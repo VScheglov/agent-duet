@@ -7,7 +7,7 @@ import { ru } from './locales/ru.ts'
 import { zh } from './locales/zh.ts'
 import { gitWrites } from './shell.ts'
 
-import type { DuetChoice, DuetDiag, DuetIssue, DuetModel, DuetPlanStep, DuetPrefs, DuetRound, DuetView } from '../types'
+import type { DuetChoice, DuetDiag, DuetIssue, DuetModel, DuetPlanStep, DuetPrefs, DuetRound, DuetVerification, DuetView } from '../types'
 
 // The codex-duet runner keeps everything a session knows in <state home>/<session>/:
 // state.json (the ledger) and round-N.events.jsonl (Codex's live event stream).
@@ -73,19 +73,29 @@ const CHECK_COMMAND_MAX = 100
 const checkCommand = (command: string) =>
   (/\n/.test(command.trim()) || oneLine(command).length > CHECK_COMMAND_MAX ? describeCommand(command) : oneLine(command))
 
-// Up to two detail lines explain why the last Codex turn was only partly verified.
+// Why the last Codex turn was only partly verified. A check that failed or that the log does not back draws
+// attention; how much was confirmed, what was skipped and what Codex did not check is a plain note, since the
+// review ended well all the same. A failure the same command's later run put right is history, not a problem.
 function verificationDetails(view: DuetView) {
   const receipt = view.verification
   if (!receipt || !['partial', 'static-analysis-only'].includes(receipt.label)) return []
-  const checks = receipt.checks.flatMap((check) => {
-    const status = check.outcome === 'skipped' ? 'skipped'
-      : check.confirmation === 'contradicted' || check.confirmation === 'unconfirmed' ? check.confirmation
-      : check.outcome === 'failed' ? 'failed' : null
-    if (!status) return []
+  const checks = receipt.checks.filter((check, n) => !(check.outcome === 'failed' && check.confirmation === 'confirmed'
+    && receipt.checks.slice(n + 1).some((later) => later.command === check.command && later.outcome === 'passed' && later.confirmation === 'confirmed')))
+  const describe = (check: DuetVerification['checks'][number], status: keyof typeof locale.verificationChecks) => {
     const exit = check.event?.exit_code
-    return [`${locale.verificationChecks[status]}: ${checkCommand(check.command)}${exit != null ? ` (exit ${exit})` : ''}${check.note ? ` — ${oneLine(check.note)}` : ''}`]
+    return `${locale.verificationChecks[status]}: ${checkCommand(check.command)}${exit != null ? ` (exit ${exit})` : ''}${check.note ? ` — ${oneLine(check.note)}` : ''}`
+  }
+  const problems = checks.flatMap((check) => {
+    if (check.outcome === 'skipped') return []
+    if (check.confirmation === 'contradicted' || check.confirmation === 'unconfirmed') return [describe(check, check.confirmation)]
+    return check.outcome === 'failed' ? [describe(check, 'failed')] : []
   })
-  return [checks.join('; '), receipt.gaps.length ? locale.verificationGaps(receipt.gaps.map(oneLine).join('; ')) : ''].filter(Boolean)
+  const note = [
+    checks.length ? locale.verificationConfirmed(checks.filter((c) => c.outcome === 'passed' && c.confirmation === 'confirmed').length, checks.length) : '',
+    ...checks.filter((c) => c.outcome === 'skipped').map((c) => describe(c, 'skipped')),
+    receipt.gaps.length ? locale.verificationGaps(receipt.gaps.map(oneLine).join('; ')) : '',
+  ].filter(Boolean).join(' · ')
+  return [{ text: problems.join('; '), isProblem: true }, { text: note, isProblem: false }].filter((line) => line.text)
 }
 
 function clock(ms: number) {
@@ -1183,8 +1193,10 @@ export const register: Register = (on, options) => {
               <Button key="stop" label={locale.stopButton} onPress={() => { void stopRound($, view).then((text) => $.ui.toast(text)) }} />
             ) : null}
           </Box>
-          {!view.runningRound ? verificationDetails(view).map((text, n) => (
-            <Text key={`verification-${n}`} color="yellow" wrap="wrap">{text}</Text>
+          {!view.runningRound ? verificationDetails(view).map(({ text, isProblem }, n) => (
+            isProblem
+              ? <Text key={`verification-${n}`} color="yellow" wrap="wrap">{text}</Text>
+              : <Text key={`verification-${n}`} dimColor wrap="wrap">{text}</Text>
           )) : null}
           {view.decision && !view.runningRound ? <Text dimColor wrap="wrap">{locale.decision(view.decision.action, view.decision.reason)}</Text> : null}
           {view.failure ? <Text color="red" wrap="wrap">{view.failure}</Text> : null}

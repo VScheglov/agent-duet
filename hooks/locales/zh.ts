@@ -11,7 +11,8 @@ export const zh: Locale = {
   verificationLabels: { executed: '已执行', partial: '部分执行', 'static-analysis-only': '仅静态分析', unknown: '未知' },
   verificationStatus: (label: string) => `验证：${label}`,
   verificationChecks: { skipped: '已跳过', failed: '失败', unconfirmed: '未确认', contradicted: '与事件矛盾' },
-  verificationGaps: (gaps: string) => `未完整检查：${gaps}`,
+  verificationConfirmed: (confirmed: number, total: number) => `已确认 ${confirmed}/${total}`,
+  verificationGaps: (gaps: string) => `Codex 未检查：${gaps}`,
   phase: {
     starting: '… 正在启动',
     queued: '⏸ 排队中',

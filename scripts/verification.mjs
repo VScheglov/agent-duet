@@ -236,10 +236,15 @@ export const unknownVerification = () => ({ label: 'unknown', checks: [], gaps: 
 export async function confirmVerification(reply, file) {
   if (!Array.isArray(reply.checks)) return unknownVerification();
   const commands = reply.checks.length ? await completedCommands(file) : [];
-  const checks = reply.checks.map((check) => {
+  // Codex may list one command twice: the run that failed and the rerun that passed. Each entry answers for
+  // its own attempt. Going from the last entry back, the last takes the latest run, as a lone entry does, so
+  // a later failure stays visible, and an earlier entry sees only the runs before the one a later entry took.
+  const visible = new Map();
+  const checks = [...reply.checks].reverse().map((check) => {
     if (check.outcome === 'skipped') return { ...check, confirmation: 'skipped' };
     const claim = commandParts(check.command);
-    const events = matchingCommands(claim, commands);
+    const events = matchingCommands(claim, commands.slice(0, visible.get(claim.key)));
+    if (events.length) visible.set(claim.key, commands.indexOf(events[0]));
     const success = succeeded(claim, events);
     let confirmation = 'unconfirmed';
     if (success !== null) confirmation = success === (check.outcome === 'passed') ? 'confirmed' : 'contradicted';
@@ -249,7 +254,7 @@ export async function confirmVerification(reply, file) {
       ...(events.length === 1 ? { event: eventEvidence(events[0]) }
         : events.length ? { events: events.map(eventEvidence) } : {}),
     };
-  });
+  }).reverse();
   const gaps = reply.gaps ?? [];
   const confirmed = checks.filter((c) => c.confirmation === 'confirmed').length;
   const label = !confirmed ? 'static-analysis-only'

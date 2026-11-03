@@ -223,8 +223,10 @@ for (const language of LANGUAGES) {
       const phase = await ui.find({ type: 'Text', text: expected[language] })
       expect(phase).toBeDefined()
       expect(phase?.props.wrap).toBe('wrap')
-      expect(await ui.find({ type: 'Text', text: /npm run integration — Missing credentials$/ })).toBeDefined()
-      expect(await ui.find({ type: 'Text', text: /Browser path not examined$/ })).toBeDefined()
+      // one calm note: what was skipped and what Codex did not check are not warnings, the review ended well
+      const note = await ui.find({ type: 'Text', text: /npm run integration — Missing credentials .*Browser path not examined$/ })
+      expect(note).toBeDefined()
+      expect(note?.props.color).toBeUndefined()
       await ui.unmount()
     })
   }

@@ -117,6 +117,31 @@ export async function matchingTests(test, dir) {
       }
     });
   }
+  // One command listed more than once: each entry answers for its own run, in the order they were listed.
+  for (const { name, checks, events, want, exits, label } of [
+    { name: 'a failed run and its passing rerun are both confirmed', checks: [['verify', 'failed'], ['verify', 'passed']],
+      events: [['verify', 1], ['verify', 0]], want: ['confirmed', 'confirmed'], exits: [1, 0], label: 'executed' },
+    { name: 'the entries take the latest runs', checks: [['verify', 'failed'], ['verify', 'passed']],
+      events: [['verify', 1], ['verify', 1], ['verify', 0]], want: ['confirmed', 'confirmed'], exits: [1, 0], label: 'executed' },
+    { name: 'a later failure is not hidden by the order of the entries', checks: [['verify', 'failed'], ['verify', 'passed']],
+      events: [['verify', 0], ['verify', 1]], want: ['contradicted', 'contradicted'], exits: [0, 1], label: 'static-analysis-only' },
+    { name: 'one run cannot answer for two entries', checks: [['verify', 'passed'], ['verify', 'passed']],
+      events: [['verify', 0]], want: ['unconfirmed', 'confirmed'], exits: [undefined, 0], label: 'partial' },
+    { name: 'another command between the runs changes nothing', checks: [['verify', 'failed'], ['lint', 'passed'], ['verify', 'passed']],
+      events: [['verify', 1], ['lint', 0], ['verify', 0]], want: ['confirmed', 'confirmed', 'confirmed'], exits: [1, 0, 0], label: 'executed' },
+    { name: 'a skipped entry takes no run', checks: [['verify', 'skipped'], ['verify', 'passed']],
+      events: [['verify', 0]], want: ['skipped', 'confirmed'], exits: [undefined, 0], label: 'partial' },
+  ]) {
+    await test(`verification matching: ${name}`, async () => {
+      fs.writeFileSync(file, events.map(([command, exit_code]) => JSON.stringify({ type: 'item.completed', item: {
+        type: 'command_execution', command, exit_code, status: exit_code ? 'failed' : 'completed' } })).join('\n'));
+      const receipt = await confirmVerification({ checks: checks.map(([command, outcome]) => ({ command, outcome, note: '' })), gaps: [] }, file);
+      assert.deepEqual(receipt.checks.map((c) => c.confirmation), want);
+      assert.deepEqual(receipt.checks.map((c) => c.event?.exit_code), exits);
+      assert.deepEqual(receipt.checks.map((c) => c.command), checks.map(([command]) => command), 'the entries keep their order');
+      assert.equal(receipt.label, label);
+    });
+  }
   await test('verification matching: a here-document script in the double-quoted wrapper Codex logs is confirmed', async () => {
     // Codex logs `/bin/zsh -lc "python3 - <<'PY' … PY"`; the check names the script as written.
     const script = "python3 - <<'PY'\nfrom pathlib import Path\nassert Path('a.txt').read_text() == \"x\", 'differs'\nprint('PASS')\nPY";

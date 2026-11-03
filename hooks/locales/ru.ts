@@ -17,7 +17,8 @@ export const ru: Locale = {
   verificationLabels: { executed: 'выполнена', partial: 'частичная', 'static-analysis-only': 'только статический анализ', unknown: 'неизвестно' },
   verificationStatus: (label: string) => `проверка: ${label}`,
   verificationChecks: { skipped: 'пропущено', failed: 'упало', unconfirmed: 'не подтверждено', contradicted: 'противоречит событиям' },
-  verificationGaps: (gaps: string) => `Проверено не полностью: ${gaps}`,
+  verificationConfirmed: (confirmed: number, total: number) => `Подтверждено ${confirmed} из ${total}`,
+  verificationGaps: (gaps: string) => `Codex не проверял: ${gaps}`,
   phase: {
     starting: '… запуск',
     queued: '⏸ в очереди',

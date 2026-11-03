@@ -12,7 +12,8 @@ export const en = {
   verificationLabels: { executed: 'executed', partial: 'partial', 'static-analysis-only': 'static-analysis-only', unknown: 'unknown' },
   verificationStatus: (label: string) => `verification: ${label}`,
   verificationChecks: { skipped: 'skipped', failed: 'failed', unconfirmed: 'unconfirmed', contradicted: 'contradicted' },
-  verificationGaps: (gaps: string) => `Not examined fully: ${gaps}`,
+  verificationConfirmed: (confirmed: number, total: number) => `Confirmed ${confirmed} of ${total}`,
+  verificationGaps: (gaps: string) => `Codex did not check: ${gaps}`,
   phase: {
     starting: '… starting',
     queued: '⏸ queued',

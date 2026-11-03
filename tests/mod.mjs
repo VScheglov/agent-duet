@@ -983,9 +983,9 @@ for (const [language, missing, other] of [
 }
 
 for (const [language, done, labels, skipped, failed, gaps] of [
-  ['en', '✅ done · verification: ', ['executed', 'partial', 'static-analysis-only', 'unknown'], 'skipped', 'failed', 'Not examined fully: '],
-  ['ru', '✅ готово · проверка: ', ['выполнена', 'частичная', 'только статический анализ', 'неизвестно'], 'пропущено', 'упало', 'Проверено не полностью: '],
-  ['zh', '✅ 已完成 · 验证：', ['已执行', '部分执行', '仅静态分析', '未知'], '已跳过', '失败', '未完整检查：'],
+  ['en', '✅ done · verification: ', ['executed', 'partial', 'static-analysis-only', 'unknown'], 'skipped', 'failed', 'Codex did not check: '],
+  ['ru', '✅ готово · проверка: ', ['выполнена', 'частичная', 'только статический анализ', 'неизвестно'], 'пропущено', 'упало', 'Codex не проверял: '],
+  ['zh', '✅ 已完成 · 验证：', ['已执行', '部分执行', '仅静态分析', '未知'], '已跳过', '失败', 'Codex 未检查：'],
 ]) {
   await test(`${language}: DONE in pane and band carries the last Codex verification, including after post-approval`, async () => {
     const { engine, write } = await languageEngine({ language });
@@ -1014,7 +1014,7 @@ for (const [language, done, labels, skipped, failed, gaps] of [
       if (label === 'partial' || label === 'static-analysis-only') {
         assert.ok(pane.some((line) => line.includes(`${skipped}: npm run integration — Missing credentials`)), pane.join('\n'));
         if (label === 'partial') assert.ok(pane.some((line) => line.includes(`${failed}: node repro.mjs (exit 1) — Reproduced crash`)), pane.join('\n'));
-        assert.ok(pane.includes(`${gaps}Browser path not inspected`), pane.join('\n'));
+        assert.ok(pane.some((line) => line.endsWith(`${gaps}Browser path not inspected`)), pane.join('\n'));
       }
     }
     write({ phase: 'done', updatedAt: ago(11 * 60_000) });
@@ -1039,6 +1039,40 @@ await test('ru: a check fed a script on a here-document is named by what it runs
   assert.ok(pane.some((line) => line.startsWith('не подтверждено: запускает скрипт Python (exit 0)')), pane.join('\n'));
   assert.ok(pane.some((line) => line.includes('пропущено: npm run e2e')), pane.join('\n'));
   assert.ok(!pane.some((line) => line.includes('read_text') || line.includes('--grep slow '.repeat(8))), pane.join('\n'));
+});
+
+await test('ru: what Codex did not check is a plain note; only a check that failed or lacks evidence draws attention', async () => {
+  const { engine, write } = await languageEngine({ language: 'ru' });
+  const passed = (command) => ({ command, outcome: 'passed', note: '', confirmation: 'confirmed', event: { command, exit_code: 0, status: 'completed' } });
+  const failed = (command) => ({ command, outcome: 'failed', note: 'broke', confirmation: 'confirmed', event: { command, exit_code: 1, status: 'failed' } });
+  const done = (checks, gaps) => write({
+    ...buildOf('note'), phase: 'done', round: 1,
+    rounds: [{ n: 1, verdict: 'approve', verification: { label: 'partial', checks, gaps } }],
+    decision: { action: 'done', reason: 'Approved', issues: [] }, issues: {},
+  });
+  const receipt = async () => {
+    await engine.tick();
+    const all = nodes(await engine.render('Pane')).filter((n) => n.type === 'Text').map((n) => ({ text: n.children.join(''), props: n.props }));
+    return { yellow: all.filter((n) => n.props.color === 'yellow').map((n) => n.text), notes: all.filter((n) => n.text.startsWith('Подтверждено')) };
+  };
+
+  done(['make check', 'node a.mjs', 'node b.mjs', 'node c.mjs'].map(passed), ['Graylog not queried', 'Ranking not reviewed']);
+  let { yellow, notes } = await receipt();
+  assert.deepEqual(yellow, []);
+  assert.deepEqual(notes.map((n) => n.text), ['Подтверждено 4 из 4 · Codex не проверял: Graylog not queried; Ranking not reviewed']);
+  assert.equal(notes[0].props.dimColor, true);
+
+  // a failure the rerun put right is history; the count leaves it out
+  done([failed('node verify.mjs'), passed('node verify.mjs'), passed('make check')], ['Graylog not queried']);
+  ({ yellow, notes } = await receipt());
+  assert.deepEqual(yellow, []);
+  assert.deepEqual(notes.map((n) => n.text), ['Подтверждено 2 из 2 · Codex не проверял: Graylog not queried']);
+
+  // a failure nothing put right, and a claim the log does not back, do draw attention
+  done([failed('node verify.mjs'), { command: 'npm test', outcome: 'passed', note: '', confirmation: 'unconfirmed' }, passed('make check')], []);
+  ({ yellow, notes } = await receipt());
+  assert.deepEqual(yellow, ['упало: node verify.mjs (exit 1) — broke; не подтверждено: npm test']);
+  assert.deepEqual(notes.map((n) => n.text), ['Подтверждено 1 из 3']);
 });
 
 await test('the default option draws English with an English locale and with no locale available', async () => {
