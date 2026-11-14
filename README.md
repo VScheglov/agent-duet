@@ -2,13 +2,13 @@
 
 # codex-duet
 
-A review where Claude and Codex work things out themselves. Codex raises issues; Claude fixes each one, disputes it with evidence, or leaves the decision to you. The loop continues until they agree, reach a deadlock, or run out of rounds. No copying text between chats.
+A review where Claude and a delegate engine, **Codex or agy (Antigravity CLI)**, work things out themselves. The delegate raises issues; Claude fixes each one, disputes it with evidence, or leaves the decision to you. The loop continues until they agree, reach a deadlock, or run out of rounds. No copying text between chats.
 
-It also works the other way around: in **build** mode, Codex writes the code while Claude acts as architect and reviewer. Most of the work uses your Codex allowance.
+It also works the other way around: in **build** mode, the delegate writes the code while Claude acts as architect and reviewer. Most of the work uses the selected engine’s allowance. The plugin remains `codex-duet`, with the same `/codex-duet` and `/duet` commands. All five modes (`plan`, `code`, `file`, `build`, `audit`) support both engines; Codex is the default.
 
-To keep the work tied to your own words, reviews can take `start --brief <file|->`: a Markdown brief with `## Owner's request` (verbatim, required), `## Accepted amendments` (only changes you accepted, with sources), and `## Claimed result` (the author's claim). Build specs require the first section and may include amendments; they use no separate `--brief`, and audit takes no brief. Codex and, before approving a build, Claude independently report `request_check`; a reported narrowing in a review or a build disagreement escalates to you. Summaries, `status`, and the report show the checks.
+To keep the work tied to your own words, reviews can take `start --brief <file|->`: a Markdown brief with `## Owner's request` (verbatim, required), `## Accepted amendments` (only changes you accepted, with sources), and `## Claimed result` (the author's claim). Build specs require the first section and may include amendments; they use no separate `--brief`, and audit takes no brief. The delegate and, before approving a build, Claude independently report `request_check`; a reported narrowing in a review or a build disagreement escalates to you. Summaries, `status`, and the report show the checks.
 
-Approval is tied to the reviewed tree. In a build, `finish` checks both the worktree and the commit after hooks; changed content comes back as a new review round with no commit left on the branch. `finish --unreviewed` bypasses these checks only on your explicit word and records the choice in the commit and report. Before manually committing a code review, run `verify`; if the content differs, use the printed `reply` command to send it back to Codex. Paths are labeled `covered`, `edited-after-review`, or `never-reviewed`.
+Approval is tied to the reviewed tree. In a build, `finish` checks both the worktree and the commit after hooks; changed content comes back as a new review round with no commit left on the branch. `finish --unreviewed` bypasses these checks only on your explicit word and records the choice in the commit and report. Before manually committing a code review, run `verify`; if the content differs, use the printed `reply` command to send it back to the delegate. Paths are labeled `covered`, `edited-after-review`, or `never-reviewed`.
 
 New or changed citations on open issues are checked against the reviewed snapshot before a round is recorded: `ok`, `moved:<L>`, `other_file:<F>`, `MISSING`, or `unchecked`. Closing replies and unchanged citations keep the earlier check. Summaries and prompts show citation problems, the report keeps the marks, and `/duet` flags missing or other-file quotes only on open issues. A mark never closes an issue or changes the stop decision; `MISSING` calls for a fresh citation, not automatic dismissal.
 
@@ -17,7 +17,7 @@ New or changed citations on open issues are checked against the reviewed snapsho
 You need:
 
 - Claude Code 2.1.275 or newer;
-- [Codex CLI](https://github.com/openai/codex), signed in, with `codex` on your `PATH` (set `CODEX_DUET_CODEX_BIN` to use another binary);
+- An installed, authenticated engine: [Codex CLI](https://github.com/openai/codex) with `codex` on your `PATH`, or agy (Antigravity CLI; tested with 1.5.7) with `agy` on your `PATH`. Set `CODEX_DUET_CODEX_BIN` or `CODEX_DUET_AGY_BIN` to use another binary;
 - Node.js 22 or newer: the runner starts as `node scripts/duet.mjs`;
 - git for code and build modes.
 
@@ -37,7 +37,7 @@ In the Claude app, where `/plugin` is unavailable, click + next to the input, th
 
 If `/codex-duet` and `/duet` do not appear after installation, open a new session or run `/reload-plugins`. The skill's full command name is `/codex-duet:codex-duet`; the short `/codex-duet` works as long as another command has not taken that name.
 
-**Recommended: allow 12 hours for background commands.** A Codex turn can take a long time, so Claude runs it in the background with `timeout: 43200000`. Without configuration, Claude Code caps this at 2 hours and interrupts long turns (you can continue with `retry`). To prevent that, add this to `~/.claude/settings.json`:
+**Recommended: allow 12 hours for background commands.** A delegate turn can take a long time, so Claude runs it in the background with `timeout: 43200000`. Without configuration, Claude Code caps this at 2 hours and interrupts long turns (you can continue with `retry`). To prevent that, add this to `~/.claude/settings.json`:
 
 ```json
 { "env": { "BASH_MAX_TIMEOUT_MS": "43200000" } }
@@ -79,76 +79,101 @@ If your organization manages Claude Code through managed settings, the `Stop` ho
 /codex-duet code --base main          the whole branch from its merge-base with main
 /codex-duet file docs/spec.md         any files: test cases, SQL, specs, configuration
 /codex-duet code -- check migrations  text after `--` sets the review's focus
+/codex-duet code --engine agy         review with agy
+/codex-duet audit --engine agy        one-shot audit with agy (see read-only limits below)
 /codex-duet status                    current progress, including after context compaction
 ```
 
-You can also ask in plain language: “have Codex review this” or “discuss the plan with Codex.”
+You can also ask in plain language: “have Codex review this”, “have agy review this”, “delegate to agy”, or “audit this with agy”.
 
-Options: `--max-rounds N` (default 10), `--model`, `--effort` (defaults from `~/.codex/config.toml`; you can name the model in plain language, such as “delegate to Codex, Astra model, max effort”), `--timeout-min` (limit per Codex turn; no limit by default), and `--sandbox` (default `inherit`: your own Codex settings; optionally `read-only`).
+Choose the engine at `start` with `--engine codex|agy`. Without that option, `CODEX_DUET_ENGINE` applies, then `codex`. The engine is saved in the session and cannot change on `reply`, `review`, or `retry`; start a new session to use the other engine. Existing sessions without an engine field remain Codex sessions.
 
-The runner checks the model and effort against your Codex model cache (`~/.codex/models_cache.json`). It refuses to start and lists the available choices if:
+Options shared by both engines: `--max-rounds N` (default 10), `--model`, `--effort`, `--timeout-min` (limit per turn; no limit by default), and `--sandbox` (`inherit` by default). Model and effort can change on `reply`, `review`, or `retry`.
+
+## Engine differences
+
+| Capability | Codex | agy |
+|---|---|---|
+| Models and effort | Config in `~/.codex/config.toml`; catalog in `~/.codex/models_cache.json` | Families from `agy models`; usually `--model gemini-4-carbon --effort high`; levels `low`, `medium`, `high`, `xhigh`, `max`; config in `settings.json` |
+| `inherit` | Uses your Codex permissions | Adds no permission flags; uses your agy permissions |
+| `workspace-write` | Codex workspace sandbox | `--sandbox` with proceed-in-sandbox settings |
+| `danger-full-access` | Codex full access | `--dangerously-skip-permissions` |
+| `read-only`, including every audit | Codex read-only shell sandbox | Promise plus an after-turn fingerprint check; shell writes are still possible |
+| Resume | Existing thread log under `~/.codex/sessions` | `--conversation <id>` while the conversation `.db` exists under the agy home |
+| Logs | `round-N.events.jsonl` | Raw `round-N.agy.jsonl`, normalized `round-N.events.jsonl` |
+| Fast | Configured and confirmed as described below | No Fast badge or tier |
+
+Both engines keep parsed replies as `round-N.codex.json`, and retain the existing `codex-duet` session IDs and commands. `CODEX_DUET_AGY_HOME` selects where the plugin reads agy settings and conversation logs (default `~/.gemini/antigravity-cli`). It does not redirect the CLI; set it to the directory agy actually uses. Authentication keeps your real `HOME`.
+
+For agy, usually choose a family and level: `--model gemini-4-carbon --effort high`. Slugs, display names and family names are accepted case-insensitively. A slug such as `gemini-3.8-flash-low` fixes the level: the same `--effort low` is allowed, but a different level is refused with advice to pass the family instead. A family accepts only its catalogued levels; a family alone lets agy choose. `--effort` alone applies to the family of the `settings.json` model. Changing only `--effort` on `reply`, `review` or `retry` replaces the level of a stored slug. Standalone models without levels pass effort through with a note because that behavior is unprobed.
+
+The runner fetches `agy models` at most once per invocation, with a 15-second timeout. An unavailable catalog, or an unknown/missing settings model for an effort-only choice, skips the relevant check with a note; the five effort values above are still validated. The summary, round record and pane show the resolved slug, marking a config family separately from an explicit level. For a family alone, agy’s init event supplies its chosen slug. Without a catalog, the display keeps the supplied choice without inventing a slug. agy has no Fast support.
+
+For Codex, `--model` and `--effort` default to `~/.codex/config.toml`; you can use plain language, such as “delegate to Codex, Astra model, max effort”.
+
+For Codex, the runner checks the model and effort against your model cache (`~/.codex/models_cache.json`). It refuses to start and lists the available choices if:
 
 - the model does not exist (you can use an ID such as `gpt-6-astra` or a name such as `GPT-6-Astra`);
 - the effort level does not exist;
 - the model does not support that effort level, including the default in `config.toml`.
 
-If there is no cache, the check is skipped. To switch the model or effort during a session, add `--model`/`--effort` to `reply`, `review`, or `retry`. The `Model:` line in the round summary shows what the session is using.
+If there is no cache, the check is skipped. The `Model:` line in the round summary shows what the session is using.
 
-**⚡ Fast.** There is no separate flag: Codex takes its speed mode from `config.toml` (`service_tier = "priority"`, the model catalog's name for Fast). The ⚡ icon in the band above the input, the task list, and the pane (“Model: … · ⚡ Fast”) appears only when the turn is known to use Fast. “(from config)” means Fast is enabled in the configuration and the model catalog offers it for that model. This qualifier disappears when Codex records the turn's mode in the thread log (`~/.codex/sessions/…/rollout-…-<thread>.jsonl`, a `thread_settings_applied` entry). If the log reports the standard mode, the icon disappears. Codex 0.160 writes this entry at the beginning of every resumed turn, but the first turn in a new thread may not have one.
+**⚡ Fast (Codex only).** There is no separate flag: Codex takes its speed mode from `config.toml` (`service_tier = "priority"`, the model catalog's name for Fast). The ⚡ icon in the band above the input, the task list, and the pane (“Model: … · ⚡ Fast”) appears only when the turn is known to use Fast. “(from config)” means Fast is enabled in the configuration and the model catalog offers it for that model. This qualifier disappears when Codex records the turn's mode in the thread log (`~/.codex/sessions/…/rollout-…-<thread>.jsonl`, a `thread_settings_applied` entry). If the log reports the standard mode, the icon disappears. Codex 0.160 writes this entry at the beginning of every resumed turn, but the first turn in a new thread may not have one.
 
-**Timing.** Codex turns take a long time, especially builds, so Claude runs `start`, `reply`, `review`, and `retry` in the background with `timeout: 43200000` (12 hours). Claude Code caps background commands at 2 hours unless you raise the limit: `max(2 hours, BASH_MAX_TIMEOUT_MS)`. “Installation” explains how to raise it to 12 hours; this also raises the maximum timeout for foreground commands to 12 hours. Claude Code silently caps any timeout above that ceiling. Without an explicit `timeout`, a foreground command lasts 2 minutes and a background command 30 minutes. The runner itself has no limit per turn by default; set one with `--timeout-min N`. Sessions started before 0.6.0 retain their old 60-minute limit; remove it with `retry --timeout-min 0` (or with `reply`/`review`).
+**Timing.** Delegate turns take a long time, especially builds, so Claude runs `start`, `reply`, `review`, and `retry` in the background with `timeout: 43200000` (12 hours). Claude Code caps background commands at 2 hours unless you raise the limit: `max(2 hours, BASH_MAX_TIMEOUT_MS)`. “Installation” explains how to raise it to 12 hours; this also raises the maximum timeout for foreground commands to 12 hours. Claude Code silently caps any timeout above that ceiling. Without an explicit `timeout`, a foreground command lasts 2 minutes and a background command 30 minutes. The runner itself has no limit per turn by default; set one with `--timeout-min N`. Sessions started before 0.6.0 retain their old 60-minute limit; remove it with `retry --timeout-min 0` (or with `reply`/`review`).
 
-**Interrupted turns.** If a turn is interrupted after Codex has started working (the background command times out, you press Stop, or Codex crashes), `retry` resumes the same Codex thread with a short “continue where you left off” prompt, even in the first round. Codex keeps its work and what it has read in context. Resuming is possible while the thread log in `~/.codex/sessions` is intact; without it, the turn starts over. `retry --fresh` always starts over.
+**Interrupted turns.** If a turn is interrupted after the delegate has started working (the background command times out, you press Stop, or the CLI crashes), `retry` resumes the same conversation with a short “continue where you left off” prompt, even in the first round. Work and read context are retained while the conversation is available: Codex needs its thread log in `~/.codex/sessions`, agy needs the conversation `.db` in its home and resumes with `--conversation`. Without it, the turn starts over. `retry --fresh` always starts over; it does not undo work already on disk.
 
-**Several tasks at once.** You can delegate multiple tasks: every build gets its own worktree and branch. At most ten Codex turns run simultaneously on the machine (`CODEX_DUET_MAX_PARALLEL`); the rest wait in order in the queue (phase `queued`) and start automatically when a slot opens. Each Codex turn starts every MCP server in its configuration and consumes one quota slot, so ten tasks without a queue can mean hundreds of processes. A slot is held only while Codex is working; it is free while Claude reviews. Queue time counts toward the background command's two-hour ceiling, so prefer a few tasks at a time over dozens at once.
+**Several tasks at once.** You can delegate multiple tasks: every build gets its own worktree and branch. At most ten delegate turns run simultaneously on the machine (`CODEX_DUET_MAX_PARALLEL`); the rest wait in order in the queue (phase `queued`) and start automatically when a slot opens. Each delegate turn starts every MCP server in its configuration and consumes one quota slot, so ten tasks without a queue can mean hundreds of processes. A slot is held only while the delegate is working; it is free while Claude reviews. Queue time counts toward the background command's two-hour ceiling, so prefer a few tasks at a time over dozens at once.
 
-## Build mode: Codex writes, Claude reviews
+## Build mode: the delegate writes, Claude reviews
 
 ```
-/codex-duet build                     “delegate to Codex …”, “have Codex implement …”
+/codex-duet build --engine agy        “delegate to agy …”, “have agy implement …”
 ```
 
 1. Claude writes a specification: goal, scope, constraints, acceptance criteria, and how to test.
-2. The runner creates a `codex-duet/<id>` branch in a separate worktree from HEAD. Your working tree is untouched. Codex does not see uncommitted changes.
-3. Codex implements, runs tests, and reports what it did, what it checked, and what remains uncertain.
-4. Claude reviews the round's diff, runs tests in the worktree itself, and raises issues C1…Cn. Codex fixes or disputes them. The stop policy is the same; deadlocks come to you (and the `/duet` pane).
+2. The runner creates a `codex-duet/<id>` branch in a separate worktree from HEAD. Your working tree is untouched. The delegate does not see uncommitted changes.
+3. The delegate implements, runs tests, and reports what it did, what it checked, and what remains uncertain.
+4. Claude reviews the round's diff, runs tests in the worktree itself, and raises issues C1…Cn. The delegate fixes or disputes them. The stop policy is the same; deadlocks come to you (and the `/duet` pane).
 5. Once everything is agreed, with your approval `finish` commits the work on the branch and removes the worktree; you merge it yourself. `discard` removes both the worktree and the branch.
 
 Instructions for Claude are in `references/build.md`.
 
 In review and build, DONE carries a verification label: `executed` (all checks confirmed, no skips or gaps), `partial` (some confirmed, coverage incomplete), `static-analysis-only` (none confirmed), or `unknown` (older reply). Receipts compare claimed commands with saved events and show outcomes, skips with reasons, unconfirmed or contradicted claims, and gaps in summaries, `report.md` and `/duet`. Confirmed failures can still be `executed`; the label never changes the stop decision and excludes Claude’s own build-review checks.
 
-## Audit mode: Codex checks without changing anything
+## Audit mode: the delegate checks without changing anything
 
 ```
-/codex-duet audit                     “audit this with Codex …”, “have Codex check … and report back”
+/codex-duet audit --engine agy        “audit this with agy …”, “have agy check … and report back”
 ```
 
 A one-off report without negotiation: audit code, data, a reference standard, or a policy. Claude does not spend tokens responding to every finding. If a reference standard cannot change without your `APPROVED`, review mode is a poor fit: almost everything would come back to you. Build is also unsuitable, because an audit must not change anything.
 
 1. Claude writes the task: what to examine, which question to answer, the scope, what counts as a finding, and what belongs in notes (a ranking or a table).
-2. Codex works directly in the project directory, always with a read-only sandbox: the runner rejects any other `--sandbox` value. The prompt also prohibits writes through MCP tools; this is an instruction, not sandbox enforcement (see “Security”).
+2. The delegate works directly in the project directory, always with `read-only`: the runner rejects any other `--sandbox` value. Codex applies its read-only shell sandbox. For agy this is a promise plus an after-turn check, not enforced read-only isolation: `write_file` is denied, but shell commands can still write. Detected changes are recorded and warned about, never undone. MCP writes are prohibited by the prompt, not sandbox enforcement (see “Security”).
 3. One turn produces a summary, findings A1…An (severity, location, evidence, recommendation, confidence), and what was and was not checked. Claude's summary has one line per finding; everything else is in the session's `report.md`.
-4. There is nothing to answer: `reply` and `review` reject audits. For a different angle, start another audit with a more precise task. Findings remain Codex's claims: before relying on them, Claude checks the relevant ones or says they are unverified.
+4. There is nothing to answer: `reply` and `review` reject audits. For a different angle, start another audit with a more precise task. Findings remain the delegate’s claims: before relying on them, Claude checks the relevant ones or says they are unverified.
 
-The queue, pane (`/duet` shows the summary and findings), ⚡ Fast, 12-hour turns, and `retry` resuming interrupted threads work just as they do in other modes.
+The queue, pane (`/duet` shows the summary and findings), 12-hour turns, and `retry` resuming interrupted conversations work as in other modes. Fast remains Codex-only.
 
 ## How negotiation works
 
 ```
-start ─► Codex: issues C1…Cn (JSON matching the schema)
+start ─► delegate: issues C1…Cn (JSON matching the schema)
           │
           ▼
    Claude answers each issue:  fixed · disputed · needs-user
           │
-reply ─► Codex (same session, resume): resolved · withdrawn · open + counterargument · new issues
+reply ─► delegate (same session, resume): resolved · withdrawn · open + counterargument · new issues
           │
           ▼
    scripts/policy.mjs → continue · done · escalate (deadlock → you)
 ```
 
-- Each issue has a permanent ID. Codex sees Claude's answers and the diff between rounds.
-- If you rule in favor of the current version (`owner-decided`), the issue closes even if Codex disagrees.
+- Each issue has a permanent ID. The delegate sees Claude’s answers and the diff between rounds.
+- If you rule in favor of the current version (`owner-decided`), the issue closes even if the delegate disagrees.
 - Reaching the round limit always escalates, regardless of the policy's decision.
 - Claude never commits anything.
 
@@ -157,8 +182,8 @@ reply ─► Codex (same session, resume): resolved · withdrawn · open + count
 Rules are checked from top to bottom; the first match wins:
 
 1. Claude parked a critical/high issue (`needs-user`) → **escalate** immediately.
-2. Codex says `approve` and no critical/high issues remain open → **done**. Medium/low issues go into the report; other parked decisions come to you.
-3. Codex rejected disputes on the same issue twice → **escalate** (deadlock).
+2. The delegate says `approve` and no critical/high issues remain open → **done**. Medium/low issues go into the report; other parked decisions come to you.
+3. The delegate rejected disputes on the same issue twice → **escalate** (deadlock).
 4. The number of open issues did not decrease for two consecutive rounds → **escalate** (stall).
 5. Otherwise → **continue**.
 
@@ -170,14 +195,14 @@ The plugin includes a Claude Code module (`hooks/register.tsx`). Every 2 seconds
 
 | Surface | Contents |
 |---|---|
-| **Pane** `/duet` | With multiple tasks, a list at the top (⏳ running, ⏸ queued with position, 🙋 needs you, ✅ done; timer and model); click a row for details. Then the phase and round timer; model and effort, with ⚡ Fast when the turn uses it; “Now: …” with Codex's command, or “thinking for N min” if its event stream has been quiet for more than two minutes, plus “Codex log updated N s ago”: the thread log keeps growing even while Codex thinks silently. Codex's latest words appear in full, with paragraphs, lists, and `code` rendered as Markdown, their age if older than two minutes, and actions (“running tests …”, “running a Python script”); its plan; an issue board (● open, ⏸ parked, ✓ fixed, ↩ withdrawn, ⚔×N disputes) with a “N of M closed” bar. Titles wrap beneath themselves instead of being cut off; ▸ expands both sides' statements; closed issues stay collapsed while any are open. Also the scoreboard, round history, Stop button (also stops a queued turn), and collapsed Settings at the bottom. Pane text wraps to fit; only task-list rows and Codex commands are truncated |
-| ↳ on escalation | Codex's and Claude's positions and [Codex is right] / [Claude is right] buttons, followed by “Send decisions to Claude” |
-| **Band above the prompt** and status line | Phase, timer, current Codex action; other modules' bands remain below it |
+| **Pane** `/duet` | With multiple tasks, a list at the top (⏳ running, ⏸ queued with position, 🙋 needs you, ✅ done; timer and model); click a row for details. Then the phase and round timer; model and effort, with ⚡ Fast only for Codex turns that use it; “Now: …” with the delegate’s command, or “thinking for N min” if its event stream has been quiet for more than two minutes, plus the conversation-log update age when available: Codex’s thread log can keep growing even while it thinks silently. The delegate’s latest words appear in full, with paragraphs, lists, and `code` rendered as Markdown, their age if older than two minutes, and actions (“running tests …”, “running a Python script”); its plan; an issue board (● open, ⏸ parked, ✓ fixed, ↩ withdrawn, ⚔×N disputes) with a “N of M closed” bar. Titles wrap beneath themselves instead of being cut off; ▸ expands both sides' statements; closed issues stay collapsed while any are open. Also the scoreboard, round history, Stop button (also stops a queued turn), and collapsed Settings at the bottom. Pane text wraps to fit; only task-list rows and delegate commands are truncated |
+| ↳ on escalation | The delegate’s and Claude’s positions and buttons for choosing the side that is right, followed by “Send decisions to Claude” |
+| **Band above the prompt** and status line | Phase, timer, current delegate action; other modules' bands remain below it |
 | **Footer** | A label such as “Duet r3 ⏳ 4:12”; click to open the pane. Visible even when the band above the prompt is disabled |
 | **Toasts** | Round start and end, escalation, failure; after a round, a “continue codex-duet” suggestion (Tab) |
-| **Sound** | Escalation (your decision is needed), review completion, round failure, or a missing Codex process; Claude's turns make no sound. Uses the Claude app's built-in sounds: `tool_approval_needed`, `enter_voice_mode`, `disconnected`. They play directly from the app and are not copied into the plugin. Without the app, fallback sounds from `sounds/` play |
+| **Sound** | Escalation (your decision is needed), review completion, round failure, or a missing delegate process; Claude's turns make no sound. Uses the Claude app's built-in sounds: `tool_approval_needed`, `enter_voice_mode`, `disconnected`. They play directly from the app and are not copied into the plugin. Without the app, fallback sounds from `sounds/` play |
 
-**Keeping the loop going.** If a session is waiting for Claude (to answer issues, or to review a Codex build round) and Claude ends its turn, the module returns it to the loop once through the `Stop` hook. It does not do so when:
+**Keeping the loop going.** If a session is waiting for Claude (to answer issues, or to review a delegate build round) and Claude ends its turn, the module returns it to the loop once through the `Stop` hook. It does not do so when:
 
 - Claude has asked you a question;
 - you sent a message and Claude answered it without touching the loop;
@@ -195,11 +220,12 @@ Commands: `/duet` opens the pane; `/duet stop` stops the current round (you can 
 
 ## Security
 
-- Codex runs with your **full harness**: your configuration, model, effort, all MCP servers, apps, and skills.
-- The sandbox is **inherited** by default (`--sandbox inherit`): Codex can do whatever your regular Codex can, such as run tests. An explicit mode (`read-only`, `workspace-write`, `danger-full-access`) is applied on every turn: `-s` at start and `-c sandbox_mode=…` on `resume`, because `resume` has no `--sandbox` flag.
-- The bans on changing files during review, committing, and modifying external systems are **prompt instructions, not a sandbox**. With `inherit` and your `danger-full-access`, an unattended agent has full access, so review other people's code (external PRs, downloaded files) with `--sandbox read-only`.
-- **The sandbox does not restrict MCP tools.** The reviewer has the same MCP servers as your Codex, including ones that can write to external systems such as a production database. The prompt explicitly prohibits changes through any tools, but this is an instruction, not sandbox enforcement.
-- **The keychain and a redirected `HOME` (macOS).** A program started with `HOME` pointing to a temporary directory (`claude`, `gh`, git credential helpers, `security`) cannot find the macOS keychain, so every sign-in attempt opens a “keychain not found” dialog. These dialogs stay open until dismissed. Click Cancel: “Reset to Defaults” creates a new, empty keychain in place of yours. Symlinking `~/Library/Keychains` removes the dialogs but gives the program your entire keychain; its entries can be changed through securityd. That is why the Codex prompts (build and review) and Claude's rules in SKILL.md require credentials through the environment: `CLAUDE_CODE_OAUTH_TOKEN` (created with `claude setup-token`) or `GH_TOKEN`. If credentials are unavailable, ask. Such dialogs have been caused, for example, by `claude -p` smoke runs in the Claude session overseeing a build; Codex itself did not run `claude` or `security`.
+- Each engine uses its own **full harness**: your configuration, model, effort, configured MCP servers and other available tools.
+- `--sandbox inherit` uses the selected engine’s permissions. For Codex, explicit modes apply on every turn: `-s` at start and `-c sandbox_mode=…` on `resume`, because `resume` has no `--sandbox` flag. agy’s mappings are in the engine table above.
+- **agy read-only is a promise plus an after-turn check, not an enforced read-only sandbox.** Its sandbox denies `write_file`, but shell commands can write. Before and after each read-only turn, the runner fingerprints tracked and untracked nonignored files under cwd in a Git repository; outside Git, it scans a capped set. It records and warns about detected violations without undoing changes. Ignored files, paths outside cwd, files beyond the cap and changes reverted before the check can escape detection. This check cannot make untrusted code safe to execute.
+- The bans on changing files during review, committing, and modifying external systems are **prompt instructions**. For external PRs or downloaded files, Codex’s `--sandbox read-only` supplies its shell sandbox; agy’s option supplies the promise and check described above.
+- **Do not rely on a shell sandbox to restrict MCP tools.** A reviewer may have MCP tools that can write to external systems such as a production database. The prompt prohibits changes through any tools, but this is an instruction, not enforcement.
+- **The keychain and a redirected `HOME` (macOS).** A program started with `HOME` pointing to a temporary directory (`claude`, `gh`, git credential helpers, `security`) cannot find the macOS keychain, so every sign-in attempt opens a “keychain not found” dialog. These dialogs stay open until dismissed. Click Cancel: “Reset to Defaults” creates a new, empty keychain in place of yours. Symlinking `~/Library/Keychains` removes the dialogs but gives the program your entire keychain; its entries can be changed through securityd. That is why the delegate prompts (build and review) and Claude's rules in SKILL.md require credentials through the environment: `CLAUDE_CODE_OAUTH_TOKEN` (created with `claude setup-token`) or `GH_TOKEN`. If credentials are unavailable, ask. Such dialogs have been caused, for example, by `claude -p` smoke runs in the Claude session overseeing a build; Codex itself did not run `claude` or `security`.
 
 ## File layout
 
@@ -208,7 +234,7 @@ Commands: `/duet` opens the pane; `/duet stop` stops the current round (you can 
 | `.claude-plugin/` | `plugin.json`: plugin manifest; `marketplace.json`: the single-plugin marketplace used for installation |
 | `SKILL.md`, `references/protocol.md`, `references/build.md` | Instructions for Claude |
 | `README.md`, `README.ru.md`, `README.zh-CN.md` | Documentation in English, Russian, and Simplified Chinese |
-| `scripts/duet.mjs` | Runner: Codex calls, issue ledger, snapshots, output |
+| `scripts/duet.mjs` | Runner: engine calls, issue ledger, snapshots, output |
 | `scripts/policy.mjs` | **Your** `decideNextStep` stop policy |
 | `prompts/`, `schemas/` | Reviewer prompts and response JSON schemas |
 | `hooks/register.tsx`, `types/index.d.ts` | Module: pane, band, footer, toasts, sound, loop reminder, commit guard, context summary |
@@ -217,19 +243,22 @@ Commands: `/duet` opens the pane; `/duet stop` stops the current round (you can 
 | `tests/` | `run.mjs`: runner and policy; `mod.mjs`: module with a stand-in engine; `pane.test.tsx`: rendering through the real engine's test kit |
 | `~/.local/state/codex-duet/<id>/` | Sessions: `state.json`, prompts and replies for each round, `report.md` |
 
-Open the reviewer's full reasoning in Codex with `codex resume <thread id>`; the report contains the ID.
+Reopen the reviewer’s conversation with `codex resume <thread id>` for Codex or `agy --conversation <conversation id>` for agy; the report contains the ID. agy’s raw output is saved as `round-N.agy.jsonl`; `round-N.events.jsonl` holds normalized events for verification and the pane. Parsed replies keep the compatibility name `round-N.codex.json`.
 
 ## Environment variables
 
 | Variable | Purpose |
 |---|---|
+| `CODEX_DUET_ENGINE` | Default engine at start: `codex` or `agy` (default `codex`) |
 | `CODEX_DUET_MODEL`, `CODEX_DUET_EFFORT` | Default model and effort |
-| `CODEX_DUET_TIMEOUT_MIN` | Limit per Codex turn in minutes (default 0, unlimited) |
-| `CODEX_DUET_MAX_PARALLEL` | Concurrent Codex turns on the machine (default 10); the rest wait in the queue |
+| `CODEX_DUET_TIMEOUT_MIN` | Limit per delegate turn in minutes (default 0, unlimited) |
+| `CODEX_DUET_MAX_PARALLEL` | Concurrent delegate turns on the machine (default 10); the rest wait in the queue |
 | `CODEX_DUET_SANDBOX` | Default sandbox (`inherit`) |
 | `CODEX_DUET_HOME` | Session storage location |
 | `CODEX_DUET_POLICY` | Alternate policy file (used by tests) |
-| `CODEX_DUET_CODEX_BIN` | Alternate codex binary (used by tests) |
+| `CODEX_DUET_CODEX_BIN` | Codex binary (default `codex`) |
+| `CODEX_DUET_AGY_BIN` | agy binary (default `agy`) |
+| `CODEX_DUET_AGY_HOME` | Plugin lookup directory for agy settings/logs (default `~/.gemini/antigravity-cli`); does not redirect the CLI or change `HOME` |
 
 ## Tests
 
@@ -242,11 +271,18 @@ claude plugin validate .
 
 Run these from the plugin directory. `run.mjs` and `mod.mjs` also run in GitHub Actions (`.github/workflows/tests.yml`) on macOS and Linux.
 
-`run.mjs` tests the runner with a fake Codex (`tests/fake-codex.mjs`): the ledger, disputes, escalation, `retry`, read-only on `resume`, diffs between rounds, and the policy's English reasons.
+`run.mjs` tests the runner with a fake Codex (`tests/fake-codex.mjs`): the ledger, disputes, escalation, `retry`, read-only on `resume`, diffs between rounds, and the policy’s English reasons. It also includes the fake-only agy suite (`tests/agy.mjs`), which you can run separately with `node tests/agy.mjs`; it needs no real agy or network.
 
 `mod.mjs` transpiles the real `hooks/register.tsx` and its local static imports, then runs its hooks against a stand-in engine (`tests/mod-engine.mjs`). `duet.mjs` creates its sessions with the same fake Codex. Tests cover the pane, band, footer, toasts, sound, loop reminder, commit guard, and context summary, including English by default, explicit Russian and Chinese, locale priority in `auto`, the macOS preferred-language fallback and English on lookup failure, translated session messages and decisions, and matching keys across the three locale tables. Transpilation requires esbuild (the copy bundled with a global `tsx` works) or `typescript`; set its path through `ESBUILD` or `TYPESCRIPT`. The stand-in catches logic errors but cannot catch misunderstandings of the API: check new engine calls against `claude-code.d.ts` and `claude plugin validate`. The idea comes from plan-progress ([zycck/claude-mods](https://github.com/zycck/claude-mods)).
 
 `tests/pane.test.tsx` renders the pane through the engine's own test kit (`claude plugin test`) on terminal, desktop, and mobile surfaces in English, Russian, and Chinese. Each surface's component registry validates the tree, which the stand-in cannot do. The review session lives in test memory. Tests check that long titles and the label for another session are fully visible, issues expand, and Codex's words render as Markdown; the narrow 44-column layout also checks wrapping with double-width Chinese characters.
+
+## agy troubleshooting (tested with 1.5.7)
+
+- **No output while starting.** agy waits for all configured MCP servers to connect before working. Check VPN/network access and run `agy mcp list` with the same agy configuration; an unreachable server can hold up the turn. The queue and background timeout still apply.
+- **A tool is denied.** A headless turn cannot show an interactive permission question. Configure the needed allow rules in agy, or explicitly choose `--sandbox danger-full-access` (`--dangerously-skip-permissions`). `workspace-write` uses `--sandbox` and proceed-in-sandbox settings; it does not override every tool rule.
+- **Retry starts over.** Check that the saved conversation `.db` is still in `CODEX_DUET_AGY_HOME` (default `~/.gemini/antigravity-cli`). `retry` uses `--conversation` only when it is present; `--fresh` deliberately restarts.
+- **Read-only violation.** Inspect the recorded paths and the files before proceeding. The check warns after the turn and never rolls changes back. It cannot detect every write; see “Security”.
 
 ## Codex CLI pitfalls (0.159)
 

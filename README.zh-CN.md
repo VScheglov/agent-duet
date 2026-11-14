@@ -2,13 +2,13 @@
 
 # codex-duet
 
-让 Claude 和 Codex 自己协商完成代码审查。Codex 提出问题，Claude 逐项修复、用证据提出异议，或留给你裁决。循环会一直持续，直到双方达成一致、陷入僵局，或用完轮次。不用再在聊天窗口之间复制内容。
+让 Claude 和所选引擎 **Codex 或 agy（Antigravity CLI）**自己协商完成代码审查。引擎提出问题，Claude 逐项修复、用证据提出异议，或留给你裁决。循环会一直持续，直到双方达成一致、陷入僵局，或用完轮次。不用再在聊天窗口之间复制内容。
 
-也可以反过来：在 **build** 模式下，Codex 编写代码，Claude 担任架构师和审查者。这样主要消耗 Codex 的额度。
+也可以反过来：在 **build** 模式下，引擎编写代码，Claude 担任架构师和审查者。这样主要消耗所选引擎的额度。插件仍叫 `codex-duet`，保留 `/codex-duet` 和 `/duet` 命令。全部五种模式（`plan`、`code`、`file`、`build`、`audit`）都支持两个引擎；默认使用 Codex。
 
-为了按你的原话核对工作，审查可使用 `start --brief <file|->` 传入 Markdown，包含 `## Owner's request`（原话，必填）、`## Accepted amendments`（仅限你已接受的修改，并注明来源）和 `## Claimed result`（作者声称达到的结果）。build 的规格本身必须包含第一个章节，可包含已接受的修改；不使用单独的 `--brief`，audit 也不接受 brief。Codex 和批准 build 前的 Claude 分别填写 `request_check`；审查报告需求被缩减，或 build 中双方判断不一致时，会交给你裁决。轮次摘要、`status` 和报告都会显示检查结果。
+为了按你的原话核对工作，审查可使用 `start --brief <file|->` 传入 Markdown，包含 `## Owner's request`（原话，必填）、`## Accepted amendments`（仅限你已接受的修改，并注明来源）和 `## Claimed result`（作者声称达到的结果）。build 的规格本身必须包含第一个章节，可包含已接受的修改；不使用单独的 `--brief`，audit 也不接受 brief。所选引擎和批准 build 前的 Claude 分别填写 `request_check`；审查报告需求被缩减，或 build 中双方判断不一致时，会交给你裁决。轮次摘要、`status` 和报告都会显示检查结果。
 
-批准与已审查的 Git 树绑定。build 中的 `finish` 会核对 worktree 和钩子运行后的提交；内容有变时会作为新一轮审查返回，分支上不保留该提交。只有你明确要求时才能使用 `finish --unreviewed` 跳过检查，提交信息和报告会记录这一选择。code 审查后手动提交前，先运行 `verify`；内容有变时，使用输出中的 `reply` 命令交回 Codex 复审。路径标记为 `covered`、`edited-after-review` 或 `never-reviewed`。
+批准与已审查的 Git 树绑定。build 中的 `finish` 会核对 worktree 和钩子运行后的提交；内容有变时会作为新一轮审查返回，分支上不保留该提交。只有你明确要求时才能使用 `finish --unreviewed` 跳过检查，提交信息和报告会记录这一选择。code 审查后手动提交前，先运行 `verify`；内容有变时，使用输出中的 `reply` 命令交回所选引擎复审。路径标记为 `covered`、`edited-after-review` 或 `never-reviewed`。
 
 每轮记录前，未关闭问题中新增或修改的引用会与该轮审查的快照核对，标记为 `ok`、`moved:<L>`、`other_file:<F>`、`MISSING` 或 `unchecked`。关闭问题或重复引用时保留此前的检查。摘要和提示词显示引用问题，报告保留标记，`/duet` 仅在未关闭问题上标出未找到或位于其他文件的引文。标记不会关闭问题，也不会改变停止决定；`MISSING` 表示应要求重新引用，不能据此自动否定问题。
 
@@ -17,7 +17,7 @@
 需要：
 
 - Claude Code 2.1.275 或更新版本；
-- 已登录的 [Codex CLI](https://github.com/openai/codex)：`codex` 必须在 `PATH` 中（可以用 `CODEX_DUET_CODEX_BIN` 指定其他可执行文件）；
+- 已安装并登录的引擎：[Codex CLI](https://github.com/openai/codex)，且 `codex` 在 `PATH` 中；或 agy（Antigravity CLI，已用 1.5.7 测试），且 `agy` 在 `PATH` 中。可用 `CODEX_DUET_CODEX_BIN` 或 `CODEX_DUET_AGY_BIN` 指定其他可执行文件；
 - Node.js 22 或更新版本：运行器通过 `node scripts/duet.mjs` 启动；
 - code 和 build 模式需要 git。
 
@@ -37,7 +37,7 @@ claude plugin install codex-duet --marketplace VScheglov/codex-duet
 
 如果安装后看不到 `/codex-duet` 和 `/duet`，请新建会话或执行 `/reload-plugins`。技能命令的完整名称是 `/codex-duet:codex-duet`；只要没有其他命令占用同名，简写 `/codex-duet` 就能使用。
 
-**建议：将后台命令的时限设为 12 小时。** Codex 的一轮工作可能很久，因此 Claude 会在后台启动它，并设置 `timeout: 43200000`。如果不调整配置，Claude Code 会将时限截为 2 小时，较长的一轮就会中断（可以通过 `retry` 继续）。为避免这种情况，在 `~/.claude/settings.json` 中加入：
+**建议：将后台命令的时限设为 12 小时。** 引擎的一轮工作可能很久，因此 Claude 会在后台启动它，并设置 `timeout: 43200000`。如果不调整配置，Claude Code 会将时限截为 2 小时，较长的一轮就会中断（可以通过 `retry` 继续）。为避免这种情况，在 `~/.claude/settings.json` 中加入：
 
 ```json
 { "env": { "BASH_MAX_TIMEOUT_MS": "43200000" } }
@@ -81,76 +81,101 @@ echo '{"language":"ru"}' | claude plugin configure codex-duet --values-stdin
 /codex-duet code --base main           从与 main 的 merge-base 开始审查整个分支
 /codex-duet file docs/spec.md          任意文件：测试用例、SQL、规格、配置
 /codex-duet code -- 检查迁移           `--` 后面是审查重点
+/codex-duet code --engine agy          使用 agy 审查
+/codex-duet audit --engine agy         使用 agy 进行一次性审计（read-only 限制见下文）
 /codex-duet status                     当前进度（压缩上下文后也很有用）
 ```
 
-也可以直接说：“让 Codex 审查代码”“和 Codex 讨论这个计划”。
+也可以直接说：“让 Codex 审查代码”“让 agy 审查代码”“让 agy 实现”“用 agy 做审计”。
 
-选项：`--max-rounds N`（默认 10）、`--model`、`--effort`（默认取自 `~/.codex/config.toml`；也可以用自然语言指定模型，例如“交给 Codex，用 astra 模型，max 推理级别”）、`--timeout-min`（Codex 每轮时限；默认不限制）、`--sandbox`（默认 `inherit`，沿用你的 Codex 设置；也可选择 `read-only`）。
+在 `start` 时用 `--engine codex|agy` 选择引擎。省略时先取 `CODEX_DUET_ENGINE`，再默认为 `codex`。选择会保存在会话中；`reply`、`review` 和 `retry` 不能更换引擎，要切换请新建会话。没有引擎字段的旧会话仍使用 Codex。
 
-运行器会根据你的 Codex 模型缓存（`~/.codex/models_cache.json`）检查模型和推理级别。以下情况会在启动前报错，并列出可用选项：
+两个引擎共用的选项：`--max-rounds N`（默认 10）、`--model`、`--effort`、`--timeout-min`（每轮时限，默认不限制）、`--sandbox`（默认 `inherit`）。`reply`、`review` 和 `retry` 可以更换模型或推理级别。
+
+## 引擎差异
+
+| 能力 | Codex | agy |
+|---|---|---|
+| 模型与推理级别 | 配置 `~/.codex/config.toml`，目录 `~/.codex/models_cache.json` | 系列来自 `agy models`；通常使用 `--model gemini-4-carbon --effort high`；级别为 `low`、`medium`、`high`、`xhigh`、`max`；配置在 `settings.json` |
+| `inherit` | 使用你的 Codex 权限 | 不添加权限参数，使用你的 agy 权限 |
+| `workspace-write` | Codex 工作区沙箱 | `--sandbox` 加 proceed-in-sandbox 设置 |
+| `danger-full-access` | Codex 完整访问权限 | `--dangerously-skip-permissions` |
+| `read-only`，包括所有 audit | Codex 的只读 shell 沙箱 | 承诺加上每轮结束后的文件指纹检查；shell 仍可能写入 |
+| 恢复 | `~/.codex/sessions` 中已有的线程日志 | agy 目录中仍有会话 `.db` 时使用 `--conversation <id>` |
+| 日志 | `round-N.events.jsonl` | 原始 `round-N.agy.jsonl`，规范化 `round-N.events.jsonl` |
+| Fast | 按下文配置并确认 | 没有 Fast 模式或标记 |
+
+两个引擎解析后的回复都保存为 `round-N.codex.json`，保留现有 `codex-duet` 会话 ID 和命令。`CODEX_DUET_AGY_HOME` 指定插件读取 agy 设置和会话日志的目录（默认 `~/.gemini/antigravity-cli`）。它不会重定向 CLI；请指向 agy 实际使用的目录。身份验证保留真实的 `HOME`。
+
+agy 通常使用系列加级别：`--model gemini-4-carbon --effort high`。slug、显示名称和系列名称均不区分大小写。`gemini-3.8-flash-low` 这样的 slug 已固定级别：可以同时传入相同的 `--effort low`，不同级别则会被拒绝，并提示改用系列名称。系列只接受目录中列出的级别；仅指定系列时由 agy 选择级别。单独的 `--effort` 应用于 `settings.json` 模型所属的系列。在 `reply`、`review` 或 `retry` 中只更改 `--effort`，会替换已保存 slug 的级别。对于没有级别的独立模型，effort 会直接传入并附上说明，因为该行为尚未验证。
+
+每次运行至多查询一次 `agy models`，超时为 15 秒。目录不可用，或仅选择 effort 时设置中的模型未知或缺失，会跳过相应检查并说明原因；上面的五个级别值仍会校验。摘要、轮次记录和面板显示解析后的 slug，并分别标明来自配置的系列与显式选择的级别。仅指定系列时，所选 slug 来自 agy 的 init 事件。目录不可用时保留传入的选择，不编造 slug。agy 不支持 Fast。
+
+Codex 的 `--model` 和 `--effort` 默认取自 `~/.codex/config.toml`；也可以用自然语言指定，例如“交给 Codex，用 astra 模型，max 推理级别”。
+
+对于 Codex，运行器会根据你的模型缓存（`~/.codex/models_cache.json`）检查模型和推理级别。以下情况会在启动前报错，并列出可用选项：
 
 - 模型不存在（可以填写 ID `gpt-6-astra` 或名称 `GPT-6-Astra`）；
 - 推理级别不存在；
 - 模型不支持该推理级别，包括 `config.toml` 中设置的默认级别。
 
-没有缓存时会跳过检查。在会话中途也可以更换模型或推理级别：给 `reply`、`review` 或 `retry` 加上 `--model` / `--effort`。轮次摘要中的 `Model:` 行会显示当前使用的配置。
+没有缓存时会跳过检查。轮次摘要中的 `Model:` 行会显示当前使用的配置。
 
-**⚡ Fast。** 没有单独的开关：Codex 从 `config.toml` 读取速度模式（`service_tier = "priority"`，这是模型目录中 Fast 的名称）。只有确定当前一轮使用 Fast 时，输入框上方状态条、任务列表和面板才会出现 ⚡ 标记。标记旁的“来自配置”表示配置启用了 Fast，且模型目录确认该模型支持它。等 Codex 将本轮模式写入线程日志（`~/.codex/sessions/…/rollout-…-<线程>.jsonl` 中的 `thread_settings_applied` 记录）后，这个附注就会消失。如果日志显示普通模式，⚡ 标记也会移除。Codex 0.160 会在每次继续线程的一轮开始时写入该记录，但新线程的第一轮可能没有。
+**⚡ Fast（仅 Codex）。** 没有单独的开关：Codex 从 `config.toml` 读取速度模式（`service_tier = "priority"`，这是模型目录中 Fast 的名称）。只有确定当前一轮使用 Fast 时，输入框上方状态条、任务列表和面板才会出现 ⚡ 标记。标记旁的“来自配置”表示配置启用了 Fast，且模型目录确认该模型支持它。等 Codex 将本轮模式写入线程日志（`~/.codex/sessions/…/rollout-…-<线程>.jsonl` 中的 `thread_settings_applied` 记录）后，这个附注就会消失。如果日志显示普通模式，⚡ 标记也会移除。Codex 0.160 会在每次继续线程的一轮开始时写入该记录，但新线程的第一轮可能没有。
 
-**时间。** Codex 每轮可能花很久，build 尤其如此，因此 Claude 会在后台运行 `start`、`reply`、`review` 和 `retry`，并设置 `timeout: 43200000`（12 小时）。Claude Code 后台命令的时限上限默认是 2 小时，实际为 `max(2 小时, BASH_MAX_TIMEOUT_MS)`。“安装”一节说明了如何提升至 12 小时；该设置也会将前台命令允许设置的超时上限提升至 12 小时。超过 Claude Code 上限的超时值会被静默截断。未明确设置 `timeout` 时，前台命令可运行 2 分钟，后台命令可运行 30 分钟。运行器自身默认不限制每轮时间，可以通过 `--timeout-min N` 设置。0.6.0 之前创建的会话保留了旧的 60 分钟限制；使用 `retry --timeout-min 0` 可以取消限制（`reply` / `review` 也支持）。
+**时间。** 引擎每轮可能花很久，build 尤其如此，因此 Claude 会在后台运行 `start`、`reply`、`review` 和 `retry`，并设置 `timeout: 43200000`（12 小时）。Claude Code 后台命令的时限上限默认是 2 小时，实际为 `max(2 小时, BASH_MAX_TIMEOUT_MS)`。“安装”一节说明了如何提升至 12 小时；该设置也会将前台命令允许设置的超时上限提升至 12 小时。超过 Claude Code 上限的超时值会被静默截断。未明确设置 `timeout` 时，前台命令可运行 2 分钟，后台命令可运行 30 分钟。运行器自身默认不限制每轮时间，可以通过 `--timeout-min N` 设置。0.6.0 之前创建的会话保留了旧的 60 分钟限制；使用 `retry --timeout-min 0` 可以取消限制（`reply` / `review` 也支持）。
 
-**中断的一轮。** 如果 Codex 开始工作后被中断（后台命令超时、点击“停止”或 Codex 崩溃），`retry` 会用简短的“从中断处继续”提示恢复同一个 Codex 线程，第一轮也一样。已完成的工作和已读取的内容仍在 Codex 的上下文中。只要 `~/.codex/sessions` 中的线程日志完整，就能继续；没有日志时会重新开始。`retry --fresh` 则始终重新开始。
+**中断的一轮。** 如果引擎开始工作后被中断（后台命令超时、点击“停止”或 CLI 崩溃），`retry` 会用简短的“从中断处继续”提示恢复同一个会话，第一轮也一样。只要会话仍可用，已完成的工作和已读取的内容就保留在上下文中：Codex 需要 `~/.codex/sessions` 中的线程日志；agy 需要其目录中的会话 `.db`，并使用 `--conversation` 恢复。文件不存在时会重新开始。`retry --fresh` 始终重新开始，但不会撤销磁盘上已有的改动。
 
-**同时处理多个任务。** 可以同时委派多个任务：每个 build 都有独立的 worktree 和分支。同一台机器最多同时运行十轮 Codex（由 `CODEX_DUET_MAX_PARALLEL` 控制），其余任务按入队顺序等待（阶段为 `queued`），空出位置后自动启动。每轮 Codex 都会启动配置中的所有 MCP 服务器，并占用一个配额，因此不限制并发时，十个任务就可能产生数百个进程。只有 Codex 运行时才占用并发名额；Claude 审查期间名额会释放。排队时间计入后台命令的两小时时限，所以最好一次安排几个任务，而不是几十个。
+**同时处理多个任务。** 可以同时委派多个任务：每个 build 都有独立的 worktree 和分支。同一台机器最多同时运行十轮引擎任务（由 `CODEX_DUET_MAX_PARALLEL` 控制），其余任务按入队顺序等待（阶段为 `queued`），空出位置后自动启动。每轮引擎任务都会启动配置中的所有 MCP 服务器，并占用一个配额，因此不限制并发时，十个任务就可能产生数百个进程。只有引擎运行时才占用并发名额；Claude 审查期间名额会释放。排队时间计入后台命令的两小时时限，所以最好一次安排几个任务，而不是几十个。
 
-## build 模式：Codex 编写，Claude 审查
+## build 模式：引擎编写，Claude 审查
 
 ```
-/codex-duet build                     “交给 Codex……” “让 Codex 实现……”
+/codex-duet build --engine agy        “交给 agy……” “让 agy 实现……”
 ```
 
 1. Claude 编写规格：目标、范围、约束、验收标准和验证方法。
-2. 运行器从 HEAD 创建独立 worktree 和分支 `codex-duet/<id>`。你的工作区不会被改动，Codex 看不到未提交的内容。
-3. Codex 实现功能、运行测试，并报告完成了什么、验证了什么、还有哪些疑问。
-4. Claude 查看本轮 diff，亲自在 worktree 中运行测试，并提出 C1…Cn 等问题。Codex 修复或提出异议。停止策略与审查模式相同，僵局会交给你裁决（也会显示在 `/duet` 面板中）。
+2. 运行器从 HEAD 创建独立 worktree 和分支 `codex-duet/<id>`。你的工作区不会被改动，所选引擎看不到未提交的内容。
+3. 所选引擎实现功能、运行测试，并报告完成了什么、验证了什么、还有哪些疑问。
+4. Claude 查看本轮 diff，亲自在 worktree 中运行测试，并提出 C1…Cn 等问题。引擎修复或提出异议。停止策略与审查模式相同，僵局会交给你裁决（也会显示在 `/duet` 面板中）。
 5. 达成一致后，经你同意，`finish` 会将改动提交到分支并删除 worktree；分支由你自己合并。`discard` 会同时删除 worktree 和分支。
 
 给 Claude 的详细说明在 `references/build.md` 中。
 
 在 review 和 build 中，DONE 旁会显示验证标签：`executed`（所有检查均已确认，无跳过项或覆盖缺口）、`partial`（部分已确认，覆盖不完整）、`static-analysis-only`（无已确认检查）或 `unknown`（旧回复）。验证记录将声明的命令与保存的事件对照，在摘要、`report.md` 和 `/duet` 中显示结果、跳过原因、未确认或与事件矛盾的声明及覆盖缺口。已确认的失败也可标为 `executed`；标签不改变停止决定，也不包含 Claude 在 build 审查中自行运行的检查。
 
-## audit 模式：Codex 只检查，不修改
+## audit 模式：引擎只检查，不修改
 
 ```
-/codex-duet audit                     “用 Codex 做审计……” “让 Codex 检查……并给出报告”
+/codex-duet audit --engine agy        “用 agy 做审计……” “让 agy 检查……并给出报告”
 ```
 
 这是一次性报告，不进行协商，适合审计代码、数据、基准或策略。因此 Claude 不必消耗 token 逐条回复。如果没有你的 `APPROVED` 就不能修改基准，审查模式并不合适：几乎所有问题都会交给你。build 也不合适，因为审计不应修改任何内容。
 
 1. Claude 编写任务：检查什么、回答什么问题、范围、哪些内容算发现，以及哪些内容应放入备注（评分、表格）。
-2. Codex 直接在项目目录中工作，始终使用 read-only 沙箱；运行器会拒绝其他 `--sandbox` 值。提示词也禁止通过 MCP 工具写入，但这是指令层面的保护，不是沙箱限制（见“安全”）。
+2. 所选引擎直接在项目目录中工作，始终选择 `read-only`；运行器会拒绝其他 `--sandbox` 值。Codex 应用只读 shell 沙箱。对于 agy，这只是承诺加上每轮结束后的检查，不是强制只读隔离：`write_file` 会被拒绝，但 shell 命令仍可写入。检测到的改动会记录并警告，绝不自动撤销。提示词禁止通过 MCP 写入，不属于沙箱强制限制（见“安全”）。
 3. 只执行一轮。输出包括结论、A1…An 等发现（严重程度、位置、证据、建议、置信度），以及检查过和未检查的内容。摘要中每个发现占一行，其余内容保存在会话的 `report.md` 中。
-4. 无需逐项回复：audit 模式不接受 `reply` 和 `review`。如果需要换个角度，请用更明确的任务新建审计。发现仍然只是 Codex 的判断；Claude 在采用前应验证相关发现，或说明它们尚未验证。
+4. 无需逐项回复：audit 模式不接受 `reply` 和 `review`。如果需要换个角度，请用更明确的任务新建审计。发现仍然只是所选引擎的判断；Claude 在采用前应验证相关发现，或说明它们尚未验证。
 
-排队、面板（`/duet` 显示结论和发现）、⚡ Fast、每轮 12 小时时限，以及通过 `retry` 继续中断线程的行为，都与其他模式相同。
+排队、面板（`/duet` 显示结论和发现）、每轮 12 小时时限，以及通过 `retry` 继续中断会话的行为，都与其他模式相同。Fast 仍仅限 Codex。
 
 ## 协商过程
 
 ```
-start ─► Codex：问题 C1…Cn（符合 schema 的 JSON）
+start ─► 引擎：问题 C1…Cn（符合 schema 的 JSON）
           │
           ▼
    Claude 逐项回复：fixed · disputed · needs-user
           │
-reply ─► Codex（同一会话，resume）：resolved · withdrawn · open + 反驳 · 新问题
+reply ─► 引擎（同一会话，resume）：resolved · withdrawn · open + 反驳 · 新问题
           │
           ▼
    scripts/policy.mjs → continue · done · escalate（僵局 → 你来裁决）
 ```
 
-- 每个问题都有固定 ID。Codex 能看到 Claude 的回复和轮次之间的 diff。
-- 如果你裁定保留当前版本（`owner-decided`），该问题就会关闭，即使 Codex 不同意。
+- 每个问题都有固定 ID。所选引擎能看到 Claude 的回复和轮次之间的 diff。
+- 如果你裁定保留当前版本（`owner-decided`），该问题就会关闭，即使引擎不同意。
 - 用完轮次时，无论策略如何判断，都会升级交给你处理。
 - Claude 不会提交任何改动。
 
@@ -159,8 +184,8 @@ reply ─► Codex（同一会话，resume）：resolved · withdrawn · open + 
 规则按从上到下的顺序检查，采用第一个匹配项：
 
 1. Claude 将严重程度为 critical/high 的问题留给用户（`needs-user`）→ 立即 **escalate**。
-2. Codex 给出 `approve`，且没有未关闭的 critical/high 问题 → **done**。Medium/low 问题写入报告，其余待用户决策的问题交给你。
-3. Codex 对同一问题两次拒绝异议 → **escalate**（僵局）。
+2. 引擎给出 `approve`，且没有未关闭的 critical/high 问题 → **done**。Medium/low 问题写入报告，其余待用户决策的问题交给你。
+3. 引擎对同一问题两次拒绝异议 → **escalate**（僵局）。
 4. 连续两轮未关闭的问题数量没有减少 → **escalate**（停滞）。
 5. 其他情况 → **continue**。
 
@@ -172,14 +197,14 @@ reply ─► Codex（同一会话，resume）：resolved · withdrawn · open + 
 
 | 位置 | 内容 |
 |---|---|
-| **面板** `/duet` | 有多个任务时，顶部显示任务列表（⏳ 运行中、⏸ 排队中及队列位置、🙋 等待你、✅ 已完成，以及计时器和模型），点击一行可打开任务详情；接着显示本轮阶段和计时器，模型与推理级别，以及本轮使用 Fast 时的 ⚡ Fast；当前 Codex 命令，或事件流沉默超过两分钟时显示“思考了 N 分钟”，以及“Codex 日志在 N 秒前更新”：即使 Codex 没有发出消息，线程日志仍可能增长；完整显示 Codex 的最近消息，包括段落、列表和 `代码`（按 markdown 渲染），超过两分钟时显示消息时间，同时显示动作（例如“正在运行测试……”或“正在运行 Python 脚本”）；Codex 的计划；问题看板（● 未关闭、⏸ 待决策、✓ 已修复、↩ 已撤回、⚔×N 次争议），附带“已关闭 N / M”进度条：标题会换行并对齐，不会截断，点击问题前的 ▸ 可展开双方意见，有未关闭问题时，已关闭的问题默认折叠；计分板和轮次历史；“停止”按钮（也能停止排队中的一轮）；底部折叠的“设置”。面板文字会根据宽度换行，只有任务列表行和 Codex 命令会被截断 |
-| ↳ 升级处理时 | 显示 Codex 和 Claude 的立场，以及 [Codex 正确] / [Claude 正确] 按钮，再通过“将决定发送给 Claude”提交 |
-| **输入框上方状态条**与状态行 | 阶段、计时器和 Codex 当前动作；其他模块的状态条保留在其下方 |
+| **面板** `/duet` | 有多个任务时，顶部显示任务列表（⏳ 运行中、⏸ 排队中及队列位置、🙋 等待你、✅ 已完成，以及计时器和模型），点击一行可打开任务详情；接着显示本轮阶段和计时器，模型与推理级别，以及 Codex 本轮使用 Fast 时的 ⚡ Fast；当前引擎命令，或事件流沉默超过两分钟时显示“思考了 N 分钟”，以及可用时的会话日志更新时间：即使 Codex 没有发出消息，其线程日志仍可能增长；完整显示引擎的最近消息，包括段落、列表和 `代码`（按 markdown 渲染），超过两分钟时显示消息时间，同时显示动作（例如“正在运行测试……”或“正在运行 Python 脚本”）；引擎的计划；问题看板（● 未关闭、⏸ 待决策、✓ 已修复、↩ 已撤回、⚔×N 次争议），附带“已关闭 N / M”进度条：标题会换行并对齐，不会截断，点击问题前的 ▸ 可展开双方意见，有未关闭问题时，已关闭的问题默认折叠；计分板和轮次历史；“停止”按钮（也能停止排队中的一轮）；底部折叠的“设置”。面板文字会根据宽度换行，只有任务列表行和引擎命令会被截断 |
+| ↳ 升级处理时 | 显示引擎和 Claude 的立场，以及选择正确一方的按钮，再通过“将决定发送给 Claude”提交 |
+| **输入框上方状态条**与状态行 | 阶段、计时器和引擎当前动作；其他模块的状态条保留在其下方 |
 | **页脚** | 类似“Duet r3 ⏳ 4:12”的标签，点击可打开面板；即使关闭输入框上方状态条也会显示 |
 | **通知** | 一轮开始和结束、升级处理、失败；每轮结束后提供“继续 codex-duet”提示（Tab） |
-| **声音** | 升级处理（需要你裁决）、审查结束、某轮失败或 Codex 进程消失时播放；Claude 工作期间不播放声音。使用 Claude 应用内置的 `tool_approval_needed`、`enter_voice_mode`、`disconnected` 提示音，直接从应用播放，不复制到插件中。没有应用时使用 `sounds/` 中的备用声音 |
+| **声音** | 升级处理（需要你裁决）、审查结束、某轮失败或引擎进程消失时播放；Claude 工作期间不播放声音。使用 Claude 应用内置的 `tool_approval_needed`、`enter_voice_mode`、`disconnected` 提示音，直接从应用播放，不复制到插件中。没有应用时使用 `sounds/` 中的备用声音 |
 
-**循环不会自行停下。** 如果会话正在等待 Claude 工作（回复问题，或在 build 模式下检查 Codex 本轮结果），而 Claude 结束了当前回合，模块会通过 `Stop` 钩子将它带回循环一次。以下情况不会触发：
+**循环不会自行停下。** 如果会话正在等待 Claude 工作（回复问题，或在 build 模式下检查引擎本轮结果），而 Claude 结束了当前回合，模块会通过 `Stop` 钩子将它带回循环一次。以下情况不会触发：
 
 - Claude 向你提了问题；
 - 你发送了一条消息，Claude 只回复了该消息，没有推进循环；
@@ -197,11 +222,12 @@ code 审查或 build 进行期间（最后一轮之后的 12 小时内视为活�
 
 ## 安全
 
-- Codex 使用**完整的运行环境**：你的配置、模型、effort、所有 MCP 服务器、apps 和技能。
-- 默认**继承**沙箱设置（`--sandbox inherit`）：Codex 拥有与你平时使用 Codex 时相同的能力，例如运行测试。明确指定的模式（`read-only`、`workspace-write`、`danger-full-access`）会应用于每一轮：启动时使用 `-s`，`resume` 时使用 `-c sandbox_mode=…`，因为 `resume` 没有 `--sandbox` 参数。
-- 禁止在审查中修改文件、提交或更改外部系统，是**提示词中的指令，而不是沙箱限制**。如果使用 `inherit`，而你的配置为 `danger-full-access`，无人值守的代理就有完整访问权限。因此审查外部代码（第三方 PR、下载的文件）时，请使用 `--sandbox read-only`。
-- **沙箱不限制 MCP 工具。** 审查者可以使用与你的 Codex 相同的 MCP，包括能写入外部系统（例如生产数据库）的工具。提示词明确禁止通过任何工具修改内容，但这只是指令层面的保护，不是沙箱限制。
-- **钥匙串与替换 `HOME`（macOS）。** 如果把 `HOME` 指向临时目录后启动程序（`claude`、`gh`、git 凭证助手、`security`），程序会找不到 macOS 钥匙串，每次尝试登录都会弹出“找不到钥匙串”的系统对话框。这些窗口会一直保留，直到被关闭。遇到这类窗口请点击“取消”：“重设为默认设置”会创建新的空钥匙串来替代你的钥匙串。链接到 `~/Library/Keychains` 虽然能消除弹窗，却会把整个钥匙串交给程序，其内容可通过 securityd 修改。因此，Codex 的 build 和审查提示词，以及 SKILL.md 中给 Claude 的规则，都要求通过环境变量提供凭证：`CLAUDE_CODE_OAUTH_TOKEN`（由 `claude setup-token` 创建）或 `GH_TOKEN`。没有凭证时必须询问用户。例如，曾在负责 build 的 Claude 会话中进行 `claude -p` 冒烟测试时触发此类弹窗；Codex 本身并未运行 `claude` 或 `security`。
+- 每个引擎都使用自己的**完整运行环境**：你的配置、模型、effort、已配置的 MCP 服务器及其他可用工具。
+- `--sandbox inherit` 使用所选引擎的权限。Codex 的明确模式会应用于每一轮：启动时使用 `-s`，`resume` 时使用 `-c sandbox_mode=…`，因为 `resume` 没有 `--sandbox` 参数。agy 的映射见上方对比表。
+- **agy 的 read-only 是承诺加上每轮结束后的检查，不是强制只读沙箱。** 其沙箱会拒绝 `write_file`，但 shell 命令仍能写入。每个只读轮次前后，运行器会对 Git 仓库 cwd 下已跟踪和未跟踪的非忽略文件计算指纹；Git 之外只扫描有上限的文件集合。检测到的违规会记录并警告，不会撤销改动。被忽略文件、cwd 之外的路径、超出上限的文件，以及检查前已还原的改动，都可能漏检。这种检查无法确保运行不可信代码是安全的。
+- 禁止在审查中修改文件、提交或更改外部系统，是**提示词指令**。对于外部 PR 和下载的文件，Codex 的 `--sandbox read-only` 会应用其 shell 沙箱；agy 的选项提供上述承诺与检查。
+- **不要依赖 shell 沙箱来限制 MCP 工具。** 审查者可能拥有能写入外部系统（例如生产数据库）的 MCP 工具。提示词禁止通过任何工具修改内容，但这属于指令，不是强制限制。
+- **钥匙串与替换 `HOME`（macOS）。** 如果把 `HOME` 指向临时目录后启动程序（`claude`、`gh`、git 凭证助手、`security`），程序会找不到 macOS 钥匙串，每次尝试登录都会弹出“找不到钥匙串”的系统对话框。这些窗口会一直保留，直到被关闭。遇到这类窗口请点击“取消”：“重设为默认设置”会创建新的空钥匙串来替代你的钥匙串。链接到 `~/Library/Keychains` 虽然能消除弹窗，却会把整个钥匙串交给程序，其内容可通过 securityd 修改。因此，引擎的 build 和审查提示词，以及 SKILL.md 中给 Claude 的规则，都要求通过环境变量提供凭证：`CLAUDE_CODE_OAUTH_TOKEN`（由 `claude setup-token` 创建）或 `GH_TOKEN`。没有凭证时必须询问用户。例如，曾在负责 build 的 Claude 会话中进行 `claude -p` 冒烟测试时触发此类弹窗；Codex 本身并未运行 `claude` 或 `security`。
 
 ## 文件布局
 
@@ -209,7 +235,7 @@ code 审查或 build 进行期间（最后一轮之后的 12 小时内视为活�
 |---|---|
 | `.claude-plugin/` | `plugin.json` 是插件清单；`marketplace.json` 是仅包含本插件的市场清单，用于安装 |
 | `SKILL.md`、`references/protocol.md`、`references/build.md` | 给 Claude 的指令 |
-| `scripts/duet.mjs` | 运行器：调用 Codex、问题记录、快照和输出 |
+| `scripts/duet.mjs` | 运行器：调用所选引擎、问题记录、快照和输出 |
 | `scripts/policy.mjs` | **你的**停止策略 `decideNextStep` |
 | `prompts/`、`schemas/` | 审查者提示词和回复的 JSON schema |
 | `hooks/register.tsx`、`types/index.d.ts` | 模块：面板、状态条、页脚、通知、声音、自动继续循环、提交保护和上下文摘要 |
@@ -219,19 +245,22 @@ code 审查或 build 进行期间（最后一轮之后的 12 小时内视为活�
 | `tests/` | `run.mjs`：运行器和策略；`mod.mjs`：使用模拟引擎测试模块；`pane.test.tsx`：使用真实引擎测试面板 |
 | `~/.local/state/codex-duet/<id>/` | 会话：`state.json`、各轮提示词和回复、`report.md` |
 
-可以在 Codex 中通过 `codex resume <thread id>` 打开审查者的完整推理过程，线程 ID 见报告。
+使用 `codex resume <thread id>` 重新打开 Codex 对话，或使用 `agy --conversation <conversation id>` 重新打开 agy 对话；ID 见报告。agy 原始输出保存在 `round-N.agy.jsonl`；`round-N.events.jsonl` 保存供验证与面板使用的规范化事件。解析后的回复保留兼容名称 `round-N.codex.json`。
 
 ## 环境变量
 
 | 变量 | 用途 |
 |---|---|
+| `CODEX_DUET_ENGINE` | 启动时的默认引擎：`codex` 或 `agy`（默认 `codex`） |
 | `CODEX_DUET_MODEL`、`CODEX_DUET_EFFORT` | 默认模型和 effort |
-| `CODEX_DUET_TIMEOUT_MIN` | Codex 每轮时限，单位为分钟（默认 0，即不限制） |
-| `CODEX_DUET_MAX_PARALLEL` | 同一台机器上同时运行的 Codex 轮次数（默认 10），其余排队 |
+| `CODEX_DUET_TIMEOUT_MIN` | 引擎每轮时限，单位为分钟（默认 0，即不限制） |
+| `CODEX_DUET_MAX_PARALLEL` | 同一台机器上同时运行的引擎轮次数（默认 10），其余排队 |
 | `CODEX_DUET_SANDBOX` | 默认沙箱模式（`inherit`） |
 | `CODEX_DUET_HOME` | 会话存储位置 |
 | `CODEX_DUET_POLICY` | 替代的策略文件（测试使用此方式） |
-| `CODEX_DUET_CODEX_BIN` | 替代的 codex 可执行文件（测试使用此方式） |
+| `CODEX_DUET_CODEX_BIN` | Codex 可执行文件（默认 `codex`） |
+| `CODEX_DUET_AGY_BIN` | agy 可执行文件（默认 `agy`） |
+| `CODEX_DUET_AGY_HOME` | 插件查找 agy 设置和日志的目录（默认 `~/.gemini/antigravity-cli`）；不会重定向 CLI 或更改 `HOME` |
 
 ## 测试
 
@@ -244,11 +273,18 @@ claude plugin validate .
 
 在插件目录中运行。GitHub Actions（`.github/workflows/tests.yml`）也会在 macOS 和 Linux 上执行 `run.mjs` 和 `mod.mjs`。
 
-`run.mjs` 使用模拟 Codex（`tests/fake-codex.mjs`）验证运行器：问题记录、争议、升级处理、`retry`、`resume` 时的 read-only、轮次之间的 diff，以及策略的英语原因消息。
+`run.mjs` 使用模拟 Codex（`tests/fake-codex.mjs`）验证运行器：问题记录、争议、升级处理、`retry`、`resume` 时的 read-only、轮次之间的 diff，以及策略的英语原因消息。它还包含仅使用模拟 agy 的测试（`tests/agy.mjs`）；可用 `node tests/agy.mjs` 单独运行，不需要真实 agy 或网络。
 
 `mod.mjs` 转译真实的 `hooks/register.tsx` 及其静态导入的本地文件，在模拟引擎（`tests/mod-engine.mjs`）中运行其钩子。测试会话由 `duet.mjs` 使用同一个模拟 Codex 创建。测试覆盖面板、状态条、页脚、通知、声音、自动继续循环、提交保护和摘要，也验证默认英语、显式语言设置、自动识别 locale 及其优先级、macOS 首选语言回退和读取失败时使用英语、上下文摘要、Stop 提醒、提交保护的拒绝消息、决策消息和三种语言表的键一致性。转译需要 esbuild（全局 `tsx` 内附的版本也可以）或 `typescript`；可通过 `ESBUILD` 或 `TYPESCRIPT` 指定路径。模拟引擎能捕获逻辑错误，却不能发现对 API 的误解：新增引擎调用时，请核对 `claude-code.d.ts` 并运行 `claude plugin validate`。这一思路来自 plan-progress（[zycck/claude-mods](https://github.com/zycck/claude-mods)）。
 
 `tests/pane.test.tsx` 通过引擎自带的测试套件（`claude plugin test`），在 terminal、desktop 和 mobile 三种界面中以英语、俄语和简体中文绘制面板。每种界面的元素表都会验证渲染树，这是模拟引擎做不到的。审查会话保存在测试内存中；测试检查长标题和其他会话的标记是否完整可见、问题能否展开，以及 Codex 的消息是否按 markdown 渲染。面板宽度为 44 列，也用于检查双列宽的中文字符能否正确换行。
+
+## agy 故障排查（已用 1.5.7 测试）
+
+- **启动时没有输出。** agy 会等待所有已配置的 MCP 服务器连接。检查 VPN/网络，并使用相同的 agy 配置运行 `agy mcp list`；无法连接的服务器可能阻塞本轮。排队和后台超时仍会生效。
+- **工具被拒绝。** 无界面运行时无法弹出交互式权限问题。请在 agy 中配置所需的 allow rules，或明确选择 `--sandbox danger-full-access`（`--dangerously-skip-permissions`）。`workspace-write` 使用 `--sandbox` 与 proceed-in-sandbox 设置，不会覆盖所有工具规则。
+- **Retry 重新开始。** 检查保存的会话 `.db` 是否仍在 `CODEX_DUET_AGY_HOME`（默认 `~/.gemini/antigravity-cli`）中。文件存在时 `retry` 才使用 `--conversation`；`--fresh` 则有意重新开始。
+- **Read-only 违规。** 继续前检查已记录的路径及文件。此检查在每轮后警告，绝不会自动回滚。它无法检测每次写入，限制见“安全”。
 
 ## Codex CLI 的注意事项（0.159）
 

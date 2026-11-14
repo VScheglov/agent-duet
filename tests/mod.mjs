@@ -24,6 +24,7 @@ const decisions = JSON.stringify({ 1: 'continue', 2: 'escalate', 3: 'done' });
 
 const baseEnv = {
   ...process.env,
+  CODEX_DUET_ENGINE: 'codex',
   CODEX_DUET_HOME: home,
   CODEX_DUET_CODEX_BIN: path.join(HERE, 'fake-codex.mjs'),
   CODEX_DUET_POLICY: path.join(HERE, 'fixture-policy.mjs'),
@@ -957,7 +958,283 @@ async function languageEngine(options, localeEnv = {}, defaultsResult) {
       ...fields,
     }));
   };
-  return { engine, sid, write };
+  return { engine, sid, write, stateHome };
+}
+
+const AGY_TEXT = {
+  en: { thinking: '⏳ agy is thinking', writing: '⏳ agy is writing code', auditing: '⏳ agy is auditing',
+    started: /agy started round 2/, queued: /queued for agy/, review: /agy finished round 1/,
+    author: /agy, round 1: 2 open/, hold: /agy finished round 1\/10 and awaits review/,
+    choice: 'agy is right', gaps: 'agy did not check: Browser not examined', defaults: 'model from agy config' },
+  ru: { thinking: '⏳ agy думает', writing: '⏳ agy пишет код', auditing: '⏳ agy проводит аудит',
+    started: /agy начал раунд 2/, queued: /в очереди к agy/, review: /agy закончил раунд 1/,
+    author: /agy, раунд 1: открыто 2/, hold: /agy закончил раунд 1\/10 и ждёт ревью/,
+    choice: 'Прав agy', gaps: 'agy не проверял: Browser not examined', defaults: 'модель — по конфигу agy' },
+  zh: { thinking: '⏳ agy 正在思考', writing: '⏳ agy 正在编写代码', auditing: '⏳ agy 正在审计',
+    started: /agy 已开始第 2 轮/, queued: /排队等待 agy/, review: /agy 已完成第 1 轮/,
+    author: /agy 第 1 轮：2 个未解决问题/, hold: /agy 已完成第 1\/10 轮，等待审查/,
+    choice: 'agy 是对的', gaps: 'agy 未检查：Browser not examined', defaults: '模型来自 agy 配置' },
+};
+
+for (const language of ['en', 'ru', 'zh']) {
+  await test(`${language}: agy names the worker across pane, band, toast, decisions and loop context without Codex Fast`, async () => {
+    const { engine, sid, write, stateHome } = await languageEngine({ language });
+    const expected = AGY_TEXT[language];
+    // A normalized agy event keeps the Codex event shape, but its shell command is plain.
+    const codexModel = { model: 'gemini-stand-in', effort: null, fromConfig: ['model', 'tier'], tier: 'priority' };
+    const pending = { round: 2, startedAt: ago(1000), codexModel };
+    const build = { kind: 'build', subject: { repo, worktree: repo, branch: 'codex-duet/agy' } };
+    const save = (fields = {}) => write({ engine: 'agy', ...fields });
+    save({ phase: 'awaiting-codex', pending });
+    fs.writeFileSync(path.join(stateHome, sid, 'lock'), String(process.pid));
+    fs.writeFileSync(path.join(stateHome, sid, 'round-2.events.jsonl'), [
+      ...ran('cmd', 'python3 -m unittest tests.smoke'),
+      { type: 'item.completed', item: { id: 'm', type: 'agent_message', text: 'Checked `parser`.\n\n- ready' } },
+    ].map((event) => JSON.stringify(event)).join('\n'));
+    await engine.tick();
+    let pane = lines(await engine.render('Pane')).join('\n');
+    assert.ok(pane.includes(expected.thinking), pane);
+    assert.match(pane, /agy: Checked `parser`\.\n\n- ready/);
+    assert.match(pane, /gemini-stand-in/);
+    assert.doesNotMatch(pane, /\bCodex\b|Fast|⚡/);
+    assert.match(lines(await engine.render('AbovePrompt')).join('\n'), /^⏳ agy gemini-stand-in · r2\/10/);
+    assert.ok(engine.toasts.some((text) => expected.started.test(text)), engine.toasts.join('\n'));
+    assert.match((await footer(engine)).join('\n'), /Duet r2 ⏳/);
+    assert.ok((await engine.prompt('Progress?')).context.join('\n').includes(expected.thinking));
+
+    save({ phase: 'queued', pending: { ...pending, queuedAt: ago(1000) } });
+    await engine.tick();
+    for (const text of [lines(await engine.render('Pane')).join('\n'), lines(await engine.render('AbovePrompt')).join('\n'), engine.toasts.at(-1)]) {
+      assert.match(text, /agy/);
+      assert.doesNotMatch(text, /\bCodex\b/);
+    }
+    assert.match(lines(await engine.render('AbovePrompt')).join('\n'), expected.queued);
+    assert.match((await footer(engine)).join('\n'), /Duet ⏸/);
+
+    save();
+    await engine.tick();
+    assert.match(engine.toasts.at(-1), expected.author);
+    await engine.press(await engine.render('Pane'), `fold-${sid}:C1`);
+    assert.match(lines(await engine.render('Pane')).join('\n'), /agy: Body of C1/);
+
+    save({ ...build, phase: 'awaiting-review' });
+    await engine.tick();
+    assert.match(engine.toasts.at(-1), expected.review);
+    assert.match(lines(await engine.render('AbovePrompt')).join('\n'), /agy/);
+    await engine.bash(`${RUNNER} status --session ${sid}`);
+    assert.match((await engine.stop()).block, expected.hold);
+    assert.match((await footer(engine)).join('\n'), /Duet r1 🔍/);
+
+    save({ ...build, phase: 'awaiting-codex', pending });
+    await engine.tick();
+    assert.ok(lines(await engine.render('Pane')).join('\n').includes(expected.writing));
+    // History remains keyed by "codex" even though the build author's display name is agy.
+    const issues = { C1: issue('C1', 'open', 'high', { history: [{ by: 'codex', action: 'fixed' }] }), C2: issue('C2', 'open') };
+    save({ ...build, phase: 'escalated', issues, decision: { action: 'escalate', reason: 'Owner decision', issues: ['C1', 'C2'] } });
+    await engine.tick();
+    let tree = await engine.render('Pane');
+    assert.equal(nodes(tree).find((n) => n.props.key === 'pick-codex-C1')?.props.label, expected.choice);
+    const score = { en: 'agy: fixed 1', ru: 'agy: исправил 1', zh: 'agy：修复 1' }[language];
+    assert.ok(lines(tree).some((line) => line.startsWith(score)), lines(tree).join('\n'));
+    await engine.press(tree, 'pick-codex-C1');
+    await engine.press(await engine.render('Pane'), 'pick-claude-C2');
+    await engine.press(await engine.render('Pane'), 'send-decisions');
+    assert.match(engine.submitted.at(-1), /C1:.*agy.*status withdrawn, owner: true/);
+    assert.doesNotMatch(engine.submitted.at(-1), /\bCodex\b/);
+    assert.match((await footer(engine)).join('\n'), LANGUAGE_TEXT[language].footer);
+
+    save({ phase: 'escalated', decision: { action: 'escalate', reason: 'Owner decision', issues: ['C1'] } });
+    await engine.tick();
+    await engine.press(await engine.render('Pane'), 'pick-codex-C1');
+    await engine.press(await engine.render('Pane'), 'send-decisions');
+    assert.match(engine.submitted.at(-1), /C1:.*agy.*fixed/);
+    assert.doesNotMatch(engine.submitted.at(-1), /\bCodex\b/);
+
+    save({ phase: 'done', rounds: [{ n: 1, codexModel, verification: {
+      label: 'static-analysis-only', checks: [], gaps: ['Browser not examined'],
+    } }] });
+    await engine.tick();
+    pane = lines(await engine.render('Pane')).join('\n');
+    assert.ok(pane.includes(expected.gaps), pane);
+    assert.match(pane, /gemini-stand-in/);
+    assert.doesNotMatch(pane, /\bCodex\b|Fast|⚡/);
+
+    save({ kind: 'audit', subject: { title: 'Audit sample' }, phase: 'awaiting-codex', pending: { round: 2, startedAt: ago(1000) } });
+    await engine.tick();
+    pane = lines(await engine.render('Pane')).join('\n');
+    assert.ok(pane.includes(expected.auditing), pane);
+    assert.ok(pane.includes(expected.defaults), pane);
+    assert.match((await engine.prompt('Audit progress?')).context.join('\n'), /agy/);
+    assert.doesNotMatch([pane, ...engine.toasts].join('\n'), /\bCodex\b|Fast|⚡/);
+    assert.ok(!engine.procs.some((command) => /^(?:agy|claude|gh|security)\b/.test(command)), 'the stand-in executes no agent or authentication command');
+  });
+}
+
+for (const [language, modelLine] of [
+  ['en', 'Model: gemini-stand-in (from config) · high'],
+  ['ru', 'Модель: gemini-stand-in (из конфига) · high'],
+  ['zh', '模型：gemini-stand-in（来自配置） · high'],
+]) {
+  await test(`${language}: agy displays explicit effort in current and recorded models while hiding only Fast`, async () => {
+    const { engine, sid, write, stateHome } = await languageEngine({ language });
+    const codexModel = { model: 'gemini-stand-in', effort: 'high', fromConfig: ['model', 'tier'], tier: 'priority' };
+    write({ engine: 'agy', phase: 'awaiting-codex', pending: { round: 2, startedAt: ago(1000), codexModel } });
+    fs.writeFileSync(path.join(stateHome, sid, 'lock'), String(process.pid));
+    await engine.tick();
+    let pane = lines(await engine.render('Pane')).join('\n');
+    let band = lines(await engine.render('AbovePrompt')).join('\n');
+    assert.ok(pane.includes(modelLine), pane);
+    assert.match(band, /^⏳ agy gemini-stand-in\/high · r2\/10/);
+    assert.doesNotMatch(`${pane}\n${band}`, /Fast|⚡/);
+    write({ engine: 'agy', phase: 'done', rounds: [{ n: 1, codexModel, verdict: 'approve' }] });
+    await engine.tick();
+    pane = lines(await engine.render('Pane')).join('\n');
+    assert.ok(pane.includes(modelLine), pane);
+    assert.doesNotMatch(pane, /Fast|⚡/);
+    // An explicit effort remains visible even when the default model has not been recorded.
+    write({ engine: 'agy', phase: 'awaiting-codex', pending: {
+      round: 2, startedAt: ago(1000), codexModel: { ...codexModel, model: null },
+    } });
+    await engine.tick();
+    pane = lines(await engine.render('Pane')).join('\n');
+    band = lines(await engine.render('AbovePrompt')).join('\n');
+    assert.ok(pane.includes(`${AGY_TEXT[language].defaults} · high`), pane);
+    assert.match(band, /^⏳ agy high · r2\/10/);
+  });
+}
+
+for (const [language, modelLine] of [
+  ['en', 'Model: gemini-3.8-flash-low · family gemini-3.8-flash (from config) · low'],
+  ['ru', 'Модель: gemini-3.8-flash-low · семейство gemini-3.8-flash (из конфига) · low'],
+  ['zh', '模型：gemini-3.8-flash-low · 系列 gemini-3.8-flash（来自配置） · low'],
+]) {
+  await test(`${language}: agy effective slug distinguishes config family from explicit level`, async () => {
+    const { engine, sid, write, stateHome } = await languageEngine({ language });
+    const codexModel = { model: 'gemini-3.8-flash-low', family: 'gemini-3.8-flash', effort: 'low', fromConfig: ['family'] };
+    write({ engine: 'agy', phase: 'awaiting-codex', pending: { round: 2, startedAt: ago(1000), codexModel } });
+    fs.writeFileSync(path.join(stateHome, sid, 'lock'), String(process.pid));
+    await engine.tick();
+    let pane = lines(await engine.render('Pane')).join('\n');
+    assert.ok(pane.includes(modelLine), pane);
+    assert.match(lines(await engine.render('AbovePrompt')).join('\n'), /^⏳ agy gemini-3\.8-flash-low\/low/);
+    write({ engine: 'agy', phase: 'done', rounds: [{ n: 1, codexModel, verdict: 'approve' }] });
+    await engine.tick();
+    pane = lines(await engine.render('Pane')).join('\n');
+    assert.ok(pane.includes(modelLine), pane);
+  });
+}
+
+for (const [language, freshLog] of [
+  ['en', /agy log updated 2\d+s ago/],
+  ['ru', /журнал agy обновлён 2\d+ с назад/],
+  ['zh', /agy 日志更新于 2\d+ 秒前/],
+]) {
+  await test(`${language}: agy freshness uses the newest conversation DB or WAL mtime and the saved conversation id`, async () => {
+    const agyHome = path.join(tmp, `agy-log-${language}`);
+    const { engine, sid, write, stateHome } = await languageEngine({ language }, { CODEX_DUET_AGY_HOME: agyHome });
+    const threadId = `conversation-${language}`;
+    const db = path.join(agyHome, 'conversations', `${threadId}.db`);
+    const wal = `${db}-wal`;
+    fs.mkdirSync(path.dirname(db), { recursive: true });
+    // These are intentionally opaque bytes: the pane needs only stat, never the database contents.
+    fs.writeFileSync(db, '\0sqlite stand-in');
+    fs.writeFileSync(wal, '\0wal stand-in');
+    write({ engine: 'agy', phase: 'awaiting-codex', codex: { threadId }, pending: { round: 2, startedAt: ago(20 * MIN) } });
+    fs.writeFileSync(path.join(stateHome, sid, 'lock'), String(process.pid));
+    const events = path.join(stateHome, sid, 'round-2.events.jsonl');
+    fs.writeFileSync(events, JSON.stringify({ type: 'item.completed', _at: ago(16 * MIN), item: { id: 'm', type: 'agent_message', text: 'Earlier words' } }));
+    fs.utimesSync(events, past(15 * MIN), past(15 * MIN));
+    fs.utimesSync(db, past(6 * MIN), past(6 * MIN));
+    fs.utimesSync(wal, past(20_000), past(20_000));
+    await engine.tick();
+    let pane = lines(await engine.render('Pane')).join('\n');
+    assert.match(pane, freshLog, 'recent WAL keeps a quiet conversation fresh');
+    assert.doesNotMatch(pane, /Codex/);
+    // A newer DB wins too, and a missing sidecar must not hide the DB's freshness.
+    fs.utimesSync(db, past(20_000), past(20_000));
+    fs.utimesSync(wal, past(8 * MIN), past(8 * MIN));
+    await engine.tick();
+    assert.match(lines(await engine.render('Pane')).join('\n'), freshLog);
+    fs.rmSync(wal);
+    await engine.tick();
+    assert.match(lines(await engine.render('Pane')).join('\n'), freshLog);
+    // A missing DB must not hide a surviving WAL, and absence of both is a quiet fallback.
+    fs.writeFileSync(wal, '\0wal stand-in');
+    fs.utimesSync(wal, past(20_000), past(20_000));
+    fs.rmSync(db);
+    await engine.tick();
+    assert.match(lines(await engine.render('Pane')).join('\n'), freshLog);
+    fs.rmSync(wal);
+    await engine.tick();
+    pane = lines(await engine.render('Pane')).join('\n');
+    assert.doesNotMatch(pane, freshLog);
+    assert.match(pane, /Earlier words/);
+  });
+}
+
+await test('agy freshness defaults to HOME/.gemini/antigravity-cli and can use the normalized thread event', async () => {
+  const { engine, sid, write, stateHome } = await languageEngine({ language: 'en' });
+  const threadId = 'default-home-conversation';
+  // Only the engine's stat response is faked; no file is created in the actual home directory.
+  engine.setFile(path.join(os.homedir(), '.gemini', 'antigravity-cli', 'conversations', `${threadId}.db`), true);
+  write({ engine: 'agy', phase: 'awaiting-codex', pending: { round: 2, startedAt: ago(1000) } });
+  fs.writeFileSync(path.join(stateHome, sid, 'lock'), String(process.pid));
+  fs.writeFileSync(path.join(stateHome, sid, 'round-2.events.jsonl'), JSON.stringify({ type: 'thread.started', thread_id: threadId }));
+  await engine.tick();
+  assert.match(lines(await engine.render('Pane')).join('\n'), /agy log updated/);
+});
+
+await test('agy freshness uses the pending conversation before normalized events arrive', async () => {
+  const agyHome = path.join(tmp, 'agy-pending-log');
+  const { engine, sid, write, stateHome } = await languageEngine({ language: 'en' }, { CODEX_DUET_AGY_HOME: agyHome });
+  const threadId = 'pending-conversation';
+  const wal = path.join(agyHome, 'conversations', `${threadId}.db-wal`);
+  fs.mkdirSync(path.dirname(wal), { recursive: true });
+  fs.writeFileSync(wal, '\0wal stand-in');
+  fs.utimesSync(wal, past(20_000), past(20_000));
+  write({ engine: 'agy', phase: 'awaiting-codex', codex: { threadId: 'old-conversation' },
+    pending: { round: 2, threadId, startedAt: ago(1000) } });
+  fs.writeFileSync(path.join(stateHome, sid, 'lock'), String(process.pid));
+  await engine.tick();
+  assert.match(lines(await engine.render('Pane')).join('\n'), /agy log updated 2\d+s ago/);
+});
+
+for (const [language, warning, changes] of [
+  ['en', '⚠ agy read-only violation:', ['added', 'changed', 'removed']],
+  ['ru', '⚠ agy нарушил режим только чтения:', ['добавлен', 'изменён', 'удалён']],
+  ['zh', '⚠ agy 违反只读模式：', ['已添加', '已更改', '已删除']],
+]) {
+  await test(`${language}: read-only violations show each changed path as a persistent warning, with round-only state compatibility`, async () => {
+    const { engine, write } = await languageEngine({ language });
+    const violations = [
+      { path: 'docs/new file.md', change: 'added', round: 1 },
+      { path: 'src/changed.ts', change: 'changed', round: 2 },
+      { path: 'old/deleted.ts', change: 'removed', round: 2 },
+    ];
+    const rounds = [{ n: 1, readOnlyViolations: [violations[0]] }, { n: 2, readOnlyViolations: violations.slice(1) }];
+    write({ engine: 'agy', phase: 'codex-failed', round: 1, pending: { round: 2, error: 'Read-only tree changed' },
+      rounds, readOnlyViolations: violations });
+    await engine.tick();
+    const warnings = (tree) => nodes(tree).filter((node) => node.type === 'Text'
+      && lines(node).some((line) => line.startsWith(warning)));
+    let shown = warnings(await engine.render('Pane'));
+    assert.equal(shown.length, 3, 'cumulative and per-round records are not duplicated');
+    for (const [index, node] of shown.entries()) {
+      assert.ok(lines(node)[0].startsWith(`${warning}${language === 'zh' ? '' : ' '}${changes[index]} `), lines(node)[0]);
+      assert.ok(lines(node)[0].endsWith(violations[index].path), lines(node)[0]);
+      assert.equal(node.props.color, 'yellow');
+      assert.equal(node.props.wrap, 'wrap');
+    }
+    // The warning remains visible on a later successful round, including ledgers with only round records.
+    write({ engine: 'agy', phase: 'done', round: 3, rounds: [...rounds, { n: 3, verdict: 'approve' }] });
+    await engine.tick();
+    shown = warnings(await engine.render('Pane'));
+    assert.equal(shown.length, 3);
+    assert.ok(shown.every((node, index) => lines(node)[0].endsWith(violations[index].path)));
+    write({ engine: 'agy', phase: 'done' });
+    await engine.tick();
+    assert.equal(warnings(await engine.render('Pane')).length, 0, 'clean sessions have no warning');
+  });
 }
 
 for (const [language, missing, other] of [

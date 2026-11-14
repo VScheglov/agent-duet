@@ -35,7 +35,11 @@ const SEVERITY_SHORT: Record<string, string> = { critical: 'crit', high: 'high',
 const BADGE_CELLS = 11 // "● C10 crit" and a space
 // The engine reloads the module when the language setting changes.
 let locale: Locale = en
-const phaseLabel = (phase: string) => (locale.phase as Record<string, string>)[phase] ?? phase
+const engineName = (view?: { engine?: string } | null) => view?.engine === 'agy' ? 'agy' : 'Codex'
+const phaseLabel = (phase: string, engine = 'Codex') => {
+  const label = (locale.phase as Record<string, string | ((engine: string) => string)>)[phase]
+  return typeof label === 'function' ? label(engine) : label ?? phase
+}
 const actionLabel = (action: string) => (locale.action as Record<string, string>)[action] ?? action
 const statusLabel = (status: string) => (locale.status as Record<string, string>)[status]
 const SPARK = '▁▂▃▄▅▆▇█'
@@ -64,7 +68,7 @@ const isBlocking = (issue: DuetIssue) => (SEVERITY_RANK[issue.severity] ?? 0) >=
 function phaseWithVerification(view: DuetView) {
   const label = view.phase === 'done' && view.verification
     ? locale.verificationStatus(locale.verificationLabels[view.verification.label]) : ''
-  return `${phaseLabel(view.phase)}${label ? ` · ${label}` : ''}`
+  return `${phaseLabel(view.phase, engineName(view))}${label ? ` · ${label}` : ''}`
 }
 
 // A check is named as Codex typed it while that is one short line; a script fed on stdin or a long chain
@@ -93,7 +97,7 @@ function verificationDetails(view: DuetView) {
   const note = [
     checks.length ? locale.verificationConfirmed(checks.filter((c) => c.outcome === 'passed' && c.confirmation === 'confirmed').length, checks.length) : '',
     ...checks.filter((c) => c.outcome === 'skipped').map((c) => describe(c, 'skipped')),
-    receipt.gaps.length ? locale.verificationGaps(receipt.gaps.map(oneLine).join('; ')) : '',
+    receipt.gaps.length ? locale.verificationGaps(receipt.gaps.map(oneLine).join('; '), engineName(view)) : '',
   ].filter(Boolean).join(' · ')
   return [{ text: problems.join('; '), isProblem: true }, { text: note, isProblem: false }].filter((line) => line.text)
 }
@@ -125,7 +129,7 @@ function wordsAge(v: DuetView) {
 function nowText(v: DuetView) {
   const quiet = v.quietMs !== null && v.quietMs >= STALE_MS ? ago(v.quietMs) : ''
   const what = v.current ? `${v.current}${quiet ? ` · ${quiet}` : ''}` : quiet ? locale.thinkingFor(quiet) : locale.thinking
-  return v.logAgeMs === null ? what : locale.logUpdated(what, ago(v.logAgeMs))
+  return v.logAgeMs === null ? what : locale.logUpdated(what, ago(v.logAgeMs), engineName(v))
 }
 
 // The band's short form: a command it runs, else its words while fresh, else how long it has been quiet.
@@ -140,15 +144,20 @@ function bandNow(v: DuetView) {
 const isFast = (m: DuetModel) => m.tier === 'priority' || m.tier === 'fast'
 
 // Model and effort show their source; nothing known at all reads as Codex's own defaults.
-function modelText(m: DuetModel) {
+function modelText(m: DuetModel, engine = 'Codex') {
   const part = (value: string | null, key: string) => (value ? `${value}${m.fromConfig.includes(key) ? locale.fromConfig : ''}` : locale.configDefault)
+  if (engine === 'agy') {
+    const family = m.family && m.fromConfig.includes('family') ? ` · ${locale.modelFamily(m.family)}${locale.fromConfig}` : ''
+    return `${m.model ? part(m.model, 'model') : locale.modelDefaults('', engine)}${family}${m.effort ? ` · ${part(m.effort, 'effort')}` : ''}`
+  }
   const fast = isFast(m) ? ` · ⚡ ${part('Fast', 'tier')}` : ''
-  if (!m.model && !m.effort) return locale.modelDefaults(fast)
+  if (!m.model && !m.effort) return locale.modelDefaults(fast, engine)
   return `${part(m.model, 'model')} · ${part(m.effort, 'effort')}${fast}`
 }
 
 // "gpt-6.1-sol/max ⚡" for the band, or nothing when the turn runs on unrecorded defaults.
-const modelTag = (m: DuetModel) => [[m.model, m.effort].filter(Boolean).join('/'), isFast(m) ? '⚡' : ''].filter(Boolean).join(' ')
+const modelTag = (m: DuetModel, engine = 'Codex') =>
+  [[m.model, m.effort].filter(Boolean).join('/'), engine !== 'agy' && isFast(m) ? '⚡' : ''].filter(Boolean).join(' ')
 
 // "▰▰▰▱▱▱▱▱▱▱": how many of the issues are closed, at a glance
 const progress = (done: number, total: number, cells = 10) =>
@@ -280,7 +289,7 @@ let mySessionId = ''
 // The newest sessions' states, re-read only when state.json changes; and the code reviews and builds that
 // run anywhere, which the commit guard protects whichever Claude session drives them.
 const states = new Map<string, { mtimeMs: number; st: any }>()
-let guarded: { id: string; cwd: string; phase: string }[] = []
+let guarded: { id: string; cwd: string; phase: string; engine?: string }[] = []
 
 // What the Stop hold knows about this Claude session: whether it drives a duet at all, whether the
 // person spoke last in the current turn, and whether Claude ran the runner since. A reload starts it over.
@@ -383,8 +392,16 @@ async function codexLogOf($: EngineInterface, st: any, threadId: string, now: nu
   return found
 }
 
-async function logAtOf($: EngineInterface, st: any, digest: Digest, now: number) {
-  const file = await codexLogOf($, st, digest.threadId, now)
+async function logAtOf($: EngineInterface, st: any, digest: Digest | null, now: number) {
+  if (st.engine === 'agy') {
+    const threadId = digest?.threadId || st.pending?.threadId || st.codex?.threadId
+    if (!threadId) return null
+    const home = (await $.env.get('CODEX_DUET_AGY_HOME')) || `${await $.env.get('HOME')}/.gemini/antigravity-cli`
+    const db = `${home}/conversations/${threadId}.db`
+    const stats = await Promise.all([db, `${db}-wal`].map((file) => $.fs.stat(file).catch(() => null)))
+    return Math.max(...stats.map((stat) => stat?.mtimeMs ?? 0)) || null
+  }
+  const file = await codexLogOf($, st, digest?.threadId ?? '', now)
   return file ? (await $.fs.stat(file).catch(() => null))?.mtimeMs || null : null
 }
 
@@ -417,11 +434,14 @@ function buildView(st: any, now: number, live: Liveness | null, digest: Digest |
     tokens: (r.usage?.input_tokens ?? 0) + (r.usage?.output_tokens ?? 0),
   }))
   // In a review Claude is the author and Codex reviews; in a build it is the other way round.
-  const roles = st.kind === 'build' ? { author: 'Codex', reviewer: 'Claude' } : { author: 'Claude', reviewer: 'Codex' }
-  const answers = raw.flatMap((i) => (i.history ?? []).filter((h: any) => h.by === roles.author.toLowerCase()))
+  const name = engineName(st)
+  const roles = st.kind === 'build' ? { author: name, reviewer: 'Claude' } : { author: 'Claude', reviewer: name }
+  const authorKey = st.kind === 'build' ? 'codex' : 'claude'
+  const answers = raw.flatMap((i) => (i.history ?? []).filter((h: any) => h.by === authorKey))
   const count = (action: string) => answers.filter((h: any) => h.action === action).length
   return {
     id: st.id,
+    engine: st.engine === 'agy' ? 'agy' : 'codex',
     kind: st.kind,
     label: labelOf(st),
     cwd: st.cwd,
@@ -460,6 +480,9 @@ function buildView(st: any, now: number, live: Liveness | null, digest: Digest |
     verification: st.kind === 'audit' ? null
       : (st.rounds ?? []).findLast((r: any) => r.kind !== 'post-approval')?.verification
         ?? { label: 'unknown', checks: [], gaps: [] },
+    readOnlyViolations: (st.readOnlyViolations ?? (st.rounds ?? []).flatMap((r: any) =>
+      (r.readOnlyViolations ?? []).map((violation: any) => ({ ...violation, round: violation.round ?? r.n }))))
+      .map((violation: any) => ({ ...violation, path: oneLine(violation.path) })),
     issues,
     rounds,
     activity: digest?.activity ?? [],
@@ -553,7 +576,7 @@ async function readSession($: EngineInterface) {
     const { seen, error } = await scanSessions($, root)
     guarded = seen
       .filter((s) => (s.st.kind === 'code' || s.st.kind === 'build') && isRunning(s.st, now))
-      .map((s) => ({ id: s.id, cwd: s.st.cwd, phase: s.st.phase }))
+      .map((s) => ({ id: s.id, cwd: s.st.cwd, phase: s.st.phase, engine: s.st.engine }))
     // Places in the queue, across every owner: the runner serves waiting turns in the order they queued.
     const queue = seen
       .filter((s) => s.st.phase === 'queued')
@@ -567,7 +590,7 @@ async function readSession($: EngineInterface) {
     const viewOf = async (s: { id: string; mtimeMs: number; st: any }) => {
       const ahead = queue.indexOf(s.id)
       const digest = detailed.has(s.id) ? await digestOf($, root, s) : null
-      const logAt = digest ? await logAtOf($, s.st, digest, now) : null
+      const logAt = detailed.has(s.id) && s.st.phase === 'awaiting-codex' ? await logAtOf($, s.st, digest, now) : null
       return buildView(s.st, now, await aliveOf($, root, s, now), digest, ahead >= 0 ? ahead : null, logAt)
     }
     const list: DuetView[] = []
@@ -678,13 +701,13 @@ async function announceOne($: EngineInterface, view: DuetView, prefs: DuetPrefs,
   const open = view.issues.filter((i) => i.status === 'open' && !i.parked)
   const blocking = open.filter(isBlocking).length
   if (view.phase === 'awaiting-codex') {
-    $.ui.toast(locale.toastStarted(tag, view.kind === 'audit', view.runningRound))
+    $.ui.toast(locale.toastStarted(tag, view.kind === 'audit', view.runningRound, engineName(view)))
   } else if (view.phase === 'queued') {
-    $.ui.toast(locale.toastQueued(tag, view.round + 1))
+    $.ui.toast(locale.toastQueued(tag, view.round + 1, engineName(view)))
   } else if (view.phase === 'awaiting-review') {
-    $.ui.toast(locale.toastReview(tag, view.round), { timeoutMs: 8000 })
+    $.ui.toast(locale.toastReview(tag, view.round, engineName(view)), { timeoutMs: 8000 })
   } else if (view.phase === 'awaiting-author') {
-    $.ui.toast(locale.toastAuthor(tag, view.round, open.length, blocking), { timeoutMs: 8000 })
+    $.ui.toast(locale.toastAuthor(tag, view.round, open.length, blocking, engineName(view)), { timeoutMs: 8000 })
     void $.prompt.suggest({ text: locale.continuePrompt })
   } else if (view.phase === 'escalated') {
     $.ui.toast(locale.toastEscalated(tag, (view.decision?.issues ?? []).join(', ')), { timeoutMs: 15000 })
@@ -715,7 +738,7 @@ async function setPref($: EngineInterface, name: keyof DuetPrefs, value?: boolea
 async function stopRound($: EngineInterface, given?: DuetView | null) {
   const view: DuetView | null = given ?? await read($, viewAtom)
   const round = view?.runningRound ?? (view?.isQueued ? view.round + 1 : null)
-  if (!round || !view?.pid) return locale.noRoundToStop
+  if (!round || !view?.pid) return locale.noRoundToStop(engineName(view))
   const { exitCode } = await $.process.run(['kill', '-TERM', String(view.pid)])
   if (exitCode !== 0) return locale.stopFailed(view.pid)
   return locale.stoppingRound(round, view.isQueued)
@@ -724,7 +747,7 @@ async function stopRound($: EngineInterface, given?: DuetView | null) {
 const pick = ($: EngineInterface, key: string, side: DuetChoice) =>
   update($, choicesAtom, (all: Record<string, DuetChoice> | undefined) => ({ ...all, [key]: side }))
 
-async function sendDecisions($: EngineInterface, sessionId: string, kind: string, issues: DuetIssue[]) {
+async function sendDecisions($: EngineInterface, sessionId: string, kind: string, issues: DuetIssue[], engine: string) {
   let picked: Record<string, DuetChoice> = {}
   await update($, choicesAtom, (all: Record<string, DuetChoice> | undefined) => {
     picked = all ?? {}
@@ -734,11 +757,11 @@ async function sendDecisions($: EngineInterface, sessionId: string, kind: string
     const side = picked[`${sessionId}:${issue.id}`]
     // In a build Claude is the reviewer: siding with Codex withdraws the issue, siding with Claude makes Codex fix it.
     if (kind === 'build') {
-      if (side === 'codex') return [locale.buildChooseCodex(issue.id)]
+      if (side === 'codex') return [locale.buildChooseCodex(issue.id, engine)]
       if (side === 'claude') return [locale.buildChooseClaude(issue.id)]
       return []
     }
-    if (side === 'codex') return [locale.reviewChooseCodex(issue.id)]
+    if (side === 'codex') return [locale.reviewChooseCodex(issue.id, engine)]
     if (side === 'claude') return [locale.reviewChooseClaude(issue.id)]
     return []
   })
@@ -785,9 +808,10 @@ async function holdReason($: EngineInterface, e: StopFacts) {
     return locale.holdMany(waiting.length, each.join('; '), after)
   }
   const view = waiting[0]
+  if (!view) return null
   const open = view.issues.filter((i) => i.status === 'open' && !i.parked).length
   const step = view.phase === 'awaiting-review'
-    ? locale.holdReviewStep(view.round, view.maxRounds)
+    ? locale.holdReviewStep(view.round, view.maxRounds, engineName(view))
     : locale.holdReplyStep(view.round, view.maxRounds, open)
   return locale.holdOne(view.id, step, after)
 }
@@ -810,7 +834,7 @@ function footerSummary(active: DuetView[]) {
 
 // One line per task for the pane's list: what it is, where it stands, how long, on what model.
 function taskLine(v: DuetView) {
-  const model = modelTag(v.codexModel)
+  const model = modelTag(v.codexModel, engineName(v))
   if (v.isProcessGone) return locale.taskGone(v.label)
   if (v.isQueued) return locale.taskQueued(v.label, v.queuedAhead, clock(v.elapsedMs))
   if (v.runningRound) return locale.taskRunning(v.label, v.runningRound, v.maxRounds, clock(v.elapsedMs), model)
@@ -823,19 +847,19 @@ function taskLine(v: DuetView) {
 function tasksNote(active: DuetView[], runner: string) {
   const each = active.map((v) => {
     const open = v.issues.filter((i) => i.status === 'open' && !i.parked).length
-    return locale.taskNote(v.id, v.kind, v.label, v.runningRound ?? v.round, v.maxRounds, phaseLabel(v.phase), open)
+    return locale.taskNote(v.id, v.kind, v.label, v.runningRound ?? v.round, v.maxRounds, phaseLabel(v.phase, engineName(v)), open)
   })
   return locale.tasksNote(active.length, each.join('; '), runner)
 }
 
 function contextNote(view: DuetView, runner: string) {
   if (view.kind === 'audit') {
-    return locale.auditNote(view.id, view.subject, view.runningRound ? locale.codexWorking : phaseLabel(view.phase), view.phase === 'done' ? view.findings.length : null, runner)
+    return locale.auditNote(view.id, view.subject, view.runningRound ? locale.codexWorking(engineName(view)) : phaseLabel(view.phase, engineName(view)), view.phase === 'done' ? view.findings.length : null, runner)
   }
   const open = view.issues.filter((i) => i.status === 'open' && !i.parked).map((i) => `${i.id} [${i.severity}] ${clip(i.title, 60)}`)
   const parked = view.issues.filter((i) => i.status === 'open' && i.parked).map((i) => i.id)
   return [
-    locale.reviewNote(view.id, view.kind, view.subject, view.runningRound ?? view.round, view.maxRounds, Boolean(view.runningRound), phaseLabel(view.phase), view.decision ? locale.noteDecision(view.decision.action, view.decision.reason) : ''),
+    locale.reviewNote(view.id, view.kind, view.subject, view.runningRound ?? view.round, view.maxRounds, Boolean(view.runningRound), phaseLabel(view.phase, engineName(view)), view.decision ? locale.noteDecision(view.decision.action, view.decision.reason) : ''),
     open.length ? locale.noteOpen(open.join('; ')) : locale.noOpenIssues,
     parked.length ? locale.noteParked(parked.join(', ')) : '',
     locale.noteNext(runner, view.id),
@@ -920,7 +944,7 @@ export const register: Register = (on, options) => {
     }
     if (!hit) return next(e)
     return {
-      deny: locale.commitDenied(hit.cwd, hit.id, phaseLabel(hit.phase)),
+      deny: locale.commitDenied(hit.cwd, hit.id, phaseLabel(hit.phase, engineName(hit))),
     }
   })
 
@@ -937,9 +961,10 @@ export const register: Register = (on, options) => {
     if (!isPerson) return next(e)
     const cwd = await $.session.cwd()
     const active = lastList.filter((v) => v.isActive && drives(v, cwd))
-    if (!active.length) return next(e)
+    const first = active[0]
+    if (!first) return next(e)
     const runner = `${$.plugin.root}/scripts/duet.mjs` // wherever the plugin is installed
-    const note = active.length === 1 ? contextNote(active[0], runner) : tasksNote(active, runner)
+    const note = active.length === 1 ? contextNote(first, runner) : tasksNote(active, runner)
     return next({ ...e, context: [...(e.context ?? []), note] })
   })
 
@@ -966,13 +991,13 @@ export const register: Register = (on, options) => {
     if (view.isQueued) {
       line = view.isProcessGone
         ? locale.bandQueueGone
-        : locale.bandQueued(view.label, view.queuedAhead, clock(view.elapsedMs))
+        : locale.bandQueued(view.label, view.queuedAhead, clock(view.elapsedMs), engineName(view))
     } else if (view.runningRound) {
       line = view.isProcessGone
         ? locale.bandRoundGone(view.runningRound)
-        : `⏳ Codex${modelTag(view.codexModel) ? ` ${modelTag(view.codexModel)}` : ''} · r${view.runningRound}/${view.maxRounds} · ${clock(view.elapsedMs)} · ${bandNow(view)}`
+        : `⏳ ${engineName(view)}${modelTag(view.codexModel, engineName(view)) ? ` ${modelTag(view.codexModel, engineName(view))}` : ''} · r${view.runningRound}/${view.maxRounds} · ${clock(view.elapsedMs)} · ${bandNow(view)}`
     } else if (view.phase === 'awaiting-review') {
-      line = locale.bandReview(view.round, view.maxRounds)
+      line = locale.bandReview(view.round, view.maxRounds, engineName(view))
     } else if (view.phase === 'escalated') {
       line = locale.bandEscalated((view.decision?.issues ?? []).join(', '))
       color = 'yellow'
@@ -1094,8 +1119,8 @@ export const register: Register = (on, options) => {
     const phaseText = isWaiting && view.isProcessGone
       ? locale.phaseGone
       : view.isQueued
-        ? locale.phaseQueued(view.queuedAhead, clock(view.elapsedMs))
-        : `${view.runningRound && view.kind === 'build' ? locale.phaseBuild : view.runningRound && view.kind === 'audit' ? locale.phaseAudit : phaseWithVerification(view)}${view.runningRound ? ` · ${clock(view.elapsedMs)}` : ''}`
+        ? locale.phaseQueued(view.queuedAhead, clock(view.elapsedMs), engineName(view))
+        : `${view.runningRound && view.kind === 'build' ? locale.phaseBuild(engineName(view)) : view.runningRound && view.kind === 'audit' ? locale.phaseAudit(engineName(view)) : phaseWithVerification(view)}${view.runningRound ? ` · ${clock(view.elapsedMs)}` : ''}`
     const tasks = list.length > 1 ? (
       <Box flexDirection="column">
         <Text weight="semibold" wrap="wrap">
@@ -1183,7 +1208,7 @@ export const register: Register = (on, options) => {
         <Box flexDirection="column">
           <Text weight="semibold" wrap="wrap">{locale.paneHeading(view.kind, view.runningRound ?? view.round, view.maxRounds)}</Text>
           <Text dimColor wrap="wrap">{`${view.id} · ${view.subject}`}</Text>
-          <Text dimColor wrap="wrap">{locale.model(modelText(view.codexModel))}</Text>
+          <Text dimColor wrap="wrap">{locale.model(modelText(view.codexModel, engineName(view)))}</Text>
           {view.isMine ? null : (
             <Text color="yellow" wrap="wrap">{locale.otherSession}</Text>
           )}
@@ -1200,6 +1225,11 @@ export const register: Register = (on, options) => {
           )) : null}
           {view.decision && !view.runningRound ? <Text dimColor wrap="wrap">{locale.decision(view.decision.action, view.decision.reason)}</Text> : null}
           {view.failure ? <Text color="red" wrap="wrap">{view.failure}</Text> : null}
+          {view.readOnlyViolations.map((violation, n) => (
+            <Text key={`read-only-${n}`} color="yellow" wrap="wrap">
+              {locale.readOnlyViolation(violation.path, locale.readOnlyChanges[violation.change], engineName(view))}
+            </Text>
+          ))}
           {diag.error ? <Text color="red" wrap="wrap">{locale.readErrorStale(diag.error)}</Text> : null}
         </Box>
 
@@ -1207,7 +1237,7 @@ export const register: Register = (on, options) => {
           <Box flexDirection="column">
             <Text wrap="wrap">{locale.now(nowText(view))}</Text>
             {/* Codex writes markdown (`code`, lists, paragraphs): drawn as a reply is, it reads as Codex meant it */}
-            {view.narration ? <Markdown text={clip(`Codex${wordsAge(view)}: ${view.narration}`, NARRATION_MAX)} dimColor /> : null}
+            {view.narration ? <Markdown text={clip(`${engineName(view)}${wordsAge(view)}: ${view.narration}`, NARRATION_MAX)} dimColor /> : null}
             {view.plan.map((step, n) => row(`plan-${n}`, <Text dimColor={step.done}>{step.done ? '☑' : '☐'}</Text>, step.text, { dimColor: step.done }))}
             {/* a command is a glance at what Codex does: one line, cut by the surface at the pane's edge */}
             {view.activity.map((what, n) => (
@@ -1233,7 +1263,7 @@ export const register: Register = (on, options) => {
                   {view.isMine ? <Box gap={1} flexWrap="wrap">
                     <Button
                       key={`pick-codex-${issue.id}`}
-                      label={locale.chooseCodex(choice === 'codex')}
+                      label={locale.chooseCodex(choice === 'codex', engineName(view))}
                       variant={choice === 'codex' ? 'primary' : 'secondary'}
                       onPress={() => { void pick($, key, 'codex') }}
                     />
@@ -1253,7 +1283,7 @@ export const register: Register = (on, options) => {
                 key="send-decisions"
                 variant="primary"
                 label={locale.sendDecisions(picked, escalated.length)}
-                onPress={() => { void sendDecisions($, view.id, view.kind, escalated) }}
+                onPress={() => { void sendDecisions($, view.id, view.kind, escalated, engineName(view)) }}
               />
             ) : null}
           </Box>

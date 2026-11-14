@@ -1,4 +1,5 @@
 export type DuetChoice = 'codex' | 'claude'
+export type DuetEngine = 'codex' | 'agy'
 
 export type DuetPrefs = { band: boolean; toasts: boolean; score: boolean; sound: boolean }
 
@@ -38,15 +39,20 @@ export type DuetFinding = { id: string; severity: string; title: string; locatio
 
 export type DuetPlanStep = { text: string; done: boolean }
 
+export type DuetReadOnlyViolation = { path: string; change: 'added' | 'changed' | 'removed'; round?: number }
+
 export type DuetScore = { fixed: number; disputed: number; conceded: number; parked: number; ownerDecided: number }
 
-// What a Codex turn runs on, recorded when the turn starts; fromConfig names what came from config.toml.
+// What an engine turn runs on. fromConfig names values from its config; agy can take
+// only the family from settings.json and the level from --effort, so the whole slug
+// must not be marked as coming from config in that case.
 // tier: a service tier beyond the standard one ("priority" is Fast), from config.toml, then from Codex's own
 // log while the turn runs ("default" once it says the turn got the standard tier); absent when unknown.
-export type DuetModel = { model: string | null; effort: string | null; fromConfig: string[]; tier?: string }
+export type DuetModel = { model: string | null; effort: string | null; fromConfig: string[]; family?: string; tier?: string }
 
 export type DuetView = {
   id: string
+  engine: DuetEngine // states from before engine selection use codex
   kind: string
   label: string // a short name for lists and toasts: a build's branch, a review's repository or files
   isQueued: boolean // the turn waits for a free Codex slot (at most CODEX_DUET_MAX_PARALLEL run at once)
@@ -70,6 +76,7 @@ export type DuetView = {
   failure: string
   decision: { action: string; reason: string; issues: string[] } | null
   verification: DuetVerification | null // the latest real Codex turn; null for audits
+  readOnlyViolations: DuetReadOnlyViolation[] // cumulative read-only changes reported by the runner
   issues: DuetIssue[]
   findings: DuetFinding[] // an audit's, [] for every other kind
   result: string // an audit's summary, '' for every other kind

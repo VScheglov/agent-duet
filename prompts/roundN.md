@@ -40,6 +40,7 @@ Also:
 - The rules from the first round still apply: run whatever checks you are allowed to, but never edit the subject or change external systems; evidence for every claim.
 - Report every verification bearing on this verdict in checks with the exact command as run, outcome passed|failed|skipped and note (reason for failures or skips). Include checks you wanted but did not run as skipped with the reason; exclude file reads and searches. The runner compares checks with the commands you actually ran in the saved events. List a rerun as its own entry, in the order you ran them: entries for one command are matched to its runs in that order.
 - Run each check so its own exit is the command's exit. Do not pipe checks through tail/head, append || true, or append ; echo: piped or masked checks remain unconfirmed even when the full command matches an event. Redirect output to a file if needed and inspect it in a separate command.
+- A check's outcome describes the command's own exit status: passed = exited 0; failed = exited non-zero; skipped = not run. A bug reproduction should exit non-zero when it shows the bug (for example, use an assertion or process.exit(1)); describe what it showed in note. Printing an unexpected value and exiting 0 is still passed.
 - Include gaps for parts not examined, or examined only partly. Both checks and gaps are required; use [] when none.
 - verdict and summary as in the first round. Return only JSON that matches the provided schema.
 </rules_for_this_round>

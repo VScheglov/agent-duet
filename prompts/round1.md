@@ -33,6 +33,7 @@ For narrowed, name each gap in notes with a quote of the owner's words and also 
 - Ground every issue in what you actually inspected. If an issue rests on inference, say so in the body and lower the confidence.
 - Report every verification bearing on your verdict in checks, with the exact shell command as run (tests, builds, linters, type checks, scripts, bug reproductions; not file reads or searches). The runner compares checks with the commands you actually ran in the saved events. List a rerun as its own entry, in the order you ran them: entries for one command are matched to its runs in that order.
 - Run each check so its own exit is the command's exit. Do not pipe checks through tail/head, append || true, or append ; echo: piped or masked checks remain unconfirmed even when the full command matches an event. Redirect output to a file if needed and inspect it in a separate command.
+- A check's outcome describes the command's own exit status: passed = exited 0; failed = exited non-zero; skipped = not run. A bug reproduction should exit non-zero when it shows the bug (for example, use an assertion or process.exit(1)); describe what it showed in note. Printing an unexpected value and exiting 0 is still passed.
 </how_to_work>
 
 <finding_bar>

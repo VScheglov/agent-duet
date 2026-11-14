@@ -1,8 +1,8 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "codex-duet",
-  "version": "0.11.2",
-  "description": "Claude ↔ Codex review loop with per-issue negotiation for plans, code and files, with a live pane",
+  "version": "0.12.0",
+  "description": "Claude ↔ Codex or agy review, build and audit loop with per-issue negotiation and a live pane",
   "types": "./types/index.d.ts",
   "author": {
     "name": "Vladimir Scheglov",
@@ -22,6 +22,7 @@
   },
   "keywords": [
     "codex",
+    "agy",
     "code-review",
     "review",
     "delegation",

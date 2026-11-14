@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { confirmVerification } from '../scripts/verification.mjs';
 import { checkQuotes } from '../scripts/quotes.mjs';
 import { matchingTests, normalizationTests } from './verification.mjs';
+import { agyTests } from './agy.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DUET = path.join(HERE, '..', 'scripts', 'duet.mjs');
@@ -20,6 +21,7 @@ const fakeState = path.join(tmp, 'codex-calls.json');
 
 const baseEnv = {
   ...process.env,
+  CODEX_DUET_ENGINE: 'codex',
   CODEX_DUET_HOME: home,
   CODEX_DUET_CODEX_BIN: path.join(HERE, 'fake-codex.mjs'),
   CODEX_DUET_POLICY: path.join(HERE, 'fixture-policy.mjs'),
@@ -2456,5 +2458,6 @@ await test('policy 4: progress or too little history is not a stall', () => {
   assert.equal(decision({ round: 2, open: [iss('C1', 'high')], history: [{ round: 1, open: 1 }, { round: 2, open: 1 }] }).action, 'continue');
 });
 
+await agyTests(test, tmp);
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log(`\n${passed} tests passed`);

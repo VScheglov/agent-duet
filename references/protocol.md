@@ -1,5 +1,7 @@
 # Negotiation protocol (author side)
 
+“The delegate” is the session engine, Codex or agy. Engine choice is fixed at `start`; the issue protocol and stop rules are shared.
+
 ## Response JSON
 
 Send it to `reply --responses -` through a quoted heredoc, so the shell leaves the text alone:
@@ -11,19 +13,19 @@ node "<base>/scripts/duet.mjs" reply --session <id> --responses - <<'DUET_JSON'
   "responses": [
     {"id": "C1", "action": "fixed", "note": "parse() returns [] for empty input: src/parse.js:41-47, test added in parse.test.js:88."},
     {"id": "C2", "action": "disputed", "note": "The retry is bounded: MAX_RETRIES = 3 (src/net.js:12) and the caller times out after 5 s (src/api.js:88). An unbounded loop is not reachable."},
-    {"id": "C3", "action": "needs-user", "note": "Codex wants soft delete; the user explicitly asked for hard delete. This is a product decision."}
+    {"id": "C3", "action": "needs-user", "note": "The delegate wants soft delete; the user explicitly asked for hard delete. This is a product decision."}
   ]
 }
 DUET_JSON
 ```
 
 - Answer every open issue exactly once; the script rejects a reply that skips one. Parked issues need no answer until the user decides.
-- `note` is mandatory and is what Codex sees. Make it verifiable: paths with lines, commands with their key output, quotes of requirements.
+- `note` is mandatory and is what the delegate sees. Make it verifiable: paths with lines, commands with their key output, quotes of requirements.
 - Write notes in the language of the issue text.
 
-Issues whose titles start with `Request: ` identify something dropped, narrowed or contradicted from the owner's request, accepted amendments or claimed result. Answer them like any other issue: fix, dispute with evidence, or park for the owner. A dispute must quote the owner's words (and the accepted amendment with its source when relevant) to show why the requirement is still met; the author's narrower specification alone is not evidence. Codex re-assesses `request_check` each round. Without an owner request ruling, a latest check of `narrowed` prevents `DONE` and escalates even if the reviewer otherwise approves; `unclear` is shown but does not itself block `DONE`.
+Issues whose titles start with `Request: ` identify something dropped, narrowed or contradicted from the owner's request, accepted amendments or claimed result. Answer them like any other issue: fix, dispute with evidence, or park for the owner. A dispute must quote the owner's words (and the accepted amendment with its source when relevant) to show why the requirement is still met; the author's narrower specification alone is not evidence. The delegate re-assesses `request_check` each round. Without an owner request ruling, a latest check of `narrowed` prevents `DONE` and escalates even if the reviewer otherwise approves; `unclear` is shown but does not itself block `DONE`.
 
-The summary's `Verification:` receipt confirms Codex's claimed checks against the round's saved command events and lists failures, skips with reasons, unconfirmed or contradicted claims, and gaps. `executed` means all checks confirmed with no skips or gaps (including confirmed failures); `partial` means some confirmed with incomplete coverage; `static-analysis-only` means none confirmed; older replies are `unknown`. The label appears beside DONE, in `report.md` and in `/duet`; it never changes the stop decision. Present it to the owner, and explain the limits whenever it is not `executed`.
+The summary's `Verification:` receipt confirms the delegate's claimed checks against the round's saved command events and lists failures, skips with reasons, unconfirmed or contradicted claims, and gaps. `executed` means all checks confirmed with no skips or gaps (including confirmed failures); `partial` means some confirmed with incomplete coverage; `static-analysis-only` means none confirmed; older replies are `unknown`. The label appears beside DONE, in `report.md` and in `/duet`; it never changes the stop decision. Present it to the owner, and explain the limits whenever it is not `executed`.
 
 ## Quote checks
 
@@ -39,11 +41,11 @@ Each issue has a separate `path`, `line` and `quote`. Before recording a review,
 
 Summaries and author prompts show moved, other-file and missing citations; subsequent reviewer prompts also show `unchecked`. The report keeps every mark and its round; the pane flags missing and other-file citations only on open issues. An existing open issue is checked again only when it carries a nonempty quote and its quote or path changes; changing only the line does not trigger a check. Replies that resolve or withdraw an issue, and replies with unchanged or absent quotes, keep the earlier citation and check. This preserves evidence of the original problem after a fix removes the quoted code. Older issues without a check remain unchecked until re-cited while open.
 
-`MISSING` is a reason to ask Codex to re-cite, not proof that the issue is wrong. Inspect the evidence before using a mark in a dispute. A mark never resolves, withdraws or parks an issue and never changes the stop decision; every open issue still needs an answer.
+`MISSING` is a reason to ask the delegate to re-cite, not proof that the issue is wrong. Inspect the evidence before using a mark in a dispute. A mark never resolves, withdraws or parks an issue and never changes the stop decision; every open issue still needs an answer.
 
 ## Actions
 
-| action | meaning | what Codex does next |
+| action | meaning | what the delegate does next |
 |---|---|---|
 | `fixed` | the change is already on disk | verifies: `resolved`, or keeps it open and says what is still wrong |
 | `disputed` | the issue does not hold or is not worth fixing | withdraws it, or answers with new evidence |
@@ -52,7 +54,7 @@ Summaries and author prompts show moved, other-file and missing citations; subse
 
 ## Fix, dispute or park
 
-**Fix** when the issue is correct and the fix stays within the task. When only part of an issue is right, fix that part and say in the note why the rest is not needed; Codex keeps the issue open if that is not enough.
+**Fix** when the issue is correct and the fix stays within the task. When only part of an issue is right, fix that part and say in the note why the rest is not needed; the delegate keeps the issue open if that is not enough.
 
 **Dispute** only with evidence, when one of these holds:
 - the claim is factually wrong: show the code, a command and its output, or documentation;
@@ -62,7 +64,7 @@ Summaries and author prompts show moved, other-file and missing citations; subse
 
 **Park** (`needs-user`) when the call belongs to the user: a product or business choice, a real risk against an explicit requirement, a fix that needs access or data Claude lacks, or a fix that would widen the scope substantially.
 
-Concede as soon as Codex brings evidence that was not considered: fix and answer `fixed`. Do not repeat an argument Codex has already answered. With nothing new to add, either fix the issue or park it. Never dispute just to finish faster.
+Concede as soon as the delegate brings evidence that was not considered: fix and answer `fixed`. Do not repeat an argument the delegate has already answered. With nothing new to add, either fix the issue or park it. Never dispute just to finish faster.
 
 ## Writing a dispute
 
@@ -75,7 +77,7 @@ Concede as soon as Codex brings evidence that was not considered: fix and answer
 Use the user's language. For each issue:
 
 **C3 [high] Soft or hard delete** (`src/users/delete.ts:40`)
-- Codex: …one or two sentences…
+- Delegate: …one or two sentences…
 - Claude: …one or two sentences…
 - Decide: …the concrete question…
 
@@ -87,12 +89,13 @@ For a request-check escalation, present the reviewer's notes and the decision ne
 {"changes": "Owner settled the scope.", "request_ruling": "The owner accepts CSV only for this release.", "responses": []}
 ```
 
-`request_ruling` must be a non-empty string conveying the owner's actual decision. It is allowed before an escalation too, persists across later replies, and is shown in summaries, `status` and the report as `Owner decision (final)`. Every later Codex turn receives it as an accepted amendment. The request-check backstop no longer escalates after a ruling; new gaps still use ordinary `Request: ` issues, and every open issue still needs an answer. At the round limit, a ruling with only `owner-decided` responses (or no responses) is recorded without another Codex turn; add `--max-rounds` if another turn is wanted. If the owner requires the full scope instead, fix the subject and reply with the change.
+`request_ruling` must be a non-empty string conveying the owner's actual decision. It is allowed before an escalation too, persists across later replies, and is shown in summaries, `status` and the report as `Owner decision (final)`. Every later delegate turn receives it as an accepted amendment. The request-check backstop no longer escalates after a ruling; new gaps still use ordinary `Request: ` issues, and every open issue still needs an answer. At the round limit, a ruling with only `owner-decided` responses (or no responses) is recorded without another delegate turn; add `--max-rounds` if another turn is wanted. If the owner requires the full scope instead, fix the subject and reply with the change.
 
 ## Recovery
 
 - After context compaction or in a new conversation: `status` re-prints the current state and the next command.
-- Before Claude or the owner manually commits reviewed code, run `verify --session <id>` in the foreground. It checks the working tree against the approved snapshot, labels paths `covered`, `edited-after-review`, or `never-reviewed`, and exits 0 only when they match. If they differ, use the printed `reply --session <id> --responses -` command with `{"changes": "<what changed after the approval>", "responses": []}` to have Codex review the current content again. `status` also shows a one-line verdict for a done code or build session.
+- Before Claude or the owner manually commits reviewed code, run `verify --session <id>` in the foreground. It checks the working tree against the approved snapshot, labels paths `covered`, `edited-after-review`, or `never-reviewed`, and exits 0 only when they match. If they differ, use the printed `reply --session <id> --responses -` command with `{"changes": "<what changed after the approval>", "responses": []}` to have the delegate review the current content again. `status` also shows a one-line verdict for a done code or build session.
 - In a build, `finish` commits only approved content; worktree or commit-hook drift returns as a review round with no commit left on the branch. `finish --unreviewed` bypasses the checks only on the owner's explicit word and records that decision in the commit and report.
-- A round failed (network, timeout, expired login): fix the cause (for example `codex login`), then `retry`.
-- To see the reviewer's full reasoning, open the thread in Codex: `codex resume <thread id>` (the id is in the report).
+- A round failed (network, timeout, expired login): fix the cause in the selected CLI, then `retry`. It retains the session engine. For agy MCP waits, check VPN/network and `agy mcp list`; for headless permission denials, configure allow rules or explicitly select `danger-full-access`.
+- To reopen the conversation, use `codex resume <thread id>` for Codex or `agy --conversation <conversation id>` for agy; the report contains the id. agy resumes only while its conversation `.db` exists in `CODEX_DUET_AGY_HOME` (default `~/.gemini/antigravity-cli`); otherwise retry restarts. `retry --fresh` always restarts.
+- agy saves raw output in `round-N.agy.jsonl` and normalized command events in `round-N.events.jsonl`; the parsed reply remains `round-N.codex.json` for compatibility. For agy read-only reviews, inspect any after-turn fingerprint warning: writes are recorded and never undone automatically; the promise and check do not prevent shell writes.

@@ -12,6 +12,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { confirmVerification, unknownVerification, verificationClaims, verificationLines } from './verification.mjs';
 import { checkQuotes, quoteCheckLine, recitesQuote } from './quotes.mjs';
+import { AGY_BIN, AGY_READ_ONLY, AgyEvents, agyAnswer, agyArgs, agyConversation, agyDefaults, agyError, checkAgyChoice, fingerprint, observedAgyModel, readOnlyChanges } from './agy.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const ROOT = path.resolve(path.dirname(SELF), '..');
@@ -38,20 +39,34 @@ const ACTIONS = ['fixed', 'disputed', 'needs-user', 'owner-decided'];
 const STATUSES = ['open', 'resolved', 'withdrawn'];
 const SEVERITY_RANK = { critical: 3, high: 2, medium: 1, low: 0 };
 const PHASE_BY_ACTION = { continue: 'awaiting-author', done: 'done', escalate: 'escalated' };
+const engineOf = (st) => st.engine ?? 'codex';
+const engineName = (st) => engineOf(st) === 'agy' ? 'agy' : 'Codex';
+
+function checkEngine(value) {
+  if (!['codex', 'agy'].includes(value)) throw new UsageError('--engine must be one of: codex, agy');
+  return value;
+}
+
+function guardEngine(st, o) {
+  if (o.engine != null && checkEngine(o.engine) !== engineOf(st)) {
+    throw new UsageError(`session ${st.id} uses engine ${engineOf(st)}; --engine cannot change a session's engine`);
+  }
+}
 
 const USAGE = `Usage: duet.mjs <command> [options]
 
-  start   --kind plan|code|file [--subject <path>|-]... [--base <ref>] [--focus <text>]
+  start   --engine codex|agy (default: CODEX_DUET_ENGINE, else codex)
+          --kind plan|code|file [--subject <path>|-]... [--base <ref>] [--focus <text>]
           [--brief <file>|-]  owner's request, accepted amendments and claimed result
           [--max-rounds 10] [--model <name>] [--effort <level>] [--timeout-min 0]
-          (--timeout-min: minutes per Codex turn; 0, the default, is no limit)
+          (--timeout-min: minutes per engine turn; 0, the default, is no limit)
           [--sandbox inherit|read-only|workspace-write|danger-full-access]
-          (inherit, the default: whatever the owner's Codex config allows)
+          (inherit, the default: whatever the selected engine's config allows)
   start   --kind build --subject <spec>|- [--base <ref>] [--branch <name>] [...the options above]
-          Codex implements the spec in a worktree on a new branch; Claude reviews
+          The engine implements the spec in a worktree on a new branch; Claude reviews
           The spec needs a non-empty ## Owner's request section; --brief is for reviews only
   start   --kind audit --subject <task>|- [--model <name>] [--effort <level>] [--timeout-min 0]
-          Codex examines what the task asks about in the current directory, always read-only, and
+          The engine examines what the task asks about in the current directory, always read-only, and
           reports findings with evidence: one turn, nothing to answer, the report is the result
   reply   --responses <file>|- [--session <id>] [--max-rounds <n>]     (review sessions)
   review  --issues <file>|- [--session <id>] [--max-rounds <n>]        (build sessions)
@@ -59,11 +74,12 @@ const USAGE = `Usage: duet.mjs <command> [options]
           --unreviewed: only on the owner's explicit word, commit without an approval check
   verify  [--session <id>]     code/build: compare current content with the approved tree (foreground)
   discard [--session <id>]     build: remove the worktree and delete its branch
-  retry   [--session <id>] [--fresh]   re-run a Codex round that failed; a turn Codex had begun goes on
+  retry   [--session <id>] [--fresh]   re-run a round that failed; a turn the engine had begun goes on
           in its own thread, with what it did and read; --fresh starts the turn over
-          reply, review and retry also take --model, --effort and --timeout-min: the session's Codex
-          switches from its next turn on. Models and efforts are checked against the owner's Codex
-          (models_cache.json). Run start, reply, review and retry in the background: a Codex turn
+          reply, review and retry also take --model, --effort and --timeout-min; --engine must match
+          the session. Models and efforts are checked against Codex's models_cache.json or agy models.
+          agy's read-only is a promise plus a tree check, not an enforced sandbox.
+          Run start, reply, review and retry in the background: an engine turn
           outlasts the 10-minute limit of a foreground Bash call
   status  [--session <id>]     re-print the latest round summary
   report  [--session <id>]     print the full report
@@ -178,23 +194,41 @@ function checkCodexChoice(model, effort) {
 }
 
 // --model/--effort from the command line over `base` (the environment at start, the session's own later).
-function codexChoice(o, base) {
-  const model = checkToken(o.model ?? base.model, 'model', MODEL_RE);
+function codexChoice(o, base, engine = 'codex', switching = false) {
+  const requested = o.model ?? base.model;
+  const model = engine === 'agy'
+    ? checkToken(typeof requested === 'string' ? requested.trim() : requested, 'model', /^[^\x00-\x1f\x7f]+$/u)
+    : checkToken(requested, 'model', MODEL_RE);
   const effort = o.effort ?? base.effort;
-  return checkCodexChoice(model, checkToken(effort == null ? effort : String(effort).toLowerCase(), 'effort', EFFORT_RE));
+  const level = checkToken(effort == null ? effort : String(effort).toLowerCase(), 'effort', EFFORT_RE);
+  if (engine === 'agy') {
+    try { return checkAgyChoice(model, level, { switchEffort: switching && o.model == null && o.effort != null }); }
+    catch (err) { throw new UsageError(err.message); }
+  }
+  return checkCodexChoice(model, level);
 }
 
 // On reply, review or retry: the session's Codex switches from its next turn on. --timeout-min too, so a
 // session started with an old limit can drop it (0).
 function switchCodex(st, o) {
+  guardEngine(st, o);
   if (o['timeout-min'] != null) st.codex.timeoutMin = toCount(o['timeout-min'], 'timeout-min');
+  if (engineOf(st) === 'agy') {
+    Object.assign(st.codex, codexChoice(o, st.codex, 'agy', true));
+    return;
+  }
   if (o.model == null && o.effort == null) return;
-  Object.assign(st.codex, codexChoice(o, st.codex));
+  Object.assign(st.codex, codexChoice(o, st.codex, engineOf(st)));
 }
 
 // What a Codex turn runs on: the session's choice, else config.toml's default at this moment. A turn
 // records it when it starts, so the pane and the round history show the truth after config.toml changes.
 function turnModel(st) {
+  if (engineOf(st) === 'agy') {
+    if (st.codex.modelInfo) return structuredClone(st.codex.modelInfo);
+    const defaults = agyDefaults();
+    return { model: st.codex.model ?? defaults.model, effort: st.codex.effort ?? null, fromConfig: st.codex.model ? [] : ['model'] };
+  }
   const { models, defaults } = codexCatalog();
   const model = st.codex.model ?? defaults.model ?? null;
   const m = {
@@ -214,10 +248,29 @@ function turnModel(st) {
 const isFastTier = (tier) => tier === 'priority' || tier === 'fast';
 
 function modelLine(st) {
-  const m = turnModel(st);
+  const m = engineOf(st) === 'agy' ? st.pending?.codexModel ?? lastCodexRound(st)?.codexModel ?? turnModel(st) : turnModel(st);
   const show = (value, key, fallback) => (value ? `${value}${m.fromConfig.includes(key) ? ' (config)' : ''}` : fallback);
-  const fast = isFastTier(m.tier) ? ` · ⚡ ${show('Fast', 'tier')}` : '';
-  return `Model: ${show(m.model, 'model', 'Codex default')} · ${show(m.effort, 'effort', 'default effort')}${fast}`;
+  const fast = engineOf(st) === 'codex' && isFastTier(m.tier) ? ` · ⚡ ${show('Fast', 'tier')}` : '';
+  const family = engineOf(st) === 'agy' && m.family && m.fromConfig.includes('family') ? ` · family ${m.family} (config)` : '';
+  return `Model: ${show(m.model, 'model', `${engineName(st)} default`)}${family} · ${show(m.effort, 'effort', 'default effort')}${fast}`;
+}
+
+function engineWarnings(st) {
+  const L = [];
+  if (engineOf(st) === 'agy') {
+    L.push('Engine: agy');
+    if (st.codex.modelCheckNote) L.push(`Model check: ${st.codex.modelCheckNote}`);
+  }
+  if (st.readOnlyViolations?.length) L.push(`WARNING: read-only violations: ${st.readOnlyViolations.map((v) => `${v.path} (${v.change})`).join(', ')}. Changes were not undone.`);
+  if (st.readOnlyCheckWarnings?.length) L.push(`WARNING: read-only tree check incomplete: ${st.readOnlyCheckWarnings.join('; ')}`);
+  return L;
+}
+
+function threadLine(st) {
+  const id = st.pending?.threadId ?? st.codex.threadId;
+  return engineOf(st) === 'agy'
+    ? `agy conversation: ${id} (continue it in agy: agy --conversation ${id})`
+    : `Codex thread: ${st.codex.threadId} (continue it in Codex: codex resume ${st.codex.threadId})`;
 }
 
 // Never read stdin unless asked to: an unclosed stdin would block forever.
@@ -698,6 +751,7 @@ const oneLine = (text) => String(text ?? '').replace(/\s+/g, ' ').trim();
 // What the reviewer may run, told to it in round 1; sessions from before --sandbox ran read-only.
 function toolingNote(st) {
   if ((st.codex.sandbox ?? 'read-only') === 'read-only') {
+    if (engineOf(st) === 'agy') return AGY_READ_ONLY;
     return 'The shell sandbox is read-only: read and run read-only commands, nothing that writes files.';
   }
   return 'You may run whatever helps to verify the subject: tests, builds, linters, scripts. Temporary files, '
@@ -708,10 +762,10 @@ function toolingNote(st) {
     + 'through the environment (claude: `CLAUDE_CODE_OAUTH_TOKEN`, gh: `GH_TOKEN`), or leave that check out and say so.';
 }
 
-function buildPrompt(st, round, snap, prev, payload) {
+function buildPrompt(st, round, snap, prev, payload, contextOnly = false) {
   const subject = st.kind === 'code' ? codeSubject(st, snap, prev) : docSubject(st, snap, prev);
   if (round === 1) {
-    if (subject.empty) throw new UsageError('nothing to review: the subject is empty');
+    if (subject.empty && !contextOnly) throw new UsageError('nothing to review: the subject is empty');
     return fill(template('round1.md'), {
       SUBJECT_HEADER: subject.header,
       TOOLING: toolingNote(st),
@@ -816,6 +870,12 @@ function noteTier(st, tier) {
 
 // The prompt goes through stdin, which is then closed: `codex exec` waits for EOF on a piped stdin.
 function runCodex(st, round, prompt, threadId, schema = SCHEMA) {
+  const agy = engineOf(st) === 'agy';
+  const normalizer = agy ? new AgyEvents() : null;
+  if (agy && (st.codex.sandbox === 'read-only' || st.kind === 'audit')) {
+    prompt = prompt.replace('The shell sandbox is read-only: read files and run read-only commands, nothing that writes files, installs anything or starts services.', 'Read files and run read-only commands, nothing that writes files, installs anything or starts services.');
+    if (!prompt.includes(AGY_READ_ONLY)) prompt = `${AGY_READ_ONLY}\n\n${prompt}`;
+  }
   const dir = sessionDir(st.id);
   const out = path.join(dir, `round-${round}.codex.json`);
   const errPath = path.join(dir, `round-${round}.stderr.txt`);
@@ -823,9 +883,11 @@ function runCodex(st, round, prompt, threadId, schema = SCHEMA) {
   fs.rmSync(out, { force: true });
   const events = fs.createWriteStream(path.join(dir, `round-${round}.events.jsonl`));
   const errors = fs.createWriteStream(errPath);
+  const raw = agy ? fs.createWriteStream(path.join(dir, `round-${round}.agy.jsonl`)) : null;
+  const before = agy && st.codex.sandbox === 'read-only' ? fingerprint(st.cwd) : null;
 
   return new Promise((resolve) => {
-    const result = { threadId, out, errPath, usage: null, turnFailed: null, lastError: null, timedOut: false, cancelled: false };
+    const result = { threadId, out, errPath, usage: null, turnFailed: null, lastError: null, timedOut: false, cancelled: false, ...(agy ? { engine: 'agy' } : {}) };
     // The tier the turn got shows only in Codex's log, once the turn has begun: looked for as soon as Codex
     // names the thread, then every few seconds for a minute, and once more when the turn is over.
     const sinceMs = Date.now();
@@ -833,6 +895,7 @@ function runCodex(st, round, prompt, threadId, schema = SCHEMA) {
     let tierLooks = 0;
     const lookForTier = () => {
       clearTimeout(tierTimer);
+      if (agy) return;
       if (!result.threadId || result.tier) return;
       const tier = appliedTier(st, result.threadId, sinceMs);
       if (tier) {
@@ -844,7 +907,8 @@ function runCodex(st, round, prompt, threadId, schema = SCHEMA) {
     };
     // A process group of its own: timeout and cancel take down the whole tree (the codex
     // wrapper, its native binary, MCP servers, shell commands), not only the wrapper.
-    const child = spawn(CODEX_BIN, codexArgs(st, out, threadId, schema), {
+    const bin = agy ? AGY_BIN : CODEX_BIN;
+    const child = spawn(bin, agy ? agyArgs(st, threadId, schema) : codexArgs(st, out, threadId, schema), {
       cwd: st.cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
       detached: true,
@@ -904,44 +968,76 @@ function runCodex(st, round, prompt, threadId, schema = SCHEMA) {
       child.stderr?.destroy();
       process.off('SIGINT', cancel);
       process.off('SIGTERM', cancel);
-      if (buffer) events.write(buffer); // a last line without its newline, as it came
+      if (buffer) {
+        if (agy) consumeLine(buffer);
+        else events.write(buffer); // Codex's last line without its newline, as it came
+      }
       // Receipts read the saved events after this promise resolves: wait for both files to flush.
-      await Promise.all([new Promise((done) => events.end(done)), new Promise((done) => errors.end(done))]);
+      await Promise.all([events, errors, raw].filter(Boolean).map((stream) => new Promise((done) => stream.end(done))));
+      if (agy) {
+        result.agyError = agyError(fs.readFileSync(errPath, 'utf8'));
+        result.agyStatus = normalizer.result?.status ?? null;
+        result.finished_reason = normalizer.result?.finished_reason ?? null;
+        result.denied_actions = normalizer.result?.denied_actions ?? [];
+        result.beganWork = normalizer.beganWork;
+        const answer = agyAnswer(normalizer.result, schema);
+        if (answer) writeJSON(out, answer);
+        else result.missingAnswer = true;
+        if (before) {
+          const after = fingerprint(st.cwd);
+          result.readOnlyViolations = readOnlyChanges(before, after);
+          result.readOnlyCheckWarnings = [...new Set([...before.warnings, ...after.warnings])];
+          st.pending.readOnlyViolations = result.readOnlyViolations;
+          st.pending.readOnlyCheckWarnings = result.readOnlyCheckWarnings;
+          if (result.readOnlyViolations.length) st.readOnlyViolations = [...(st.readOnlyViolations ?? []), ...result.readOnlyViolations.map((v) => ({ ...v, round }))];
+          if (result.readOnlyCheckWarnings.length) st.readOnlyCheckWarnings = [...new Set([...(st.readOnlyCheckWarnings ?? []), ...result.readOnlyCheckWarnings])];
+          saveState(st);
+        }
+      }
       resolve({ ...result, ...extra });
     };
     process.on('SIGINT', cancel);
     process.on('SIGTERM', cancel);
 
     let buffer = '';
+    const consumeLine = (line) => {
+      let input;
+      try { input = JSON.parse(line); } catch {}
+      if (!input || typeof input !== 'object' || Array.isArray(input)) {
+        if (!agy) events.write(`${line}\n`);
+        return;
+      }
+      for (const event of agy ? normalizer.accept(input) : [input]) {
+        // Preserve type/item/id/type key order: the pane's command count uses it.
+        events.write(`${JSON.stringify({ ...event, _at: now() })}\n`);
+        if (event.type === 'thread.started' && event.thread_id) {
+          result.threadId = event.thread_id;
+          if (agy) {
+            st.pending.threadId = event.thread_id;
+            const model = observedAgyModel(st.pending.codexModel, input.init?.model);
+            if (model) st.pending.codexModel = model;
+            saveState(st);
+          }
+          lookForTier();
+        } else if (event.type === 'turn.completed') result.usage = event.usage ?? null;
+        else if (event.type === 'turn.failed') result.turnFailed = event.error?.message || 'turn failed';
+        else if (event.type === 'error' && event.message) result.lastError = event.message;
+      }
+    };
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk) => {
+      if (raw) raw.write(chunk);
       buffer += chunk;
       let nl = buffer.indexOf('\n');
       while (nl >= 0) {
         const line = buffer.slice(0, nl);
         buffer = buffer.slice(nl + 1);
         nl = buffer.indexOf('\n');
-        let event;
-        try {
-          event = JSON.parse(line);
-        } catch {}
-        if (!event || typeof event !== 'object' || Array.isArray(event)) {
-          events.write(`${line}\n`);
-          continue;
-        }
-        // Codex's events carry no time: each gets the moment it came (_at), so the pane can tell how old
-        // Codex's last words are.
-        events.write(`${JSON.stringify({ ...event, _at: now() })}\n`);
-        if (event.type === 'thread.started' && event.thread_id) {
-          result.threadId = event.thread_id;
-          lookForTier();
-        } else if (event.type === 'turn.completed') result.usage = event.usage ?? null;
-        else if (event.type === 'turn.failed') result.turnFailed = event.error?.message || 'turn failed';
-        else if (event.type === 'error' && event.message) result.lastError = event.message;
+        consumeLine(line);
       }
     });
     child.stderr.on('data', (chunk) => errors.write(chunk));
-    child.on('error', (err) => { void finish({ code: null, spawnError: `cannot run ${CODEX_BIN}: ${err.message}` }); });
+    child.on('error', (err) => { void finish({ code: null, spawnError: `cannot run ${bin}: ${err.message}` }); });
     // 'close' waits for the pipes, and a leftover descendant can hold them open forever: after
     // the exit, wait a grace period for them, then finish anyway (reap clears out the group).
     child.on('exit', (code, signal) => {
@@ -949,14 +1045,15 @@ function runCodex(st, round, prompt, threadId, schema = SCHEMA) {
     });
     child.on('close', (code, signal) => { void finish({ code, signal }); });
     child.stdin.on('error', () => {});
-    child.stdin.end(prompt);
+    child.stdin.end(agy ? `${JSON.stringify({ event: 'user', message: { role: 'user', content: prompt } })}\n` : prompt);
   });
 }
 
-function stderrTail(file, lines = 15) {
+function stderrTail(file, lines = 15, agy = false) {
   try {
     return fs.readFileSync(file, 'utf8').split('\n')
       .filter((l) => l.trim() && !l.startsWith('Reading additional input from stdin'))
+      .filter((l) => !agy || !/^[IWEF]\d{4}\s+\d{2}:\d{2}:\d{2}/.test(l))
       .slice(-lines).join('\n');
   } catch {
     return '';
@@ -1212,7 +1309,7 @@ async function decide(st, reply) {
     } else if (st.kind === 'build' && reply.verdict === 'approve'
       && normalizeRequestCheck(last?.request_check, false).status === 'matches'
       && ['narrowed', 'unclear'].includes(codexRequestCheck(st).status)) {
-      d = { action: 'escalate', reason: "Codex and Claude disagree on whether the work delivers the owner's request", issues: [], enforced: true };
+      d = { action: 'escalate', reason: `${engineName(st)} and Claude disagree on whether the work delivers the owner's request`, issues: [], enforced: true };
     }
   }
   if (d.action === 'escalate' && !d.issues.length) d.issues = [...view.open, ...view.parked].map((i) => i.id);
@@ -1223,6 +1320,28 @@ async function decide(st, reply) {
 
 // Why a Codex turn produced no usable reply, or null when it did.
 function turnProblem(res, round) {
+  if (res.engine === 'agy') {
+    const waiting = !res.beganWork ? ' agy waits for all of its MCP servers to connect before a turn (agy mcp list); check the network or VPN.' : '';
+    if (res.cancelled) return `cancelled: codex-duet received SIGINT or SIGTERM; retry continues the interrupted agy turn.${waiting}`;
+    if (res.timedOut) {
+      const limit = res.timeoutMs >= 60_000 ? `${Math.round(res.timeoutMs / 60_000)} min` : `${res.timeoutMs} ms`;
+      return `agy did not finish within ${limit}.${waiting}`;
+    }
+    if (res.spawnError) return res.spawnError;
+    if (res.denied_actions?.length) {
+      return `agy denied ${res.denied_actions.map((a) => a.display_name || a.action || 'action').join(', ')}; headless agy cannot ask for approval: use --sandbox danger-full-access or allow rules in agy's settings`;
+    }
+    if (res.agyError) {
+      const e = res.agyError;
+      return `agy exited with code ${res.code}: ${e.short_error || e.status || 'turn failed'}${e.retryable == null ? '' : ` (retryable: ${e.retryable})`}${e.reason ? `; reason: ${e.reason}` : ''}`;
+    }
+    if (res.turnFailed) return `agy: ${res.turnFailed}`;
+    if (res.code !== 0) return `agy exited with ${res.signal || `code ${res.code}`}`;
+    if (res.finished_reason) return `agy turn ended early: ${res.finished_reason}`;
+    if (round === 1 && !res.threadId) return 'agy did not report a conversation id';
+    if (res.missingAnswer) return 'agy returned no valid structured answer (structured_output or a schema-valid final JSON object)';
+    return null;
+  }
   // Codex may exit 0 on SIGTERM; the cause must still read as a cancel, not as a missing reply.
   if (res.cancelled) {
     return 'cancelled: codex-duet received SIGINT or SIGTERM (often the Bash tool\'s limit: run rounds in the background '
@@ -1245,9 +1364,11 @@ function failTurn(st, round, problem, res) {
   st.phase = 'codex-failed';
   st.pending.error = problem;
   if (res.threadId) st.pending.threadId = res.threadId;
+  if (engineOf(st) === 'agy') st.pending.agyResult = { status: res.agyStatus, finished_reason: res.finished_reason, denied_actions: res.denied_actions, error: res.agyError };
   saveState(st);
-  const tail = stderrTail(res.errPath);
-  throw new Error(`round ${round} failed: ${problem}${tail ? `\n--- codex stderr (tail) ---\n${tail}` : ''}\n`
+  const tail = stderrTail(res.errPath, 15, engineOf(st) === 'agy');
+  throw new Error(`round ${round} failed: ${problem}${tail ? `\n--- ${engineOf(st)} stderr (tail) ---\n${tail}` : ''}\n`
+    + `${engineWarnings(st).join('\n')}${engineWarnings(st).length ? '\n' : ''}`
     + `Fix the cause, then run: node "${SELF}" retry --session ${st.id}`);
 }
 
@@ -1256,7 +1377,33 @@ function failTurn(st, round, problem, res) {
 // too. Only while Codex's log of that thread exists; else, and after `retry --fresh`, the turn starts over.
 function interruptedThread(st) {
   const id = st.pending?.threadId;
+  if (engineOf(st) === 'agy') {
+    const file = agyConversation(id);
+    return file && fs.existsSync(file) ? id : null;
+  }
   return id && rolloutOf(st, id) ? id : null;
+}
+
+function savedThread(st) {
+  if (engineOf(st) !== 'agy') return st.codex.threadId;
+  const file = agyConversation(st.codex.threadId);
+  return file && fs.existsSync(file) ? st.codex.threadId : null;
+}
+
+// A later round can lose its conversation (deleted DB or --fresh). Restore the same
+// initial instructions and request before the current-round prompt, without changing
+// the normal resumed path or the shipped prompt templates.
+function restoreAgyContext(st, round, initial, current) {
+  return `This is a new conversation for round ${round}. The initial instructions below restore the task context; the current-round instructions that follow them govern this reply.\n\n`
+    + `${initial}\n\n${tag('existing_issue_ledger', '', JSON.stringify(st.issues, null, 2))}\n\n${current}`;
+}
+
+function engineRoundResult(st, res) {
+  return engineOf(st) === 'agy' ? {
+    readOnlyViolations: res.readOnlyViolations ?? [],
+    readOnlyCheckWarnings: res.readOnlyCheckWarnings ?? [],
+    agyResult: { status: res.agyStatus, finished_reason: res.finished_reason, denied_actions: res.denied_actions },
+  } : {};
 }
 
 // The caller holds the session lock for the whole round.
@@ -1265,7 +1412,11 @@ async function runRound(st, round, payload) {
   const prev = st.rounds.at(-1)?.snapshot ?? null;
   const snap = takeSnapshot(st, round);
   const cutOff = interruptedThread(st);
-  const prompt = cutOff ? template('resume.md') : buildPrompt(st, round, snap, prev, payload);
+  const conversation = cutOff ?? (round === 1 ? null : savedThread(st));
+  let prompt = cutOff ? template('resume.md') : buildPrompt(st, round, snap, prev, payload);
+  if (engineOf(st) === 'agy' && round > 1 && !conversation) {
+    prompt = restoreAgyContext(st, round, buildPrompt(st, 1, snap, null, null, true), prompt);
+  }
   const release = await takeSlot(st, round, { payload, threadId: cutOff ?? undefined });
   const startedAt = now();
   st.phase = 'awaiting-codex';
@@ -1274,7 +1425,7 @@ async function runRound(st, round, payload) {
 
   let res;
   try {
-    res = await runCodex(st, round, prompt, cutOff ?? (round === 1 ? null : st.codex.threadId));
+    res = await runCodex(st, round, prompt, conversation);
   } finally {
     release();
   }
@@ -1284,12 +1435,12 @@ async function runRound(st, round, payload) {
     try {
       reply = normalizeReply(readJSON(res.out));
     } catch (err) {
-      problem = `unreadable Codex reply: ${err.message}`;
+      problem = `unreadable ${engineName(st)} reply: ${err.message}`;
     }
   }
   if (problem) failTurn(st, round, problem, res);
 
-  if (round === 1) st.codex.threadId = res.threadId;
+  if (round === 1 || engineOf(st) === 'agy') st.codex.threadId = res.threadId;
   const quoteChecks = checkQuotes(st, reply, snap, round);
   const delta = mergeReply(st, reply, round);
   st.round = round;
@@ -1304,6 +1455,7 @@ async function runRound(st, round, payload) {
     finishedAt: now(),
     usage: res.usage,
     codexModel: st.pending?.codexModel ?? null,
+    ...engineRoundResult(st, res),
     added: delta.added,
     closed: delta.closed,
     open: openIssues(st).length,
@@ -1330,7 +1482,7 @@ async function recordOwnerDecisions(st, payload) {
   for (const r of payload.responses) {
     const issue = st.issues[r.id];
     Object.assign(issue, { status: 'withdrawn', closedRound: st.round, parked: false });
-    issue.history.push({ round: st.round, by: 'duet', status: 'withdrawn', note: 'owner decision recorded at the round limit, without another Codex round' });
+    issue.history.push({ round: st.round, by: 'duet', status: 'withdrawn', note: `owner decision recorded at the round limit, without another ${engineName(st)} round` });
   }
   await settle(st, { verdict: st.rounds.at(-1).verdict });
 }
@@ -1435,10 +1587,12 @@ function issuesForAuthor(st) {
 async function runBuildTurn(st, round, review) {
   clearApproval(st);
   const cutOff = interruptedThread(st);
-  const prompt = cutOff
+  const conversation = cutOff ?? (round === 1 ? null : savedThread(st));
+  const initial = () => fill(template('build-round1.md'), { WORKSPACE: workspaceText(st), SPEC: fs.readFileSync(st.subject.spec, 'utf8').trim() });
+  let prompt = cutOff
     ? template('resume.md')
     : round === 1
-      ? fill(template('build-round1.md'), { WORKSPACE: workspaceText(st), SPEC: fs.readFileSync(st.subject.spec, 'utf8').trim() })
+      ? initial()
       : fill(template('build-roundN.md'), {
         ROUND: round,
         VERDICT: review.verdict,
@@ -1446,6 +1600,7 @@ async function runBuildTurn(st, round, review) {
         ISSUES: issuesForAuthor(st),
         REQUEST_RULING: requestRulingLine(st),
       });
+  if (engineOf(st) === 'agy' && round > 1 && !conversation) prompt = restoreAgyContext(st, round, initial(), prompt);
   const release = await takeSlot(st, round, { review, threadId: cutOff ?? undefined });
   const startedAt = now();
   st.phase = 'awaiting-codex';
@@ -1454,7 +1609,7 @@ async function runBuildTurn(st, round, review) {
 
   let res;
   try {
-    res = await runCodex(st, round, prompt, cutOff ?? (round === 1 ? null : st.codex.threadId), BUILD_SCHEMA);
+    res = await runCodex(st, round, prompt, conversation, BUILD_SCHEMA);
   } finally {
     release();
   }
@@ -1464,12 +1619,12 @@ async function runBuildTurn(st, round, review) {
     try {
       reply = normalizeAuthorReply(readJSON(res.out));
     } catch (err) {
-      problem = `unreadable Codex reply: ${err.message}`;
+      problem = `unreadable ${engineName(st)} reply: ${err.message}`;
     }
   }
   if (problem) failTurn(st, round, problem, res);
 
-  if (round === 1) st.codex.threadId = res.threadId;
+  if (round === 1 || engineOf(st) === 'agy') st.codex.threadId = res.threadId;
   applyAuthorReply(st, reply, round);
   st.round = round;
   st.rounds.push({
@@ -1481,6 +1636,7 @@ async function runBuildTurn(st, round, review) {
     finishedAt: now(),
     usage: res.usage,
     codexModel: st.pending?.codexModel ?? null,
+    ...engineRoundResult(st, res),
     verdict: null,
     summary: '',
     open: openIssues(st).length,
@@ -1499,17 +1655,18 @@ function renderBuildSummary(st, approvalCheck = null) {
     `## codex-duet ${st.id} · build · round ${st.round}/${st.maxRounds} (${duration(last.startedAt, last.finishedAt)})`,
     `Worktree: ${worktree} (branch ${branch})`,
     modelLine(st),
+    ...engineWarnings(st),
     ...requestCheckLines(st),
   ];
   if (st.phase === 'awaiting-review') {
-    L.push(`${last.kind === 'post-approval' ? 'Changes' : 'Codex'}: ${indent(last.author.summary)}`);
-    if (last.kind === 'post-approval') L.push(`Last Codex turn: round ${lastCodexRound(st)?.n ?? 'unknown'}`);
+    L.push(`${last.kind === 'post-approval' ? 'Changes' : engineName(st)}: ${indent(last.author.summary)}`);
+    if (last.kind === 'post-approval') L.push(`Last ${engineName(st)} turn: round ${lastCodexRound(st)?.n ?? 'unknown'}`);
     L.push(...verificationLines(codexVerification(st), 'Tests', lastCodexRound(st)?.author?.tests));
     if (last.pathStates) L.push(...pathStateLines(last.pathStates));
     if (last.author.questions.length) L.push('Questions:', ...last.author.questions.map((q) => `- ${indent(q)}`));
     const answers = Object.values(st.issues).filter((i) => i.author?.round === st.round).sort(byPriority);
     if (answers.length) {
-      L.push('', '### Codex on your issues');
+      L.push('', `### ${engineName(st)} on your issues`);
       for (const i of answers) {
         L.push(`- ${i.id} [${i.severity}] ${i.title} → ${i.author.action}: ${indent(i.author.note)}`);
         const quote = quoteCheckLine(i);
@@ -1517,7 +1674,7 @@ function renderBuildSummary(st, approvalCheck = null) {
       }
     }
     const silent = openIssues(st).filter((i) => i.author?.round !== st.round);
-    if (silent.length) L.push(`Not answered by Codex: ${silent.map((i) => i.id).join(', ')}`);
+    if (silent.length) L.push(`Not answered by ${engineName(st)}: ${silent.map((i) => i.id).join(', ')}`);
     for (const i of silent) {
       const quote = quoteCheckLine(i);
       if (quote) L.push(`  ${i.id}: ${quote}`);
@@ -1568,7 +1725,7 @@ function renderBuildSummary(st, approvalCheck = null) {
   if (parked.length) {
     L.push('', `### Parked for the owner (${parked.length})`);
     for (const i of parked) {
-      L.push(`- ${i.id} [${i.severity}] ${i.title} — Codex: ${indent(i.author?.note || '')}`);
+      L.push(`- ${i.id} [${i.severity}] ${i.title} — ${engineName(st)}: ${indent(i.author?.note || '')}`);
       const quote = quoteCheckLine(i);
       if (quote) L.push(`  ${quote}`);
     }
@@ -1577,7 +1734,7 @@ function renderBuildSummary(st, approvalCheck = null) {
     L.push('', "### Needs the owner's decision");
     for (const id of d.issues) {
       const i = st.issues[id];
-      if (i) L.push(`- **${i.id}** [${i.severity}] ${i.title}`, `  Codex: ${indent(i.author?.note || '(no answer)')}`, `  Claude: ${indent(i.codexReply || i.recommendation || i.body)}`);
+      if (i) L.push(`- **${i.id}** [${i.severity}] ${i.title}`, `  ${engineName(st)}: ${indent(i.author?.note || '(no answer)')}`, `  Claude: ${indent(i.codexReply || i.recommendation || i.body)}`);
     }
   }
   if (d?.action === 'done') {
@@ -1623,8 +1780,9 @@ async function cmdReview(o) {
   const release = acquireLock(id);
   try {
     const st = loadState(id);
+    guardEngine(st, o);
     if (st.kind === 'audit') throw new UsageError(AUDIT_HAS_NO_ROUNDS);
-    if (st.kind !== 'build') throw new UsageError('review is for --kind build sessions; answer a Codex review with reply');
+    if (st.kind !== 'build') throw new UsageError(`review is for --kind build sessions; answer a ${engineName(st)} review with reply`);
     guardIdle(st);
     if (!['awaiting-review', 'escalated', 'done'].includes(st.phase)) throw new UsageError(`nothing to review now (phase: ${st.phase})`);
     switchCodex(st, o);
@@ -1644,7 +1802,7 @@ async function cmdReview(o) {
     // The owner has ruled: Codex gets a turn to act on it, whatever the stall rule thinks of the history.
     const ruled = review.issues.some((i) => i.owner) && openIssues(st).length > 0;
     if (ruled && st.decision.action === 'escalate' && st.round < st.maxRounds) {
-      st.decision = { action: 'continue', reason: 'the owner ruled; Codex acts on it', issues: [], enforced: true };
+      st.decision = { action: 'continue', reason: `the owner ruled; ${engineName(st)} acts on it`, issues: [], enforced: true };
     }
     recordApproval(st);
     if (st.decision.action === 'continue') {
@@ -1685,7 +1843,7 @@ function postApprovalRound(st, tree, cause) {
     n: st.round,
     kind: 'post-approval',
     cause,
-    author: { summary: `Changed after the approval, not by Codex. ${cause}`, tests: 'No Codex turn in this round.', questions: [] },
+    author: { summary: `Changed after the approval, not by ${engineName(st)}. ${cause}`, tests: `No ${engineName(st)} turn in this round.`, questions: [] },
     snapshot: { tree },
     diffBase: approval.tree,
     pathStates: paths,
@@ -1731,7 +1889,7 @@ async function cmdFinish(o) {
       git(['add', '-A'], { cwd: worktree });
       if (git(['diff', '--cached', '--quiet'], { cwd: worktree, allowFail: true }).status !== 0) {
         git(['commit', '-q', '-m', commitSubject(specTitle(st)), '-m', o.unreviewed ? unreviewedNote
-          : `Implemented by Codex, reviewed by Claude in ${st.round} round(s); session ${st.id}.`], { cwd: worktree });
+          : `Implemented by ${engineName(st)}, reviewed by Claude in ${st.round} round(s); session ${st.id}.`], { cwd: worktree });
       }
     } catch (err) {
       if (indexBefore) {
@@ -1869,7 +2027,7 @@ async function runAuditTurn(st) {
     try {
       reply = normalizeAuditReply(readJSON(res.out));
     } catch (err) {
-      problem = `unreadable Codex reply: ${err.message}`;
+      problem = `unreadable ${engineName(st)} reply: ${err.message}`;
     }
   }
   if (problem) failTurn(st, round, problem, res);
@@ -1886,6 +2044,7 @@ async function runAuditTurn(st) {
     finishedAt: now(),
     usage: res.usage,
     codexModel: st.pending?.codexModel ?? null,
+    ...engineRoundResult(st, res),
     open: reply.findings.length,
     parked: 0,
   });
@@ -1913,6 +2072,7 @@ function renderAuditSummary(st) {
     `Task: ${st.subject.title} (${st.subject.task})`,
     `Directory: ${st.cwd}`,
     modelLine(st),
+    ...engineWarnings(st),
     `Result: ${indent(st.audit.summary || '(no summary)')}`,
     `Findings: ${countBySeverity(findings) || 'none'}`,
     ...findings.map((f) => `- ${f.id} [${f.severity}] ${f.title}${f.location ? ` — ${f.location}` : ''}`),
@@ -1931,8 +2091,9 @@ function renderAuditReport(st) {
     '',
     `- Session: ${st.id}`,
     `- Directory: ${st.cwd}`,
-    `- Codex: ${[last.codexModel?.model, last.codexModel?.effort].filter(Boolean).join(' · ') || 'its config'}, ${duration(last.startedAt, last.finishedAt)}`,
-    `- Codex thread: ${st.codex.threadId} (continue it in Codex: codex resume ${st.codex.threadId})`,
+    `- ${engineName(st)}: ${[last.codexModel?.model, last.codexModel?.effort].filter(Boolean).join(' · ') || 'its config'}, ${duration(last.startedAt, last.finishedAt)}`,
+    `- ${threadLine(st)}`,
+    ...engineWarnings(st),
     '',
     '## Result',
     '',
@@ -1966,7 +2127,7 @@ function duration(from, to) {
   return s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`;
 }
 
-function renderIssue(issue, round) {
+function renderIssue(issue, round, st) {
   const tags = [
     issue.openedRound === round ? 'new' : '',
     issue.reopened ? 'reopened' : '',
@@ -1977,14 +2138,14 @@ function renderIssue(issue, round) {
   if (issue.recommendation) lines.push(`  Suggested fix: ${indent(issue.recommendation)}`);
   const quote = quoteCheckLine(issue);
   if (quote) lines.push(`  ${quote}`);
-  if (issue.codexReply && issue.openedRound !== round) lines.push(`  Codex on your last answer: ${indent(issue.codexReply)}`);
+  if (issue.codexReply && issue.openedRound !== round) lines.push(`  ${engineName(st)} on your last answer: ${indent(issue.codexReply)}`);
   return lines;
 }
 
-function renderPositions(issue) {
+function renderPositions(issue, st) {
   return [
     `- **${issue.id}** [${issue.severity}] ${issue.title}${issue.location ? ` — ${issue.location}` : ''}`,
-    `  Codex: ${indent(issue.codexReply || issue.body)}`,
+    `  ${engineName(st)}: ${indent(issue.codexReply || issue.body)}`,
     `  Claude: ${indent(issue.author?.note || '(no answer yet)')}`,
   ];
 }
@@ -2026,7 +2187,8 @@ function renderSummary(st) {
     `## codex-duet ${st.id} · ${st.kind} · round ${st.round}/${st.maxRounds} (${duration(last.startedAt, last.finishedAt)})`,
     `Subject: ${subjectLine(st)}`,
     modelLine(st),
-    `Codex verdict: ${last.verdict} — ${last.summary}`,
+    ...engineWarnings(st),
+    `${engineName(st)} verdict: ${last.verdict} — ${last.summary}`,
     ...requestCheckLines(st),
     `Decision: ${d.action.toUpperCase()} — ${d.reason}${d.enforced ? ' (enforced by duet.mjs)' : ''} · verification: ${codexVerification(st).label}`,
     ...verificationLines(codexVerification(st)),
@@ -2034,14 +2196,14 @@ function renderSummary(st) {
   if (closedNow.length) {
     L.push('', `### Closed this round (${closedNow.length})`);
     for (const i of closedNow) {
-      L.push(`- ${i.id} [${i.severity}] ${i.title} → ${i.status}${i.codexReply ? ` — Codex: ${indent(i.codexReply)}` : ''}`);
+      L.push(`- ${i.id} [${i.severity}] ${i.title} → ${i.status}${i.codexReply ? ` — ${engineName(st)}: ${indent(i.codexReply)}` : ''}`);
       const quote = quoteCheckLine(i);
       if (quote) L.push(`  ${quote}`);
     }
   }
   if (open.length) {
     L.push('', `### Open (${open.length})`);
-    for (const i of open) L.push(...renderIssue(i, st.round));
+    for (const i of open) L.push(...renderIssue(i, st.round, st));
   }
   if (parked.length) {
     L.push('', `### Parked for the owner (${parked.length})`);
@@ -2067,7 +2229,7 @@ function renderSummary(st) {
   }
   if (d.action === 'escalate') {
     L.push('', "### Needs the owner's decision");
-    for (const id of d.issues) if (st.issues[id]) L.push(...renderPositions(st.issues[id]));
+    for (const id of d.issues) if (st.issues[id]) L.push(...renderPositions(st.issues[id], st));
   }
   L.push('', `Report: ${path.join(sessionDir(st.id), 'report.md')}`);
   return L.join('\n');
@@ -2077,7 +2239,7 @@ function outcome(issue, st) {
   if (issue.status === 'open') return issue.parked ? 'OPEN (owner decision)' : 'OPEN';
   if (issue.status === 'resolved') return 'resolved';
   if (issue.author?.action === 'owner-decided' || issue.ownerRuled) return 'withdrawn (owner decision)';
-  return `withdrawn by ${reviewerOf(st) === 'codex' ? 'Codex' : 'Claude'}`;
+  return `withdrawn by ${reviewerOf(st) === 'codex' ? engineName(st) : 'Claude'}`;
 }
 
 function renderReport(st) {
@@ -2090,13 +2252,14 @@ function renderReport(st) {
     `- Subject: ${subjectLine(st)}`,
     `- Rounds: ${st.round}/${st.maxRounds}`,
     `- Outcome: ${st.decision?.action ?? st.phase} — ${st.decision?.reason ?? ''}`,
-    `- Codex thread: ${st.codex.threadId} (continue it in Codex: codex resume ${st.codex.threadId})`,
+    `- ${threadLine(st)}`,
+    ...engineWarnings(st),
     ...approvalReportLines(st).map((line) => line.startsWith('- ') ? line : `- ${line}`),
     '',
     "## Owner's request",
     '',
     `Owner brief: ${st.brief || 'none'}`,
-    `Codex: ${requestCheckText(codexRequestCheck(st))}`,
+    `${engineName(st)}: ${requestCheckText(codexRequestCheck(st))}`,
     ...(st.kind === 'build' ? [`Claude: ${requestCheckText(normalizeBuildReviewCheck(st.rounds.findLast((r) => r.verdict)?.request_check))}`] : []),
     ...(st.requestRuling ? [requestRulingLine(st)] : []),
     '',
@@ -2104,7 +2267,7 @@ function renderReport(st) {
     '',
     ...st.rounds.filter((r) => r.kind !== 'post-approval').map((r) => `- Round ${r.n}: ${r.verification?.label ?? 'unknown'}`),
     '',
-    `Last Codex turn: round ${lastCodexRound(st)?.n ?? 'unknown'}`,
+    `Last ${engineName(st)} turn: round ${lastCodexRound(st)?.n ?? 'unknown'}`,
     ...verificationLines(codexVerification(st), 'Verification', lastCodexRound(st)?.author?.tests),
     '',
     '## Issues',
@@ -2122,8 +2285,8 @@ function renderReport(st) {
     L.push('', i.body || '(no description)', '');
     for (const h of i.history) {
       const text = h.note || h.reply;
-      if (text) L.push(`- r${h.round} ${h.by}${h.action ? ` (${h.action})` : ''}${h.status ? ` → ${h.status}` : ''}: ${indent(text, '  ')}`);
-      if (h.quoteCheck) L.push(`- r${h.round} ${h.by}: ${quoteCheckLine(h, { includeOk: true, includeUnchecked: true })}`);
+      if (text) L.push(`- r${h.round} ${h.by === 'codex' && engineOf(st) === 'agy' ? 'agy' : h.by}${h.action ? ` (${h.action})` : ''}${h.status ? ` → ${h.status}` : ''}: ${indent(text, '  ')}`);
+      if (h.quoteCheck) L.push(`- r${h.round} ${h.by === 'codex' && engineOf(st) === 'agy' ? 'agy' : h.by}: ${quoteCheckLine(h, { includeOk: true, includeUnchecked: true })}`);
     }
   }
   if (['code', 'build'].includes(st.kind)) {
@@ -2131,14 +2294,14 @@ function renderReport(st) {
     for (const r of st.rounds) {
       L.push('', `### Round ${r.n}${r.kind === 'post-approval' ? ' · post-approval' : ''}`);
       if (r.author) {
-        L.push(`${r.kind === 'post-approval' ? 'Changes' : 'Codex'}: ${r.author.summary}`);
+        L.push(`${r.kind === 'post-approval' ? 'Changes' : engineName(st)}: ${r.author.summary}`);
         if (r.kind !== 'post-approval') L.push(`Tests: ${r.verification?.label ?? 'unknown'}`);
         if (r.kind !== 'post-approval' && !r.verification && r.author.tests) L.push(`Legacy Tests claim (unconfirmed): ${oneLine(r.author.tests)}`);
       }
       if (r.snapshot?.tree) L.push(`Snapshot tree: ${r.snapshot.tree}`);
       if (r.diffBase) L.push(`This round: ${r.diffBase} → ${r.snapshot.tree}`);
       if (r.pathStates) L.push(...pathStateLines(r.pathStates));
-      if (r.verdict) L.push(`${st.kind === 'build' ? 'Claude' : 'Codex'}: ${r.verdict} — ${r.summary}`);
+      if (r.verdict) L.push(`${st.kind === 'build' ? 'Claude' : engineName(st)}: ${r.verdict} — ${r.summary}`);
     }
   }
   return `${L.join('\n')}\n`;
@@ -2210,6 +2373,7 @@ function initCodeSubject(st, o) {
 }
 
 async function cmdStart(o) {
+  const engine = checkEngine(o.engine ?? process.env.CODEX_DUET_ENGINE ?? 'codex');
   if (!KINDS.includes(o.kind)) throw new UsageError(`--kind must be one of: ${KINDS.join(', ')}`);
   let brief = null;
   if (o.brief != null) {
@@ -2229,19 +2393,20 @@ async function cmdStart(o) {
     if (!hasOwnerRequest(brief)) throw new UsageError("the brief needs a non-empty `## Owner's request` section (ASCII apostrophe), quoting the owner's own words");
   }
   if (o.kind === 'audit' && o.sandbox && o.sandbox !== 'read-only') {
-    throw new UsageError('an audit runs read-only: Codex examines and reports, it changes nothing (leave --sandbox out)');
+    throw new UsageError(`an audit runs read-only: ${engine === 'agy' ? 'agy is told not to write and checked afterwards' : 'Codex examines and reports, it changes nothing'} (leave --sandbox out)`);
   }
   const sandbox = o.kind === 'audit' ? 'read-only' : checkSandbox(o.sandbox ?? process.env.CODEX_DUET_SANDBOX ?? 'inherit');
   // Every option is checked before the session's directory exists: a refusal leaves nothing behind.
   const maxRounds = o.kind === 'audit' ? 1 : o['max-rounds'] ? toInt(o['max-rounds'], 'max-rounds') : 10;
   const timeoutMin = toCount(o['timeout-min'] ?? process.env.CODEX_DUET_TIMEOUT_MIN ?? 0, 'timeout-min');
-  const { model, effort } = codexChoice(o, { model: process.env.CODEX_DUET_MODEL, effort: process.env.CODEX_DUET_EFFORT });
+  const choice = codexChoice(o, { model: process.env.CODEX_DUET_MODEL, effort: process.env.CODEX_DUET_EFFORT }, engine);
   const ts = now().replace(/\D/g, '').slice(0, 14);
   const id = `${ts.slice(0, 8)}-${ts.slice(8)}-${crypto.randomBytes(2).toString('hex')}`;
   const dir = sessionDir(id);
   fs.mkdirSync(dir, { recursive: true });
   const st = {
     version: 1,
+    engine,
     id,
     kind: o.kind,
     cwd: fs.realpathSync(process.cwd()),
@@ -2252,7 +2417,7 @@ async function cmdStart(o) {
     maxRounds,
     round: 0,
     phase: 'starting',
-    codex: { threadId: null, model, effort, timeoutMin, sandbox },
+    codex: { threadId: null, ...choice, timeoutMin, sandbox },
     subject: {},
     issues: {},
     rounds: [],
@@ -2298,6 +2463,7 @@ async function cmdReply(o) {
   const release = acquireLock(id);
   try {
     const st = loadState(id); // read again under the lock: another call may have moved the session on
+    guardEngine(st, o);
     if (st.kind === 'build') throw new UsageError('a build session is answered with: review --issues -');
     if (st.kind === 'audit') throw new UsageError(AUDIT_HAS_NO_ROUNDS);
     guardIdle(st);
@@ -2324,8 +2490,12 @@ async function cmdRetry(o) {
   const release = acquireLock(id);
   try {
     const st = loadState(id);
+    guardEngine(st, o);
     if (!st.pending) throw new UsageError(`nothing to retry in ${st.id} (phase: ${st.phase})`);
-    if (o.fresh) delete st.pending.threadId; // start the turn over instead of continuing the cut-off one
+    if (o.fresh) {
+      delete st.pending.threadId; // start the turn over instead of continuing the cut-off one
+      if (engineOf(st) === 'agy') st.codex.threadId = null;
+    }
     switchCodex(st, o);
     saveState(st);
     if (st.kind === 'build') await runBuildTurn(st, st.pending.round, st.pending.review);
@@ -2341,11 +2511,12 @@ function cmdStatus(o) {
   if (st.pending) {
     const busy = lockHolder(st);
     const waiting = st.phase === 'queued'
-      ? `is waiting for a free Codex slot since ${st.pending.queuedAt} (at most ${MAX_PARALLEL} turns run at once)`
+      ? `is waiting for a free ${engineName(st)} slot since ${st.pending.queuedAt} (at most ${MAX_PARALLEL} turns run at once)`
       : `is running since ${st.pending.startedAt}`;
     console.log(busy
       ? `codex-duet ${st.id}: round ${st.pending.round} ${waiting} (pid ${busy})`
       : `codex-duet ${st.id}: round ${st.pending.round} did not complete${st.pending.error ? `: ${st.pending.error}` : ''}. Run: node "${SELF}" retry --session ${st.id}`);
+    if (!st.rounds.length && engineOf(st) === 'agy') console.log([modelLine(st), ...engineWarnings(st)].join('\n'));
   }
   if (st.rounds.length) {
     console.log(st.kind === 'build' ? renderBuildSummary(st) : st.kind === 'audit' ? renderAuditSummary(st) : renderSummary(st));
@@ -2366,7 +2537,7 @@ function cmdVerify(o) {
       ...pathStateLines(check.paths),
     ];
     if (!check.matches && st.kind === 'code') {
-      L.push('Send the changes back to Codex:', '```bash',
+      L.push(`Send the changes back to ${engineName(st)}:`, '```bash',
         `node "${SELF}" reply --session ${st.id} --responses - <<'DUET_JSON'`,
         '{"changes": "<what changed after the approval>", "responses": []}', 'DUET_JSON', '```');
     }
@@ -2380,6 +2551,12 @@ function cmdVerify(o) {
 
 function cmdReport(o) {
   const st = resolveSession(o.session);
+  if (engineOf(st) === 'agy' && st.kind === 'audit' && !st.audit) {
+    const report = [`# codex-duet audit — ${st.subject.title}`, `Engine: agy`, `Phase: ${st.phase}`, st.pending?.error ?? '', ...engineWarnings(st)].join('\n');
+    fs.writeFileSync(path.join(sessionDir(st.id), 'report.md'), `${report}\n`);
+    console.log(report);
+    return;
+  }
   if (st.kind === 'audit' && !st.audit) throw new UsageError(`the audit ${st.id} has no report yet (phase: ${st.phase})`);
   const report = st.kind === 'audit' ? renderAuditReport(st) : renderReport(st);
   fs.writeFileSync(path.join(sessionDir(st.id), 'report.md'), report);
@@ -2393,7 +2570,7 @@ function cmdList(o) {
     console.log(o.all ? 'no sessions' : 'no sessions for this directory (try --all)');
     return;
   }
-  for (const s of rows) console.log(`${s.id}  ${s.kind.padEnd(4)}  round ${s.round}/${s.maxRounds}  ${s.phase.padEnd(15)}  ${s.cwd}`);
+  for (const s of rows) console.log(`${s.id}  ${s.kind.padEnd(4)}  round ${s.round}/${s.maxRounds}  ${s.phase.padEnd(15)}  ${s.cwd}${engineOf(s) === 'agy' ? '  agy' : ''}`);
 }
 
 const COMMANDS = {
