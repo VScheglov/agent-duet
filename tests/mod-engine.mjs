@@ -58,7 +58,7 @@ export function compile(source, dir) {
   };
   fs.writeFileSync(path.join(dir, 'claude-code.mjs'), [
     'export const atom = (ref, initial) => ({ ref, initial });',
-    'export const read = async ($, a) => $.__get(a);',
+    'export const read = async ($, a) => $.__get(a.ref ? a : { ref: a });',
     'export const update = async ($, a, fn) => $.__update(a, fn);',
   ].join('\n'));
   return visit(source);
@@ -75,14 +75,16 @@ function entry(dir, d) {
 }
 
 // root: where the plugin is installed, as $.plugin.root tells the module; the test's checkout by default
-export async function boot(file, { env, cwd, options = {}, defaultsResult = { exitCode: 1, stdout: '', stderr: '' }, sessionId = 'claude-me', root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..') }) {
+export async function boot(file, { env, cwd, options = {}, settings = {}, initialState = new Map(), store = new Map(), defaultsResult = { exitCode: 1, stdout: '', stderr: '' }, sessionId = 'claude-me', root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..') }) {
+  // Preference migration reads plugin-scoped JSON too; never consult the owner's store in a test.
+  env = { CLAUDE_CONFIG_DIR: path.join(path.dirname(file), 'claude-config'), ...env };
   // a fresh module instance per boot, so its module-level state starts empty, as after a reload
   const mod = await import(`${pathToFileURL(file).href}?n=${Math.random()}`);
   const hooks = [];
   mod.register((event, a, b) => hooks.push(b ? { event, matcher: a, fn: b } : { event, matcher: null, fn: a }), options);
 
-  const atoms = new Map();
-  const stored = new Map();
+  const atoms = initialState;
+  const stored = store;
   const timers = [];
   // sounds: an afplay'd file by its name, an engine-played clip by its asset path
   const seen = { toasts: [], sounds: [], statuses: [], opened: [], suggested: [], submitted: [], procs: [] };
@@ -92,15 +94,17 @@ export async function boot(file, { env, cwd, options = {}, defaultsResult = { ex
   let sessionCwd = cwd;
   const $ = {
     __get(a) {
-      return atoms.has(a.ref.key) ? atoms.get(a.ref.key) : a.initial;
+      const key = `${a.ref.plugin}:${a.ref.key}`;
+      return atoms.has(key) ? atoms.get(key) : a.initial;
     },
     __update(a, fn) {
       const value = fn(this.__get(a));
-      atoms.set(a.ref.key, value);
+      atoms.set(`${a.ref.plugin}:${a.ref.key}`, value);
       return value;
     },
-    plugin: { name: 'codex-duet', root },
+    plugin: { name: 'agent-duet', root },
     env: { get: async (name) => env[name] },
+    settings: { read: async ({ key } = {}) => key ? settings[key] : settings },
     // the id the runner records as a review's owner, from the CLAUDE_CODE_SESSION_ID of its Bash call
     session: { cwd: async () => sessionCwd, id: async () => sessionId },
     clock: {
@@ -114,13 +118,13 @@ export async function boot(file, { env, cwd, options = {}, defaultsResult = { ex
     },
     fs: {
       list: async (dir) => fs.readdirSync(dir, { withFileTypes: true }).map((d) => entry(dir, d)),
-      stat: async (p) => {
+      stat: async (p, options) => {
         if (fakeFiles.has(p)) {
           if (!fakeFiles.get(p)) throw new Error(`ENOENT: no such file or directory, stat '${p}'`);
           return { kind: 'file', size: 1, mtimeMs: 1, isLink: false };
         }
         const st = fs.statSync(p);
-        return { kind: st.isDirectory() ? 'dir' : st.isFile() ? 'file' : 'other', size: st.size, mtimeMs: st.mtimeMs, isLink: false };
+        return { kind: st.isDirectory() ? 'dir' : st.isFile() ? 'file' : 'other', size: st.size, mtimeMs: st.mtimeMs, isLink: fs.lstatSync(p).isSymbolicLink(), ...(options?.resolve ? { realPath: fs.realpathSync(p) } : {}) };
       },
       read: async (p) => {
         if (fs.statSync(p).size > 4_194_304) throw new Error(`${p}: over 4 MiB`); // as the engine refuses
@@ -180,6 +184,7 @@ export async function boot(file, { env, cwd, options = {}, defaultsResult = { ex
   const api = {
     ...seen,
     stored,
+    atoms,
     settle,
     setCwd: (dir) => { sessionCwd = dir; },
     setFile: (file, isThere) => { fakeFiles.set(file, isThere); },
@@ -203,7 +208,7 @@ export async function boot(file, { env, cwd, options = {}, defaultsResult = { ex
       dispatch('ui.render', {
         component,
         surface,
-        requestId: component === 'Pane' ? 'codex-duet' : undefined,
+        requestId: component === 'Pane' ? 'agent-duet' : undefined,
         viewport: { columns: 120, rows: 40, isFullscreen },
         props: component === 'SessionMode' ? { modes: [] } : { bodyColumns: 120, hasSurvey: false },
       }, () => BELOW),

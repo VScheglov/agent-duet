@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { duetEnv } from '../scripts/config.mjs';
 
 const args = process.argv.slice(2);
 if (args[0] === 'models') {
@@ -33,7 +34,7 @@ state.calls.push({ args, input, prompt: message.message.content, cwd: process.cw
 fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
 if (!step) throw new Error('fake agy: no scripted reply left');
 const conversation = args.includes('--conversation') ? args[args.indexOf('--conversation') + 1] : crypto.randomUUID();
-const logs = path.join(process.env.CODEX_DUET_AGY_HOME, 'conversations');
+const logs = path.join(duetEnv('AGY_HOME'), 'conversations');
 fs.mkdirSync(logs, { recursive: true });
 fs.writeFileSync(path.join(logs, `${conversation}.db`), 'fake SQLite conversation');
 fs.writeFileSync(path.join(logs, `${conversation}.db-wal`), 'fake write-ahead log');

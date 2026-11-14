@@ -12,7 +12,7 @@ import { BELOW, boot, compile, lines, nodes } from './mod-engine.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DUET = path.join(HERE, '..', 'scripts', 'duet.mjs');
-const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'codex-duet-mod-')));
+const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'agent-duet-mod-')));
 const repo = path.join(tmp, 'repo');
 const elsewhere = path.join(tmp, 'elsewhere');
 const insideSpace = path.join(repo, 'in with space');
@@ -23,17 +23,17 @@ const fakeState = path.join(tmp, 'codex-calls.json');
 const decisions = JSON.stringify({ 1: 'continue', 2: 'escalate', 3: 'done' });
 
 const baseEnv = {
-  ...process.env,
-  CODEX_DUET_ENGINE: 'codex',
-  CODEX_DUET_HOME: home,
-  CODEX_DUET_CODEX_BIN: path.join(HERE, 'fake-codex.mjs'),
-  CODEX_DUET_POLICY: path.join(HERE, 'fixture-policy.mjs'),
+  ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(?:AGENT|CODEX)_DUET_/.test(key))),
+  AGENT_DUET_ENGINE: 'codex',
+  AGENT_DUET_HOME: home,
+  AGENT_DUET_CODEX_BIN: path.join(HERE, 'fake-codex.mjs'),
+  AGENT_DUET_POLICY: path.join(HERE, 'fixture-policy.mjs'),
   FAKE_CODEX_SCRIPT: scriptFile,
   FAKE_CODEX_STATE: fakeState,
   FIXTURE_DECISIONS: decisions,
   CODEX_HOME: path.join(tmp, 'no-codex-home'), // no model catalog, none of the owner's defaults
-  CODEX_DUET_MODEL: '',
-  CODEX_DUET_EFFORT: '',
+  AGENT_DUET_MODEL: '',
+  AGENT_DUET_EFFORT: '',
   CLAUDE_CODE_SESSION_ID: 'claude-me', // the session the stand-in engine is, unless a call says otherwise
 };
 
@@ -56,7 +56,7 @@ function git(args) {
   const r = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
   assert.equal(r.status, 0, r.stderr);
 }
-const sessionId = (out) => /codex-duet (\d{8}-\d{6}-[0-9a-f]{4})/.exec(out)?.[1];
+const sessionId = (out) => /agent-duet (\d{8}-\d{6}-[0-9a-f]{4})/.exec(out)?.[1];
 const stateFile = (sid) => path.join(home, sid, 'state.json');
 const rewrite = (sid, change) => {
   const st = JSON.parse(fs.readFileSync(stateFile(sid), 'utf8'));
@@ -92,8 +92,8 @@ async function waitFor(check, timeoutMs = 2000) {
 
 const compiled = compile(path.join(HERE, '..', 'hooks', 'register.tsx'), tmp);
 // installed from a marketplace, the plugin lives in a folder of the engine's choosing, not in ~/.claude/skills
-const installed = path.join(tmp, 'plugins', 'cache', 'codex-duet', 'codex-duet', '0.10.0');
-const E = await boot(compiled, { options: { language: 'ru' }, env: { HOME: os.homedir(), CODEX_DUET_HOME: home, CODEX_HOME: baseEnv.CODEX_HOME }, cwd: repo, root: installed });
+const installed = path.join(tmp, 'plugins', 'cache', 'agent-duet', 'agent-duet', '0.10.0');
+const E = await boot(compiled, { options: { language: 'ru' }, env: { HOME: os.homedir(), AGENT_DUET_HOME: home, CODEX_HOME: baseEnv.CODEX_HOME }, cwd: repo, root: installed });
 // The Claude app's sounds, as register.tsx names them; the stub says they exist whatever this machine has.
 const APP_SFX = '/Applications/Claude.app/Contents/Resources/ion-dist/audio/voice/sfx';
 const APP_SOUNDS = ['tool_approval_needed.mp3', 'enter_voice_mode.mp3', 'disconnected.mp3'];
@@ -102,11 +102,90 @@ const setAppSounds = (isThere) => APP_SOUNDS.forEach((name) => E.setFile(`${APP_
 setAppSounds(true);
 let id;
 
+await test('rename: legacy language settings survive, with explicit new language and auto taking precedence', async () => {
+  for (const [options, pluginConfigs, expected] of [
+    [{ language: 'auto' }, { 'codex-duet@skills-dir': { options: { language: 'ru' } } }, /Сессий agent-duet не найдено/],
+    [{ language: 'auto' }, { 'codex-duet@codex-duet': { options: { language: 'zh' } } }, /未找到 agent-duet 会话/],
+    [{ language: 'en' }, { 'codex-duet@skills-dir': { options: { language: 'ru' } } }, /No agent-duet sessions found/],
+    [{ language: 'auto' }, { 'agent-duet@skills-dir': { options: { language: 'auto' } }, 'codex-duet@skills-dir': { options: { language: 'ru' } } }, /No agent-duet sessions found/],
+  ]) {
+    const m = await boot(compiled, {
+      env: { HOME: os.homedir(), AGENT_DUET_HOME: path.join(tmp, 'language-rename'), LC_ALL: 'en_US.UTF-8' },
+      cwd: repo, options, settings: { pluginConfigs },
+    });
+    assert.match(lines(await m.render('Pane')).join('\n'), expected);
+  }
+});
+
+await test('rename: mod prefers the new home, falls back without moving, and follows the migrated link', async () => {
+  const xdg = path.join(tmp, 'mod-roots');
+  const legacy = path.join(xdg, 'codex-duet');
+  const current = path.join(xdg, 'agent-duet');
+  fs.mkdirSync(legacy, { recursive: true });
+  const old = await boot(compiled, { env: { HOME: os.homedir(), XDG_STATE_HOME: xdg }, cwd: repo });
+  assert.equal(old.atoms.get('agent-duet:diag').root, legacy);
+  assert.equal(fs.lstatSync(legacy).isSymbolicLink(), false, 'the mod must not migrate');
+  fs.renameSync(legacy, current);
+  fs.symlinkSync(current, legacy);
+  await old.tick();
+  assert.equal(old.atoms.get('agent-duet:diag').root, current, 'an already loaded mod picks up migration');
+  assert.ok(fs.existsSync(path.join(current, '.ui-trace.json')));
+  fs.unlinkSync(legacy);
+  fs.mkdirSync(legacy);
+  const both = await boot(compiled, { env: { HOME: os.homedir(), XDG_STATE_HOME: xdg }, cwd: repo });
+  assert.equal(both.atoms.get('agent-duet:diag').root, current);
+  assert.equal(fs.existsSync(path.join(legacy, '.ui-trace.json')), false);
+  for (const env of [
+    { CODEX_DUET_HOME: legacy },
+    { CODEX_DUET_HOME: legacy, AGENT_DUET_HOME: current },
+  ]) {
+    const m = await boot(compiled, { env: { HOME: os.homedir(), ...env }, cwd: repo });
+    assert.equal(m.atoms.get('agent-duet:diag').root, env.AGENT_DUET_HOME ?? legacy);
+  }
+});
+
+await test('rename: live atom preferences and choices carry over once, with new settings taking precedence', async () => {
+  const prefs = { band: false, sound: false, toasts: true, score: false };
+  const choices = { 'session:C1': 'claude' };
+  const initialState = new Map([
+    ['codex-duet:prefs', prefs], ['codex-duet:focus', 'session'],
+    ['codex-duet:choices', choices], ['codex-duet:expanded', { settings: true }],
+  ]);
+  const env = { HOME: os.homedir(), AGENT_DUET_HOME: path.join(tmp, 'prefs-root'), CLAUDE_CODE_PLUGIN_CACHE_DIR: path.join(tmp, 'empty-cache') };
+  const first = await boot(compiled, { env, cwd: repo, initialState });
+  assert.deepEqual(first.atoms.get('agent-duet:prefs'), prefs);
+  assert.deepEqual(first.stored.get('prefs'), prefs, 'the imported prefs survive the next session');
+  assert.deepEqual(first.atoms.get('agent-duet:choices'), choices);
+  assert.equal(first.atoms.get('agent-duet:focus'), 'session');
+  assert.deepEqual(first.atoms.get('agent-duet:expanded'), { settings: true });
+  await first.command('duet', 'sound on');
+  const second = await boot(compiled, { env, cwd: repo, initialState, store: first.stored });
+  assert.equal(second.atoms.get('agent-duet:prefs').sound, true, 'a reload must not import old prefs again');
+  const newPrefs = { band: true, sound: true, toasts: false, score: true };
+  const explicit = await boot(compiled, { env, cwd: repo, initialState, store: new Map([['prefs', newPrefs]]) });
+  assert.deepEqual(explicit.atoms.get('agent-duet:prefs'), newPrefs);
+});
+
+await test('rename: persisted legacy preferences also carry over in a new Claude session', async () => {
+  const cache = path.join(tmp, 'legacy-store-cache');
+  fs.mkdirSync(path.join(cache, 'store'), { recursive: true });
+  const prefs = { band: false, sound: false, score: false, toasts: false };
+  const oldStore = path.join(cache, 'store', 'codex-duet_skills-dir-012345abcdef.json');
+  fs.writeFileSync(oldStore, JSON.stringify({ prefs }));
+  const env = { HOME: os.homedir(), AGENT_DUET_HOME: path.join(tmp, 'persisted-root'), CLAUDE_CODE_PLUGIN_CACHE_DIR: cache };
+  const first = await boot(compiled, { env, cwd: repo });
+  assert.deepEqual(first.atoms.get('agent-duet:prefs'), prefs);
+  assert.deepEqual(first.stored.get('prefs'), prefs);
+  const second = await boot(compiled, { env, cwd: repo, store: first.stored });
+  assert.deepEqual(second.atoms.get('agent-duet:prefs'), prefs);
+  assert.deepEqual(JSON.parse(fs.readFileSync(oldStore, 'utf8')), { prefs }, 'legacy storage is read-only');
+});
+
 await test('no session: nothing above the prompt or in the footer, the pane says where it looks', async () => {
   assert.equal(await E.render('AbovePrompt'), BELOW);
   assert.equal(await E.render('SessionMode'), BELOW);
   const pane = lines(await E.render('Pane'));
-  assert.ok(pane.includes('Сессий codex-duet не найдено.'), pane.join('\n'));
+  assert.ok(pane.includes('Сессий agent-duet не найдено.'), pane.join('\n'));
   assert.ok(pane.includes('[Звук: вкл]'));
   assert.ok(pane.includes('[▶ Звуки]'));
 });
@@ -124,7 +203,7 @@ await test("round 1 ends: toast and suggestion, no sound; band and footer show C
   await E.tick();
   assert.deepEqual(E.sounds, []);
   assert.ok(E.toasts.some((t) => /раунд 1: открыто 2, из них critical\/high: 1/.test(t)), E.toasts.join('\n'));
-  assert.deepEqual(E.suggested, ['продолжай codex-duet']);
+  assert.deepEqual(E.suggested, ['продолжай agent-duet']);
   const band = await E.render('AbovePrompt');
   assert.match(lines(band)[0], /ход Claude: 2 замечания/);
   assert.equal(band.children.at(-1), BELOW);
@@ -251,7 +330,7 @@ await test('commit guard: every write passes when no session is guarded', async 
   const emptyHome = path.join(tmp, 'unguarded');
   fs.mkdirSync(emptyHome);
   const unguarded = await boot(compiled, {
-    cwd: repo, env: { HOME: os.homedir(), CODEX_DUET_HOME: emptyHome },
+    cwd: repo, env: { HOME: os.homedir(), AGENT_DUET_HOME: emptyHome },
   });
   await unguarded.tick();
   for (const action of writeActions) {
@@ -453,7 +532,7 @@ for (const [command, dirs] of [
 
 await test("context note: on the person's own messages in the Claude session that drives the review", async () => {
   const typed = await E.prompt('как дела?');
-  assert.match(typed.context.join('\n'), new RegExp(`^\\[codex-duet\\] Активная сессия ревью ${id}`));
+  assert.match(typed.context.join('\n'), new RegExp(`^\\[agent-duet\\] Активная сессия ревью ${id}`));
   assert.ok(typed.context.join('\n').includes(`node "${installed}/scripts/duet.mjs" status --session ${id}`), 'the runner where the plugin is installed');
   assert.ok((await E.prompt('с телефона', 'bridge')).context, 'Remote Control is the person too');
   assert.equal((await E.prompt('<task-notification>', 'task-notification')).context, undefined);
@@ -465,7 +544,7 @@ await test("context note: on the person's own messages in the Claude session tha
 await test('Stop hold: Claude ran the runner and stopped while the loop waits on it: sent back once', async () => {
   await E.bash(`${RUNNER} status --session ${id}`);
   const r = await E.stop();
-  assert.match(r.block ?? '', new RegExp(`^codex-duet ${id}: раунд 1/10 закончен, открыто 2: .*reply`));
+  assert.match(r.block ?? '', new RegExp(`^agent-duet ${id}: раунд 1/10 закончен, открыто 2: .*reply`));
   assert.equal((await E.stop({ stop_hook_active: true })).block, undefined);
 });
 
@@ -501,7 +580,7 @@ await test('escalation: decision cue and toast, footer asks for you, the pane se
   assert.equal((await E.stop()).block, undefined, 'escalated: the owner moves next');
   await E.press(await E.render('Pane'), 'pick-codex-C1');
   await E.press(await E.render('Pane'), 'send-decisions');
-  assert.match(E.submitted.at(-1), new RegExp(`^codex-duet ${id}: мои решения[\\s\\S]*C1: прав Codex`));
+  assert.match(E.submitted.at(-1), new RegExp(`^agent-duet ${id}: мои решения[\\s\\S]*C1: прав Codex`));
 });
 
 await test('the board: a long title wraps whole beside its badge, an issue unfolds to both sides, closed issues fold away', async () => {
@@ -536,7 +615,7 @@ await test('the sound toggle: off silences the cues, toasts stay; the setting is
   assert.ok(E.toasts.some((t) => /ревью завершено за 3/.test(t)));
   assert.match(lines(await E.render('AbovePrompt'))[0], /✅ готово · проверка: неизвестно/, 'a recently finished review shows its verification');
   assert.equal(await E.render('SessionMode'), BELOW);
-  assert.equal((await E.command('duet', 'sound on')).text, 'codex-duet sound: вкл');
+  assert.equal((await E.command('duet', 'sound on')).text, 'agent-duet sound: вкл');
 });
 
 await test("/duet sound test: the Claude app's sounds in turn; without the app or a working afplay, the plugin's own", async () => {
@@ -725,7 +804,7 @@ await test("build: Codex works in a worktree outside the project, yet the hold a
   // as initBuildSubject leaves it: the session's cwd is its worktree, under the session's own folder
   const worktree = path.join(home, failed, 'worktree');
   rewrite(failed, () => ({
-    kind: 'build', cwd: worktree, subject: { repo, worktree, branch: 'codex-duet/x' }, phase: 'awaiting-review', round: 1, pending: null,
+    kind: 'build', cwd: worktree, subject: { repo, worktree, branch: 'agent-duet/x' }, phase: 'awaiting-review', round: 1, pending: null,
   }));
   await E.tick();
   await E.bash(`${RUNNER} status --session ${failed}`);
@@ -774,7 +853,7 @@ await test('a reply from this session takes the review over: band, footer and cu
 });
 
 await test('a second Claude session sees none of it; a review from before owners shows everywhere, but an old change is not news', async () => {
-  const other = await boot(compiled, { options: { language: 'ru' }, env: { HOME: os.homedir(), CODEX_DUET_HOME: home, CODEX_HOME: baseEnv.CODEX_HOME }, cwd: repo, sessionId: 'claude-third' });
+  const other = await boot(compiled, { options: { language: 'ru' }, env: { HOME: os.homedir(), AGENT_DUET_HOME: home, CODEX_HOME: baseEnv.CODEX_HOME }, cwd: repo, sessionId: 'claude-third' });
   await other.tick();
   assert.equal(await other.render('AbovePrompt'), BELOW);
   // no owner, last written an hour ago: a review from before 0.6.0 that a fresh session meets for the first time
@@ -782,7 +861,7 @@ await test('a second Claude session sees none of it; a review from before owners
   delete st.owner;
   st.updatedAt = new Date(Date.now() - 3_600_000).toISOString();
   fs.writeFileSync(stateFile(foreign), JSON.stringify(st));
-  const late = await boot(compiled, { options: { language: 'ru' }, env: { HOME: os.homedir(), CODEX_DUET_HOME: home, CODEX_HOME: baseEnv.CODEX_HOME }, cwd: repo, sessionId: 'claude-fourth' });
+  const late = await boot(compiled, { options: { language: 'ru' }, env: { HOME: os.homedir(), AGENT_DUET_HOME: home, CODEX_HOME: baseEnv.CODEX_HOME }, cwd: repo, sessionId: 'claude-fourth' });
   await late.tick();
   assert.match(lines(await late.render('AbovePrompt'))[0], /ждёт твоего решения: C1/, 'shown here, as before owners');
   assert.deepEqual([late.sounds.length, late.toasts.length], [0, 0], 'an hour-old state is history, not a cue');
@@ -792,7 +871,7 @@ await test('a second Claude session sees none of it; a review from before owners
   fs.writeFileSync(stateFile(foreign), JSON.stringify(waiting));
   assert.equal((await late.stop()).block, undefined, 'a session that never ran the runner is left alone');
   await late.bash(`${RUNNER} status --session ${foreign}`);
-  assert.match((await late.stop()).block ?? '', new RegExp(`^codex-duet ${foreign}:`));
+  assert.match((await late.stop()).block ?? '', new RegExp(`^agent-duet ${foreign}:`));
 });
 
 await test('the commit guard covers every running review, not only the one this session shows', async () => {
@@ -813,9 +892,9 @@ const craft = (sid, fields) => {
     ...base, id: sid, owner: 'claude-me', issues: {}, rounds: [], decision: null, updatedAt: new Date().toISOString(), ...fields,
   }));
 };
-const buildOf = (branch) => ({
+const buildOf = (branch, prefix = 'agent-duet') => ({
   kind: 'build', cwd: path.join(home, `wt-${branch}`),
-  subject: { repo, worktree: path.join(home, `wt-${branch}`), branch: `codex-duet/${branch}` },
+  subject: { repo, worktree: path.join(home, `wt-${branch}`), branch: `${prefix}/${branch}` },
 });
 const T = { one: '20991231-000001-aaaa', two: '20991231-000002-bbbb', three: '20991231-000003-cccc' };
 const ago = (ms) => new Date(Date.now() - ms).toISOString();
@@ -823,7 +902,7 @@ const ago = (ms) => new Date(Date.now() - ms).toISOString();
 await test('several tasks: the pane lists them, a row opens its details, footer and status line sum them up', async () => {
   const codexModel = { model: 'gpt-6.1-sol', effort: 'max', fromConfig: ['model', 'effort'] };
   craft(T.one, { ...buildOf('task-one'), phase: 'awaiting-codex', round: 0, pending: { round: 1, startedAt: ago(65_000), codexModel } });
-  craft(T.two, { ...buildOf('task-two'), phase: 'queued', round: 0, pending: { round: 1, queuedAt: ago(30_000) } });
+  craft(T.two, { ...buildOf('task-two', 'codex-duet'), phase: 'queued', round: 0, pending: { round: 1, queuedAt: ago(30_000) } });
   craft(T.three, { ...buildOf('task-three'), phase: 'escalated', round: 2, decision: { action: 'escalate', reason: 'r', issues: ['C1'] } });
   for (const sid of [T.one, T.two]) fs.writeFileSync(path.join(home, sid, 'lock'), String(process.pid));
   await E.tick();
@@ -837,7 +916,7 @@ await test('several tasks: the pane lists them, a row opens its details, footer 
   const detail = lines(await E.render('Pane'));
   assert.ok(detail.some((l) => l.startsWith(`${T.two} · `)) && detail.some((l) => l.startsWith('⏸ ждёт свободного Codex, в очереди 1-я')), detail.join('\n'));
   assert.match((await footer(E))[0], /^\[Duet ×\d+ ⏳1 ⏸1 🙋\]$/);
-  assert.equal(E.statuses.at(-1), 'codex-duet: идут 1 · в очереди 1');
+  assert.equal(E.statuses.at(-1), 'agent-duet: идут 1 · в очереди 1');
   assert.match(lines(await E.render('AbovePrompt'))[0], / · ещё задач: \d+$/);
 });
 
@@ -847,8 +926,8 @@ await test('cues per task: each toast names its task, and one read sounds once, 
   craft(T.three, { ...buildOf('task-three'), phase: 'done', round: 3 });
   await E.tick();
   const toasts = E.toasts.slice(before.toasts);
-  assert.ok(toasts.includes('task-one: codex-duet: нужно твоё решение — C2. Панель: /duet'), toasts.join('\n'));
-  assert.ok(toasts.includes('task-three: codex-duet: ревью завершено за 3 раунда ✓'), toasts.join('\n'));
+  assert.ok(toasts.includes('task-one: agent-duet: нужно твоё решение — C2. Панель: /duet'), toasts.join('\n'));
+  assert.ok(toasts.includes('task-three: agent-duet: ревью завершено за 3 раунда ✓'), toasts.join('\n'));
   assert.deepEqual(E.sounds.slice(before.sounds), ['tool_approval_needed.mp3'], 'two cues raised, one played: the decision');
 });
 
@@ -858,7 +937,7 @@ await test('the Stop hold names every task that waits on Claude', async () => {
   await E.tick();
   await E.bash(`${RUNNER} status --session ${T.one}`);
   const block = (await E.stop()).block ?? '';
-  assert.match(block, /^codex-duet: твоего хода ждут \d+ сессии — /);
+  assert.match(block, /^agent-duet: твоего хода ждут \d+ сессии — /);
   assert.match(block, /task-one: ревью раунда 1\/10/);
   assert.match(block, /task-two: ревью раунда 1\/10/);
 });
@@ -891,14 +970,14 @@ await test('an audit: the list names it by its task; done, the pane shows its re
   const at = pane.findIndex((l) => /^● A1 +high/.test(l));
   assert.equal(pane[at + 1], 'Stale outcome survives a recheck — ledger.py:38-44', pane.join('\n'));
   assert.ok(!pane.includes('Табло') && !pane.some((l) => l.startsWith('Замечания')), 'nothing to negotiate or score');
-  assert.ok(E.toasts.slice(before).some((t) => t.endsWith('codex-duet: аудит готов, находок 2 ✓')), E.toasts.slice(before).join('\n'));
+  assert.ok(E.toasts.slice(before).some((t) => t.endsWith('agent-duet: аудит готов, находок 2 ✓')), E.toasts.slice(before).join('\n'));
 });
 
 // Language choices use their own session folders so the owner's shell locale and the preceding reviews
 // cannot decide what these engines display. The text written by Codex and the policy remains untouched.
 const LANGUAGE_TEXT = {
   en: {
-    empty: /No codex-duet sessions found\./,
+    empty: /No agent-duet sessions found\./,
     pane: /Issues/,
     band: /Claude’s turn: 2 issues/,
     toast: /round 1/,
@@ -911,7 +990,7 @@ const LANGUAGE_TEXT = {
     ownerMarker: /Owner decision: fix/,
   },
   ru: {
-    empty: /Сессий codex-duet не найдено\./,
+    empty: /Сессий agent-duet не найдено\./,
     pane: /Замечания/,
     band: /ход Claude/,
     toast: /раунд 1/,
@@ -924,7 +1003,7 @@ const LANGUAGE_TEXT = {
     ownerMarker: /Решение владельца: исправить/,
   },
   zh: {
-    empty: /未找到 codex-duet 会话。/,
+    empty: /未找到 agent-duet 会话。/,
     pane: /问题 · 2 个未解决/,
     band: /轮到 Claude：2 个问题/,
     toast: /第 1 轮/,
@@ -943,7 +1022,7 @@ async function languageEngine(options, localeEnv = {}, defaultsResult) {
   fs.mkdirSync(stateHome);
   const engine = await boot(compiled, {
     options, defaultsResult, cwd: repo,
-    env: { HOME: os.homedir(), CODEX_DUET_HOME: stateHome, CODEX_HOME: baseEnv.CODEX_HOME, ...localeEnv },
+    env: { HOME: os.homedir(), AGENT_DUET_HOME: stateHome, CODEX_HOME: baseEnv.CODEX_HOME, ...localeEnv },
   });
   const sid = '20991231-123456-abcd';
   const write = (fields = {}) => {
@@ -983,7 +1062,7 @@ for (const language of ['en', 'ru', 'zh']) {
     // A normalized agy event keeps the Codex event shape, but its shell command is plain.
     const codexModel = { model: 'gemini-stand-in', effort: null, fromConfig: ['model', 'tier'], tier: 'priority' };
     const pending = { round: 2, startedAt: ago(1000), codexModel };
-    const build = { kind: 'build', subject: { repo, worktree: repo, branch: 'codex-duet/agy' } };
+    const build = { kind: 'build', subject: { repo, worktree: repo, branch: 'agent-duet/agy' } };
     const save = (fields = {}) => write({ engine: 'agy', ...fields });
     save({ phase: 'awaiting-codex', pending });
     fs.writeFileSync(path.join(stateHome, sid, 'lock'), String(process.pid));
@@ -1131,7 +1210,9 @@ for (const [language, freshLog] of [
 ]) {
   await test(`${language}: agy freshness uses the newest conversation DB or WAL mtime and the saved conversation id`, async () => {
     const agyHome = path.join(tmp, `agy-log-${language}`);
-    const { engine, sid, write, stateHome } = await languageEngine({ language }, { CODEX_DUET_AGY_HOME: agyHome });
+    const logEnv = language === 'en' ? { CODEX_DUET_AGY_HOME: agyHome }
+      : { AGENT_DUET_AGY_HOME: agyHome, CODEX_DUET_AGY_HOME: path.join(tmp, 'unused-legacy-agy-home') };
+    const { engine, sid, write, stateHome } = await languageEngine({ language }, logEnv);
     const threadId = `conversation-${language}`;
     const db = path.join(agyHome, 'conversations', `${threadId}.db`);
     const wal = `${db}-wal`;
@@ -1186,7 +1267,7 @@ await test('agy freshness defaults to HOME/.gemini/antigravity-cli and can use t
 
 await test('agy freshness uses the pending conversation before normalized events arrive', async () => {
   const agyHome = path.join(tmp, 'agy-pending-log');
-  const { engine, sid, write, stateHome } = await languageEngine({ language: 'en' }, { CODEX_DUET_AGY_HOME: agyHome });
+  const { engine, sid, write, stateHome } = await languageEngine({ language: 'en' }, { AGENT_DUET_AGY_HOME: agyHome });
   const threadId = 'pending-conversation';
   const wal = path.join(agyHome, 'conversations', `${threadId}.db-wal`);
   fs.mkdirSync(path.dirname(wal), { recursive: true });
@@ -1442,7 +1523,7 @@ for (const language of ['auto', 'en', 'ru', 'zh']) {
     assert.ok(context.includes(`status --session ${sid}`), context);
     await engine.bash(`${RUNNER} status --session ${sid}`);
     const hold = (await engine.stop()).block ?? '';
-    assert.ok(hold.startsWith(`codex-duet ${sid}:`), hold);
+    assert.ok(hold.startsWith(`agent-duet ${sid}:`), hold);
     assert.match(hold, expected.hold);
     const deny = (await engine.bash('git commit -m test')).deny ?? '';
     assert.match(deny, expected.deny);
@@ -1453,13 +1534,13 @@ for (const language of ['auto', 'en', 'ru', 'zh']) {
     await engine.press(await engine.render('Pane'), 'pick-codex-C1');
     await engine.press(await engine.render('Pane'), 'send-decisions');
     const submitted = engine.submitted.at(-1);
-    assert.ok(submitted.startsWith(`codex-duet ${sid}:`), submitted);
+    assert.ok(submitted.startsWith(`agent-duet ${sid}:`), submitted);
     assert.match(submitted, expected.decisions);
     assert.match(submitted, expected.codex);
     // Build reverses the roles: siding with Claude keeps the issue open with an owner ruling;
     // siding with Codex withdraws it. The structured flag stays stable in every language.
     write({
-      kind: 'build', subject: { repo, worktree: repo, branch: 'codex-duet/localized' },
+      kind: 'build', subject: { repo, worktree: repo, branch: 'agent-duet/localized' },
       phase: 'escalated', decision: { action: 'escalate', reason: 'Owner decision needed', issues: ['C1', 'C2'] },
     });
     await engine.tick();
@@ -1467,7 +1548,7 @@ for (const language of ['auto', 'en', 'ru', 'zh']) {
     await engine.press(await engine.render('Pane'), 'pick-codex-C2');
     await engine.press(await engine.render('Pane'), 'send-decisions');
     const buildSubmitted = engine.submitted.at(-1);
-    assert.ok(buildSubmitted.startsWith(`codex-duet ${sid}:`), buildSubmitted);
+    assert.ok(buildSubmitted.startsWith(`agent-duet ${sid}:`), buildSubmitted);
     assert.match(buildSubmitted, expected.decisions);
     assert.match(buildSubmitted, expected.ownerMarker);
     assert.match(buildSubmitted, /C1:.*owner: true/);
@@ -1506,11 +1587,11 @@ await test('English uses singular and plural, Russian one/few/many, and Chinese 
     [5, 'замечаний', 'раундов'], [11, 'замечаний', 'раундов'], [21, 'замечание', 'раунд'],
   ]) {
     assert.ok(en.bandAuthor(1, 10, n).endsWith(`${n} ${n === 1 ? 'issue' : 'issues'}`));
-    assert.equal(en.toastReviewDone('', n), `codex-duet: review complete in ${n} ${n === 1 ? 'round' : 'rounds'} ✓`);
+    assert.equal(en.toastReviewDone('', n), `agent-duet: review complete in ${n} ${n === 1 ? 'round' : 'rounds'} ✓`);
     assert.ok(ru.bandAuthor(1, 10, n).endsWith(`${n} ${issueWord}`));
-    assert.equal(ru.toastReviewDone('', n), `codex-duet: ревью завершено за ${n} ${roundWord} ✓`);
+    assert.equal(ru.toastReviewDone('', n), `agent-duet: ревью завершено за ${n} ${roundWord} ✓`);
     assert.ok(zh.bandAuthor(1, 10, n).endsWith(`${n} 个问题`));
-    assert.equal(zh.toastReviewDone('', n), `codex-duet: 审查完成，共 ${n} 轮 ✓`);
+    assert.equal(zh.toastReviewDone('', n), `agent-duet: 审查完成，共 ${n} 轮 ✓`);
   }
 });
 

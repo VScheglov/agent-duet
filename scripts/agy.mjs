@@ -4,9 +4,10 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { duetEnv } from './config.mjs';
 
-export const AGY_BIN = process.env.CODEX_DUET_AGY_BIN || 'agy';
-export const AGY_HOME = process.env.CODEX_DUET_AGY_HOME || path.join(os.homedir(), '.gemini', 'antigravity-cli');
+export const AGY_BIN = duetEnv('AGY_BIN') || 'agy';
+export const AGY_HOME = duetEnv('AGY_HOME') || path.join(os.homedir(), '.gemini', 'antigravity-cli');
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 const LEVEL_SUFFIX = /-(low|medium|high|xhigh|max)$/i;
 const CATALOG_UNAVAILABLE = 'agy models unavailable; model check skipped (check the network or VPN)';

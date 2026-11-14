@@ -9,12 +9,12 @@ import { gitWrites } from './shell.ts'
 
 import type { DuetChoice, DuetDiag, DuetIssue, DuetModel, DuetPlanStep, DuetPrefs, DuetRound, DuetVerification, DuetView } from '../types'
 
-// The codex-duet runner keeps everything a session knows in <state home>/<session>/:
+// The agent-duet runner keeps everything a session knows in <state home>/<session>/:
 // state.json (the ledger) and round-N.events.jsonl (Codex's live event stream).
 // This mod reads those files on a timer and draws them; it never writes them.
 
-const PANE = 'codex-duet'
-const TITLE = 'Codex Duet'
+const PANE = 'agent-duet'
+const TITLE = 'Agent Duet'
 const POLL_MS = 2000
 const ACTIVE_MS = 12 * 60 * 60 * 1000 // a session counts as active this long after its last write
 const DEFAULT_PREFS: DuetPrefs = { band: true, toasts: true, score: true, sound: true }
@@ -48,13 +48,13 @@ const STALE_MS = 2 * 60_000 // words older than this show their age, and a strea
 const BIG_STREAM = 3_500_000 // an event stream from this size on is read from its end (STREAM_TAIL bytes)
 const STREAM_TAIL = 2_000_000
 
-const viewAtom = atom({ plugin: 'codex-duet', key: 'view' } as const, null)
-const listAtom = atom({ plugin: 'codex-duet', key: 'list' } as const, [])
-const focusAtom = atom({ plugin: 'codex-duet', key: 'focus' } as const, '')
-const prefsAtom = atom({ plugin: 'codex-duet', key: 'prefs' } as const, DEFAULT_PREFS)
-const choicesAtom = atom({ plugin: 'codex-duet', key: 'choices' } as const, {})
-const expandedAtom = atom({ plugin: 'codex-duet', key: 'expanded' } as const, {})
-const diagAtom = atom({ plugin: 'codex-duet', key: 'diag' } as const, { root: '', error: '' })
+const viewAtom = atom({ plugin: 'agent-duet', key: 'view' } as const, null)
+const listAtom = atom({ plugin: 'agent-duet', key: 'list' } as const, [])
+const focusAtom = atom({ plugin: 'agent-duet', key: 'focus' } as const, '')
+const prefsAtom = atom({ plugin: 'agent-duet', key: 'prefs' } as const, DEFAULT_PREFS)
+const choicesAtom = atom({ plugin: 'agent-duet', key: 'choices' } as const, {})
+const expandedAtom = atom({ plugin: 'agent-duet', key: 'expanded' } as const, {})
+const diagAtom = atom({ plugin: 'agent-duet', key: 'diag' } as const, { root: '', error: '' })
 
 // ---------------------------------------------------------------- text helpers
 
@@ -295,19 +295,33 @@ let guarded: { id: string; cwd: string; phase: string; engine?: string }[] = []
 // person spoke last in the current turn, and whether Claude ran the runner since. A reload starts it over.
 const loop = { drives: false, userSpoke: false, ranSinceUser: false }
 
-async function stateRoot($: EngineInterface) {
-  if (!cache.root) {
-    const explicit = await $.env.get('CODEX_DUET_HOME')
-    const xdg = await $.env.get('XDG_STATE_HOME')
-    const home = await $.env.get('HOME')
-    cache.root = explicit || `${xdg || `${home}/.local/state`}/codex-duet`
+// The mod has its own async environment boundary; empty new values also win.
+async function duetEnv($: EngineInterface, suffix: 'HOME' | 'AGY_HOME') {
+  // The engine requires literal names in source to inventory a mod's environment reads.
+  switch (suffix) {
+    case 'HOME': return (await $.env.get('AGENT_DUET_HOME')) ?? (await $.env.get('CODEX_DUET_HOME'))
+    case 'AGY_HOME': return (await $.env.get('AGENT_DUET_AGY_HOME')) ?? (await $.env.get('CODEX_DUET_AGY_HOME'))
   }
+}
+
+async function stateRoot($: EngineInterface) {
+  const explicit = await duetEnv($, 'HOME')
+  if (explicit) return cache.root = explicit
+  const xdg = await $.env.get('XDG_STATE_HOME')
+  const home = await $.env.get('HOME')
+  const base = xdg || `${home}/.local/state`
+  const current = `${base}/agent-duet`
+  // Recheck on each tick: a runner can migrate while this mod is already loaded.
+  // The mod never moves directories itself, and never reads old sessions when the new root exists.
+  if (await $.fs.stat(current).catch(() => null)) return cache.root = current
+  const legacy = `${base}/codex-duet`
+  cache.root = (await $.fs.stat(legacy).catch(() => null))?.kind === 'dir' ? legacy : current
   return cache.root
 }
 
 // A short name for a task in lists and toasts: a build's branch, a review's repository or files.
 function labelOf(st: any) {
-  if (st.kind === 'build') return String(st.subject?.branch ?? st.id).replace(/^codex-duet\//, '')
+  if (st.kind === 'build') return String(st.subject?.branch ?? st.id).replace(/^(?:agent-duet|codex-duet)\//, '')
   if (st.kind === 'audit') return clip(oneLine(st.subject?.title) || locale.audit, 50)
   if (st.kind === 'code') return String(st.cwd ?? st.id).split('/').filter(Boolean).pop() ?? st.id
   return (st.subject?.paths ?? []).map((p: string) => String(p).split('/').pop()).join(', ') || st.id
@@ -396,7 +410,7 @@ async function logAtOf($: EngineInterface, st: any, digest: Digest | null, now: 
   if (st.engine === 'agy') {
     const threadId = digest?.threadId || st.pending?.threadId || st.codex?.threadId
     if (!threadId) return null
-    const home = (await $.env.get('CODEX_DUET_AGY_HOME')) || `${await $.env.get('HOME')}/.gemini/antigravity-cli`
+    const home = (await duetEnv($, 'AGY_HOME')) || `${await $.env.get('HOME')}/.gemini/antigravity-cli`
     const db = `${home}/conversations/${threadId}.db`
     const stats = await Promise.all([db, `${db}-wal`].map((file) => $.fs.stat(file).catch(() => null)))
     return Math.max(...stats.map((stat) => stat?.mtimeMs ?? 0)) || null
@@ -657,7 +671,7 @@ async function announce($: EngineInterface, list: DuetView[]) {
   if (prefs.band && (running.length || queued.length)) {
     const one = running.length === 1 && !queued.length ? running[0] : null
     $.ui.status(one
-      ? `codex-duet r${one.runningRound}/${one.maxRounds} · ${clock(one.elapsedMs)}`
+      ? `agent-duet r${one.runningRound}/${one.maxRounds} · ${clock(one.elapsedMs)}`
       : locale.statusTasks(running.length, queued.length))
     hasStatus = true
   } else if (hasStatus) {
@@ -722,6 +736,50 @@ async function announceOne($: EngineInterface, view: DuetView, prefs: DuetPrefs,
 }
 
 // ---------------------------------------------------------------- actions
+
+async function legacyPrefs($: EngineInterface) {
+  // $.store is scoped to the installed plugin id. Its JSON files are under
+  // <plugin cache>/store; non-simple ids use a sanitized name and a hash suffix.
+  const config = (await $.env.get('CLAUDE_CONFIG_DIR')) || `${await $.env.get('HOME')}/.claude`
+  const cache = (await $.env.get('CLAUDE_CODE_PLUGIN_CACHE_DIR')) || `${config}/plugins`
+  const root = `${cache}/store`
+  const files = (await $.fs.list(root).catch(() => []))
+    .filter((f) => f.kind === 'file' && /^codex-duet(?:_[a-zA-Z0-9_-]+-[a-f0-9]{12})?\.json$/.test(f.name))
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+  for (const file of files) {
+    try {
+      const prefs = JSON.parse(String(await $.fs.read(`${root}/${file.name}`))).prefs
+      if (prefs && typeof prefs === 'object' && !Array.isArray(prefs)) return prefs as Partial<DuetPrefs>
+    } catch {} // one damaged legacy store must not prevent the plugin from starting
+  }
+  return undefined
+}
+
+async function restoreUi($: EngineInterface) {
+  // Host atom values survive hot reloads (CoreEngineInterface.state); $.store
+  // survives new sessions too. Prefer either new-name value to legacy data.
+  let prefs = await $.store.get('prefs')
+    ?? await read($, { plugin: 'agent-duet', key: 'prefs' } as const)
+  if (!await $.store.get('rename-migrated')) {
+    prefs ??= await read($, { plugin: 'codex-duet', key: 'prefs' } as const).catch(() => undefined)
+      ?? await legacyPrefs($)
+    if (prefs && typeof prefs === 'object') await $.store.set('prefs', prefs)
+    if (await read($, { plugin: 'agent-duet', key: 'focus' } as const) === undefined) {
+      const old = await read($, { plugin: 'codex-duet', key: 'focus' } as const).catch(() => undefined)
+      if (old !== undefined) await update($, focusAtom, () => old)
+    }
+    if (await read($, { plugin: 'agent-duet', key: 'choices' } as const) === undefined) {
+      const old = await read($, { plugin: 'codex-duet', key: 'choices' } as const).catch(() => undefined)
+      if (old !== undefined) await update($, choicesAtom, () => old)
+    }
+    if (await read($, { plugin: 'agent-duet', key: 'expanded' } as const) === undefined) {
+      const old = await read($, { plugin: 'codex-duet', key: 'expanded' } as const).catch(() => undefined)
+      if (old !== undefined) await update($, expandedAtom, () => old)
+    }
+    await $.store.set('rename-migrated', true)
+  }
+  if (prefs && typeof prefs === 'object') await update($, prefsAtom, () => ({ ...DEFAULT_PREFS, ...(prefs as Partial<DuetPrefs>) }))
+}
 
 async function setPref($: EngineInterface, name: keyof DuetPrefs, value?: boolean) {
   let saved: DuetPrefs = DEFAULT_PREFS
@@ -868,6 +926,29 @@ function contextNote(view: DuetView, runner: string) {
 
 // ---------------------------------------------------------------- hooks
 
+async function languageOption($: EngineInterface, current: unknown) {
+  const fallback = typeof current === 'string' ? current : 'auto'
+  if (['en', 'ru', 'zh'].includes(fallback)) return fallback
+  // userConfig options live under the installed plugin id, independently of $.store.
+  // Keep the old language until the owner explicitly configures the new plugin (auto included).
+  try {
+    const configs = await $.settings.read({ key: 'pluginConfigs' })
+    if (!configs || typeof configs !== 'object') return fallback
+    const choices = Object.entries(configs).flatMap(([id, config]) => {
+      const language = (config as { options?: { language?: unknown } })?.options?.language
+      return typeof language === 'string' && ['auto', 'en', 'ru', 'zh'].includes(language) ? [{ id, language }] : []
+    })
+    if (choices.some((c) => /^agent-duet(?:@|$)/.test(c.id))) return fallback
+    const legacy = choices.filter((c) => /^codex-duet(?:@|$)/.test(c.id))
+    const market = /\/cache\/([^/]+)\//.exec($.plugin.root)?.[1]
+    const source = $.plugin.root.includes('/skills/') ? 'skills-dir' : market === 'agent-duet' ? 'codex-duet' : market
+    const own = legacy.find((c) => c.id === (source ? `codex-duet@${source}` : 'codex-duet'))
+    if (own) return own.language
+    // A custom/inline install can use the sole old choice. Never guess between conflicting installs.
+    return new Set(legacy.map((c) => c.language)).size === 1 ? legacy[0]!.language : fallback
+  } catch { return fallback }
+}
+
 async function preferredLanguage($: EngineInterface) {
   const value = (await $.env.get('LC_ALL')) || (await $.env.get('LC_MESSAGES')) || (await $.env.get('LANG'))
   if (value) return value
@@ -887,9 +968,11 @@ async function preferredLanguage($: EngineInterface) {
 }
 
 export const register: Register = (on, options) => {
-  const language = options.language
+  let language = options.language
   locale = language === 'ru' ? ru : language === 'zh' ? zh : en
   on('session.start', async ($, e, next) => {
+    language = await languageOption($, options.language)
+    locale = language === 'ru' ? ru : language === 'zh' ? zh : en
     if (language !== 'en' && language !== 'ru' && language !== 'zh') {
       const code = (await preferredLanguage($)).toLowerCase()
       locale = code.startsWith('ru') ? ru : code.startsWith('zh') ? zh : en
@@ -898,8 +981,7 @@ export const register: Register = (on, options) => {
       name: 'duet',
       description: locale.commandDescription,
     })
-    const stored = await $.store.get('prefs')
-    if (stored && typeof stored === 'object') await update($, prefsAtom, () => ({ ...DEFAULT_PREFS, ...(stored as Partial<DuetPrefs>) }))
+    await restoreUi($)
     $.clock.every(POLL_MS, () => tick($))
     void tick($)
     return next(e)
@@ -1005,7 +1087,7 @@ export const register: Register = (on, options) => {
       line = locale.bandFailed(view.failure)
       color = 'red'
     } else if (view.phase === 'done') {
-      line = `${phaseWithVerification(view)} · codex-duet · r${view.round}/${view.maxRounds}`
+      line = `${phaseWithVerification(view)} · agent-duet · r${view.round}/${view.maxRounds}`
       color = 'green'
     }
     // the others go into a count; the pane lists them

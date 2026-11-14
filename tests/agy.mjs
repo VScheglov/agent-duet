@@ -28,7 +28,7 @@ export async function agyTests(test, parent) {
     fs.mkdirSync(agyHome);
     fs.writeFileSync(path.join(agyHome, 'settings.json'), JSON.stringify({ model: 'Gemini 3.8 Flash (High)' }));
     fs.writeFileSync(script, JSON.stringify(steps));
-    const env = { ...process.env, CODEX_DUET_HOME: home, CODEX_DUET_ENGINE: 'codex', CODEX_DUET_AGY_BIN: path.join(HERE, 'fake-agy.mjs'), CODEX_DUET_AGY_HOME: agyHome, FAKE_AGY_SCRIPT: script, FAKE_AGY_STATE: callsFile, FAKE_CODEX_SCRIPT: script, FAKE_CODEX_STATE: callsFile, CODEX_DUET_CODEX_BIN: path.join(HERE, 'fake-codex.mjs'), CODEX_HOME: path.join(dir, 'codex-home'), CODEX_DUET_MODEL: '', CODEX_DUET_EFFORT: '', CODEX_DUET_SANDBOX: 'inherit', CODEX_DUET_TIMEOUT_MIN: '', CODEX_DUET_TIMEOUT_MS: '', CODEX_DUET_KILL_GRACE_MS: '150', CODEX_DUET_POLICY: path.join(HERE, 'fixture-policy.mjs'), FIXTURE_DECISIONS: '{"1":"continue","2":"done"}', CLAUDE_CODE_SESSION_ID: '' };
+    const env = { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(?:AGENT|CODEX)_DUET_/.test(key))), AGENT_DUET_HOME: home, AGENT_DUET_ENGINE: 'codex', AGENT_DUET_AGY_BIN: path.join(HERE, 'fake-agy.mjs'), AGENT_DUET_AGY_HOME: agyHome, FAKE_AGY_SCRIPT: script, FAKE_AGY_STATE: callsFile, FAKE_CODEX_SCRIPT: script, FAKE_CODEX_STATE: callsFile, AGENT_DUET_CODEX_BIN: path.join(HERE, 'fake-codex.mjs'), CODEX_HOME: path.join(dir, 'codex-home'), AGENT_DUET_MODEL: '', AGENT_DUET_EFFORT: '', AGENT_DUET_SANDBOX: 'inherit', AGENT_DUET_TIMEOUT_MIN: '', AGENT_DUET_TIMEOUT_MS: '', AGENT_DUET_KILL_GRACE_MS: '150', AGENT_DUET_POLICY: path.join(HERE, 'fixture-policy.mjs'), FIXTURE_DECISIONS: '{"1":"continue","2":"done"}', CLAUDE_CODE_SESSION_ID: '' };
     const run = (args, input = '', more = {}) => {
       const r = spawnSync(process.execPath, [DUET, ...args], { cwd, env: { ...env, ...more }, input, encoding: 'utf8' });
       return { code: r.status, out: r.stdout, err: r.stderr };
@@ -53,6 +53,19 @@ export async function agyTests(test, parent) {
     return { cwd, home, agyHome, env, run, state, calls, modelCalls, ids, callsFile, git };
   }
   const start = (kind, extra = []) => ['start', '--engine', 'agy', '--kind', kind, ...(kind === 'plan' || kind === 'file' ? ['--subject', 'plan.md'] : kind === 'audit' || kind === 'build' ? ['--subject', '-'] : []), ...extra];
+
+  await test('agy: finish preserves a conventional subject and credits the implementing engine', () => {
+    const x = setup([{ reply: build, write: { 'implemented.txt': 'agy wrote this\n' } }]);
+    const r = x.run(start('build'), "# feat: implement with agy\n## Owner's request\n> Implement a file.\n");
+    assert.equal(r.code, 0, r.err);
+    const st = x.state();
+    const approval = x.run(['review', '--session', st.id, '--issues', '-'], JSON.stringify({ verdict: 'approve', summary: 'approved', issues: [], request_check: { status: 'matches', notes: 'checked' } }));
+    assert.equal(approval.code, 0, approval.err);
+    const f = x.run(['finish', '--session', st.id]);
+    assert.equal(f.code, 0, f.err);
+    assert.equal(x.git('log', '-1', '--format=%s', st.subject.branch).trim(), 'feat: implement with agy');
+    assert.match(x.git('log', '-1', '--format=%b', st.subject.branch), /Implemented by agy, reviewed by Claude in 1 round\(s\)/);
+  });
 
   await test('agy models: measured family/level choices resolve to the slug the CLI runs', () => {
     for (const [options, slug, effort] of [
@@ -247,7 +260,7 @@ export async function agyTests(test, parent) {
       const x = setup([{ reply: review() }, { reply: review({ verdict: 'approve', issues: [] }) }]);
       const external = path.join(root, `external-${serial}.md`);
       fs.writeFileSync(external, 'outside document');
-      const r = x.run(['start', '--kind', 'file', '--subject', external, '--sandbox', sandbox], '', { CODEX_DUET_ENGINE: 'agy' });
+      const r = x.run(['start', '--kind', 'file', '--subject', external, '--sandbox', sandbox], '', { AGENT_DUET_ENGINE: 'agy' });
       assert.equal(r.code, 0, r.err);
       const a = x.calls()[0].args;
       assert.equal(a[a.indexOf('--add-dir') + 1], root);
@@ -340,7 +353,7 @@ export async function agyTests(test, parent) {
     for (const cancel of [false, true]) {
       const x = setup([{ hang: true }, { reply: review() }]);
       let r;
-      if (!cancel) r = x.run(start('plan'), '', { CODEX_DUET_TIMEOUT_MS: '500' });
+      if (!cancel) r = x.run(start('plan'), '', { AGENT_DUET_TIMEOUT_MS: '500' });
       else r = await new Promise((resolve, reject) => {
         const child = spawn(process.execPath, [DUET, ...start('plan')], { cwd: x.cwd, env: x.env });
         let out = '', err = '';
@@ -395,7 +408,7 @@ export async function agyTests(test, parent) {
     const original = x.state().codex.threadId;
     const sid = x.state().id;
     const input = JSON.stringify({ changes: 'fixed', responses: [{ id: 'C1', action: 'fixed', note: 'fixed' }] });
-    const interrupted = x.run(['reply', '--session', sid, '--responses', '-'], input, { CODEX_DUET_TIMEOUT_MS: '500' });
+    const interrupted = x.run(['reply', '--session', sid, '--responses', '-'], input, { AGENT_DUET_TIMEOUT_MS: '500' });
     assert.equal(interrupted.code, 1);
     const retry = x.run(['retry', '--session', sid, '--fresh']);
     assert.equal(retry.code, 0, retry.err);
@@ -413,7 +426,7 @@ export async function agyTests(test, parent) {
       const x = setup([{ reply: build }, { hang: true }, { reply: build }]);
       assert.equal(x.run(start('build'), "# Implement\n## Owner's request\n> Preserve all rows\n").code, 0);
       const sid = x.state().id;
-      assert.equal(x.run(['review', '--session', sid, '--issues', '-'], JSON.stringify(review()), { CODEX_DUET_TIMEOUT_MS: '500' }).code, 1);
+      assert.equal(x.run(['review', '--session', sid, '--issues', '-'], JSON.stringify(review()), { AGENT_DUET_TIMEOUT_MS: '500' }).code, 1);
       if (!fresh) fs.rmSync(path.join(x.agyHome, 'conversations', `${x.state().pending.threadId}.db`));
       const r = x.run(['retry', '--session', sid, ...(fresh ? ['--fresh'] : [])]);
       assert.equal(r.code, 0, r.err);
@@ -444,7 +457,7 @@ export async function agyTests(test, parent) {
     fs.writeFileSync(path.join(x.cwd, 'a.js'), 'export const a = 1;\n');
     fs.rmSync(path.join(x.cwd, 'plan.md'));
     const sid = x.state().id;
-    const r = x.run(['reply', '--session', sid, '--responses', '-'], JSON.stringify({ responses: [{ id: 'C1', action: 'fixed', note: 'reverted everything' }] }), { CODEX_DUET_TIMEOUT_MS: '500' });
+    const r = x.run(['reply', '--session', sid, '--responses', '-'], JSON.stringify({ responses: [{ id: 'C1', action: 'fixed', note: 'reverted everything' }] }), { AGENT_DUET_TIMEOUT_MS: '500' });
     assert.equal(r.code, 1);
     const retry = x.run(['retry', '--session', sid, '--fresh']);
     assert.equal(retry.code, 0, retry.err);
@@ -465,13 +478,13 @@ export async function agyTests(test, parent) {
 
   await test('agy: spawn failure is retryable and process cleanup also reaps descendants', () => {
     const x = setup([{ reply: review() }]);
-    const failed = x.run(start('plan'), '', { CODEX_DUET_AGY_BIN: path.join(x.cwd, 'no-agy') });
+    const failed = x.run(start('plan'), '', { AGENT_DUET_AGY_BIN: path.join(x.cwd, 'no-agy') });
     assert.equal(failed.code, 1);
     assert.match(x.state().pending.error, /cannot run.*no-agy.*ENOENT/);
     assert.equal(x.run(['retry', '--session', x.state().id]).code, 0);
     for (const [hang, descendant] of [[true, 'stdout'], [true, 'quiet'], [false, 'stdout'], [false, 'quiet']]) {
       const y = setup([{ reply: review(), hang, descendant, ignoreTerm: true, commands: [{ command: 'node --test', completed: false }] }]);
-      const r = y.run(start('plan'), '', { CODEX_DUET_TIMEOUT_MS: '500' });
+      const r = y.run(start('plan'), '', { AGENT_DUET_TIMEOUT_MS: '500' });
       assert.equal(r.code, hang ? 1 : 0, r.err);
       if (hang) assert.doesNotMatch(y.state().pending.error, /MCP servers/);
       const pids = fs.readFileSync(`${y.callsFile}.pids`, 'utf8').trim().split('\n').map(Number);
@@ -489,7 +502,7 @@ export async function agyTests(test, parent) {
     const refused = x.run(['retry', '--session', s.id, '--engine', 'agy']);
     assert.equal(refused.code, 2);
     assert.match(refused.err, /engine codex/);
-    const rr = x.run(['reply', '--session', s.id, '--responses', '-'], JSON.stringify({ responses: [{ id: 'C1', action: 'fixed', note: 'fixed' }] }), { CODEX_DUET_ENGINE: 'agy' });
+    const rr = x.run(['reply', '--session', s.id, '--responses', '-'], JSON.stringify({ responses: [{ id: 'C1', action: 'fixed', note: 'fixed' }] }), { AGENT_DUET_ENGINE: 'agy' });
     assert.equal(rr.code, 0, rr.err);
     assert.match(rr.out, /Codex verdict/);
     assert.deepEqual(x.calls()[1].args.slice(0, 3), ['exec', 'resume', s.codex.threadId]);
@@ -498,7 +511,7 @@ export async function agyTests(test, parent) {
   await test('agy: Codex and agy turns use the same queue slots', async () => {
     const x = setup([{ hang: true }]);
     const y = setup([{ reply: review() }]);
-    const shared = { CODEX_DUET_HOME: x.home, CODEX_DUET_MAX_PARALLEL: '1', CODEX_DUET_QUEUE_POLL_MS: '25' };
+    const shared = { AGENT_DUET_HOME: x.home, AGENT_DUET_MAX_PARALLEL: '1', AGENT_DUET_QUEUE_POLL_MS: '25' };
     const launch = (fixture, args, extra) => {
       const child = spawn(process.execPath, [DUET, ...args], { cwd: fixture.cwd, env: { ...fixture.env, ...shared, ...extra } });
       let err = '';

@@ -1,15 +1,15 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
-  "name": "codex-duet",
-  "version": "0.12.0",
-  "description": "Claude ↔ Codex or agy review, build and audit loop with per-issue negotiation and a live pane",
+  "name": "agent-duet",
+  "version": "0.13.0",
+  "description": "agent-duet: Claude ↔ Codex or agy review, build and audit loop with per-issue negotiation and a live pane",
   "types": "./types/index.d.ts",
   "author": {
     "name": "Vladimir Scheglov",
     "url": "https://github.com/VScheglov"
   },
-  "homepage": "https://github.com/VScheglov/codex-duet",
-  "repository": "https://github.com/VScheglov/codex-duet",
+  "homepage": "https://github.com/VScheglov/agent-duet",
+  "repository": "https://github.com/VScheglov/agent-duet",
   "license": "MIT",
   "userConfig": {
     "language": {

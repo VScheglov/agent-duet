@@ -1,10 +1,10 @@
 [Русский](README.ru.md) | [简体中文](README.zh-CN.md)
 
-# codex-duet
+# agent-duet
 
 A review where Claude and a delegate engine, **Codex or agy (Antigravity CLI)**, work things out themselves. The delegate raises issues; Claude fixes each one, disputes it with evidence, or leaves the decision to you. The loop continues until they agree, reach a deadlock, or run out of rounds. No copying text between chats.
 
-It also works the other way around: in **build** mode, the delegate writes the code while Claude acts as architect and reviewer. Most of the work uses the selected engine’s allowance. The plugin remains `codex-duet`, with the same `/codex-duet` and `/duet` commands. All five modes (`plan`, `code`, `file`, `build`, `audit`) support both engines; Codex is the default.
+It also works the other way around: in **build** mode, the delegate writes the code while Claude acts as architect and reviewer. Most of the work uses the selected engine’s allowance. Use `/agent-duet` for the skill and `/duet` for its pane. All five modes (`plan`, `code`, `file`, `build`, `audit`) support both engines; Codex is the default.
 
 To keep the work tied to your own words, reviews can take `start --brief <file|->`: a Markdown brief with `## Owner's request` (verbatim, required), `## Accepted amendments` (only changes you accepted, with sources), and `## Claimed result` (the author's claim). Build specs require the first section and may include amendments; they use no separate `--brief`, and audit takes no brief. The delegate and, before approving a build, Claude independently report `request_check`; a reported narrowing in a review or a build disagreement escalates to you. Summaries, `status`, and the report show the checks.
 
@@ -12,30 +12,32 @@ Approval is tied to the reviewed tree. In a build, `finish` checks both the work
 
 New or changed citations on open issues are checked against the reviewed snapshot before a round is recorded: `ok`, `moved:<L>`, `other_file:<F>`, `MISSING`, or `unchecked`. Closing replies and unchanged citations keep the earlier check. Summaries and prompts show citation problems, the report keeps the marks, and `/duet` flags missing or other-file quotes only on open issues. A mark never closes an issue or changes the stop decision; `MISSING` calls for a fresh citation, not automatic dismissal.
 
+Formerly **codex-duet** through 0.12.0: sessions, saved pane preferences, environment variables and existing `codex-duet/` branches carry over automatically. On the first runner call, an old default state directory moves to the new default and a symlink preserves its old absolute paths; if both directories exist, only the new one is used. Explicit homes are never moved. The pane only reads these paths and its trace stays beside the sessions. The saved language remains a fallback until the new plugin is configured, including an explicit `auto`. Atom state survives hot reloads: preferences and available UI choices are imported once, and new-name preferences take precedence.
+
 ## Installation
 
 You need:
 
 - Claude Code 2.1.275 or newer;
-- An installed, authenticated engine: [Codex CLI](https://github.com/openai/codex) with `codex` on your `PATH`, or agy (Antigravity CLI; tested with 1.5.7) with `agy` on your `PATH`. Set `CODEX_DUET_CODEX_BIN` or `CODEX_DUET_AGY_BIN` to use another binary;
+- An installed, authenticated engine: [Codex CLI](https://github.com/openai/codex) with `codex` on your `PATH`, or agy (Antigravity CLI; tested with 1.5.7) with `agy` on your `PATH`. Set `AGENT_DUET_CODEX_BIN` or `AGENT_DUET_AGY_BIN` to use another binary;
 - Node.js 22 or newer: the runner starts as `node scripts/duet.mjs`;
 - git for code and build modes.
 
 In a Claude Code terminal session:
 
 ```
-/plugin install codex-duet --marketplace VScheglov/codex-duet
+/plugin install agent-duet --marketplace VScheglov/agent-duet
 ```
 
 Answer `y` to `Add marketplace?` and choose a scope: user scope makes the plugin available in every project. From a shell, the equivalent is:
 
 ```bash
-claude plugin install codex-duet --marketplace VScheglov/codex-duet
+claude plugin install agent-duet --marketplace VScheglov/agent-duet
 ```
 
-In the Claude app, where `/plugin` is unavailable, click + next to the input, then Plugins, Add marketplace with `VScheglov/codex-duet`, and Add plugin.
+In the Claude app, where `/plugin` is unavailable, click + next to the input, then Plugins, Add marketplace with `VScheglov/agent-duet`, and Add plugin.
 
-If `/codex-duet` and `/duet` do not appear after installation, open a new session or run `/reload-plugins`. The skill's full command name is `/codex-duet:codex-duet`; the short `/codex-duet` works as long as another command has not taken that name.
+If `/agent-duet` and `/duet` do not appear after installation, open a new session or run `/reload-plugins`. The skill's full command name is `/agent-duet:agent-duet`; the short `/agent-duet` works as long as another command has not taken that name.
 
 **Recommended: allow 12 hours for background commands.** A delegate turn can take a long time, so Claude runs it in the background with `timeout: 43200000`. Without configuration, Claude Code caps this at 2 hours and interrupts long turns (you can continue with `retry`). To prevent that, add this to `~/.claude/settings.json`:
 
@@ -54,10 +56,10 @@ Only when all three variables are unset or empty, macOS uses the first preferred
 To set Russian from a shell:
 
 ```bash
-echo '{"language":"ru"}' | claude plugin configure codex-duet --values-stdin
+echo '{"language":"ru"}' | claude plugin configure agent-duet --values-stdin
 ```
 
-Replace `ru` with `en`, `zh`, or `auto` as needed. `--values-stdin` reads a JSON object whose values are single-line strings; options omitted from it keep their current values. Without `--values-stdin`, `claude plugin configure codex-duet` only displays the configuration. You can also change the language in the plugin's row in the `/plugin` menu.
+Replace `ru` with `en`, `zh`, or `auto` as needed. `--values-stdin` reads a JSON object whose values are single-line strings; options omitted from it keep their current values. Without `--values-stdin`, `claude plugin configure agent-duet` only displays the configuration. You can also change the language in the plugin's row in the `/plugin` menu.
 
 The module reloads when the setting changes. The setting covers the plugin's interface and the notes and messages it sends to Claude; the runner's output remains English.
 
@@ -74,19 +76,19 @@ If your organization manages Claude Code through managed settings, the `Stop` ho
 ## Usage
 
 ```
-/codex-duet plan                      plan from plan mode or the current conversation
-/codex-duet code                      uncommitted changes, including untracked files
-/codex-duet code --base main          the whole branch from its merge-base with main
-/codex-duet file docs/spec.md         any files: test cases, SQL, specs, configuration
-/codex-duet code -- check migrations  text after `--` sets the review's focus
-/codex-duet code --engine agy         review with agy
-/codex-duet audit --engine agy        one-shot audit with agy (see read-only limits below)
-/codex-duet status                    current progress, including after context compaction
+/agent-duet plan                      plan from plan mode or the current conversation
+/agent-duet code                      uncommitted changes, including untracked files
+/agent-duet code --base main          the whole branch from its merge-base with main
+/agent-duet file docs/spec.md         any files: test cases, SQL, specs, configuration
+/agent-duet code -- check migrations  text after `--` sets the review's focus
+/agent-duet code --engine agy         review with agy
+/agent-duet audit --engine agy        one-shot audit with agy (see read-only limits below)
+/agent-duet status                    current progress, including after context compaction
 ```
 
 You can also ask in plain language: “have Codex review this”, “have agy review this”, “delegate to agy”, or “audit this with agy”.
 
-Choose the engine at `start` with `--engine codex|agy`. Without that option, `CODEX_DUET_ENGINE` applies, then `codex`. The engine is saved in the session and cannot change on `reply`, `review`, or `retry`; start a new session to use the other engine. Existing sessions without an engine field remain Codex sessions.
+Choose the engine at `start` with `--engine codex|agy`. Without that option, `AGENT_DUET_ENGINE` applies, then `codex`. The engine is saved in the session and cannot change on `reply`, `review`, or `retry`; start a new session to use the other engine. Existing sessions without an engine field remain Codex sessions.
 
 Options shared by both engines: `--max-rounds N` (default 10), `--model`, `--effort`, `--timeout-min` (limit per turn; no limit by default), and `--sandbox` (`inherit` by default). Model and effort can change on `reply`, `review`, or `retry`.
 
@@ -103,7 +105,7 @@ Options shared by both engines: `--max-rounds N` (default 10), `--model`, `--eff
 | Logs | `round-N.events.jsonl` | Raw `round-N.agy.jsonl`, normalized `round-N.events.jsonl` |
 | Fast | Configured and confirmed as described below | No Fast badge or tier |
 
-Both engines keep parsed replies as `round-N.codex.json`, and retain the existing `codex-duet` session IDs and commands. `CODEX_DUET_AGY_HOME` selects where the plugin reads agy settings and conversation logs (default `~/.gemini/antigravity-cli`). It does not redirect the CLI; set it to the directory agy actually uses. Authentication keeps your real `HOME`.
+Both engines keep parsed replies as `round-N.codex.json`; existing session IDs and internal state fields stay unchanged. `AGENT_DUET_AGY_HOME` selects where the plugin reads agy settings and conversation logs (default `~/.gemini/antigravity-cli`). It does not redirect the CLI; set it to the directory agy actually uses. Authentication keeps your real `HOME`.
 
 For agy, usually choose a family and level: `--model gemini-4-carbon --effort high`. Slugs, display names and family names are accepted case-insensitively. A slug such as `gemini-3.8-flash-low` fixes the level: the same `--effort low` is allowed, but a different level is refused with advice to pass the family instead. A family accepts only its catalogued levels; a family alone lets agy choose. `--effort` alone applies to the family of the `settings.json` model. Changing only `--effort` on `reply`, `review` or `retry` replaces the level of a stored slug. Standalone models without levels pass effort through with a note because that behavior is unprobed.
 
@@ -125,19 +127,19 @@ If there is no cache, the check is skipped. The `Model:` line in the round summa
 
 **Interrupted turns.** If a turn is interrupted after the delegate has started working (the background command times out, you press Stop, or the CLI crashes), `retry` resumes the same conversation with a short “continue where you left off” prompt, even in the first round. Work and read context are retained while the conversation is available: Codex needs its thread log in `~/.codex/sessions`, agy needs the conversation `.db` in its home and resumes with `--conversation`. Without it, the turn starts over. `retry --fresh` always starts over; it does not undo work already on disk.
 
-**Several tasks at once.** You can delegate multiple tasks: every build gets its own worktree and branch. At most ten delegate turns run simultaneously on the machine (`CODEX_DUET_MAX_PARALLEL`); the rest wait in order in the queue (phase `queued`) and start automatically when a slot opens. Each delegate turn starts every MCP server in its configuration and consumes one quota slot, so ten tasks without a queue can mean hundreds of processes. A slot is held only while the delegate is working; it is free while Claude reviews. Queue time counts toward the background command's two-hour ceiling, so prefer a few tasks at a time over dozens at once.
+**Several tasks at once.** You can delegate multiple tasks: every build gets its own worktree and branch. At most ten delegate turns run simultaneously on the machine (`AGENT_DUET_MAX_PARALLEL`); the rest wait in order in the queue (phase `queued`) and start automatically when a slot opens. Each delegate turn starts every MCP server in its configuration and consumes one quota slot, so ten tasks without a queue can mean hundreds of processes. A slot is held only while the delegate is working; it is free while Claude reviews. Queue time counts toward the background command's two-hour ceiling, so prefer a few tasks at a time over dozens at once.
 
 ## Build mode: the delegate writes, Claude reviews
 
 ```
-/codex-duet build --engine agy        “delegate to agy …”, “have agy implement …”
+/agent-duet build --engine agy        “delegate to agy …”, “have agy implement …”
 ```
 
 1. Claude writes a specification: goal, scope, constraints, acceptance criteria, and how to test.
-2. The runner creates a `codex-duet/<id>` branch in a separate worktree from HEAD. Your working tree is untouched. The delegate does not see uncommitted changes.
+2. The runner creates a `agent-duet/<id>` branch in a separate worktree from HEAD. Your working tree is untouched. The delegate does not see uncommitted changes.
 3. The delegate implements, runs tests, and reports what it did, what it checked, and what remains uncertain.
 4. Claude reviews the round's diff, runs tests in the worktree itself, and raises issues C1…Cn. The delegate fixes or disputes them. The stop policy is the same; deadlocks come to you (and the `/duet` pane).
-5. Once everything is agreed, with your approval `finish` commits the work on the branch and removes the worktree; you merge it yourself. `discard` removes both the worktree and the branch.
+5. Once everything is agreed, with your approval `finish` commits the work on the branch and removes the worktree; you merge it yourself. Conventional Commit titles (including a scope or `!`) are kept as written; other titles get `agent-duet: ` unless already named. The commit body credits the implementing engine and Claude’s review. `discard` removes both the worktree and the branch.
 
 Instructions for Claude are in `references/build.md`.
 
@@ -146,7 +148,7 @@ In review and build, DONE carries a verification label: `executed` (all checks c
 ## Audit mode: the delegate checks without changing anything
 
 ```
-/codex-duet audit --engine agy        “audit this with agy …”, “have agy check … and report back”
+/agent-duet audit --engine agy        “audit this with agy …”, “have agy check … and report back”
 ```
 
 A one-off report without negotiation: audit code, data, a reference standard, or a policy. Claude does not spend tokens responding to every finding. If a reference standard cannot change without your `APPROVED`, review mode is a poor fit: almost everything would come back to you. Build is also unsuitable, because an audit must not change anything.
@@ -199,7 +201,7 @@ The plugin includes a Claude Code module (`hooks/register.tsx`). Every 2 seconds
 | ↳ on escalation | The delegate’s and Claude’s positions and buttons for choosing the side that is right, followed by “Send decisions to Claude” |
 | **Band above the prompt** and status line | Phase, timer, current delegate action; other modules' bands remain below it |
 | **Footer** | A label such as “Duet r3 ⏳ 4:12”; click to open the pane. Visible even when the band above the prompt is disabled |
-| **Toasts** | Round start and end, escalation, failure; after a round, a “continue codex-duet” suggestion (Tab) |
+| **Toasts** | Round start and end, escalation, failure; after a round, a “continue agent-duet” suggestion (Tab) |
 | **Sound** | Escalation (your decision is needed), review completion, round failure, or a missing delegate process; Claude's turns make no sound. Uses the Claude app's built-in sounds: `tool_approval_needed`, `enter_voice_mode`, `disconnected`. They play directly from the app and are not copied into the plugin. Without the app, fallback sounds from `sounds/` play |
 
 **Keeping the loop going.** If a session is waiting for Claude (to answer issues, or to review a delegate build round) and Claude ends its turn, the module returns it to the loop once through the `Stop` hook. It does not do so when:
@@ -241,24 +243,29 @@ Commands: `/duet` opens the pane; `/duet stop` stops the current round (you can 
 | `hooks/locales/en.ts`, `hooks/locales/ru.ts`, `hooks/locales/zh.ts` | Interface and session-message translations; English defines the key contract |
 | `sounds/` | Fallback sounds when the Claude app is unavailable; `node sounds/make.mjs` synthesizes them again |
 | `tests/` | `run.mjs`: runner and policy; `mod.mjs`: module with a stand-in engine; `pane.test.tsx`: rendering through the real engine's test kit |
-| `~/.local/state/codex-duet/<id>/` | Sessions: `state.json`, prompts and replies for each round, `report.md` |
+| `~/.local/state/agent-duet/<id>/` | Sessions: `state.json`, prompts and replies for each round, `report.md` |
 
 Reopen the reviewer’s conversation with `codex resume <thread id>` for Codex or `agy --conversation <conversation id>` for agy; the report contains the ID. agy’s raw output is saved as `round-N.agy.jsonl`; `round-N.events.jsonl` holds normalized events for verification and the pane. Parsed replies keep the compatibility name `round-N.codex.json`.
 
 ## Environment variables
 
+Use `AGENT_DUET_*` below. The old `CODEX_DUET_*` names still work; the new name wins when both are set, including an empty new value. Codex’s own `CODEX_HOME` and `~/.codex` are unchanged.
+
 | Variable | Purpose |
 |---|---|
-| `CODEX_DUET_ENGINE` | Default engine at start: `codex` or `agy` (default `codex`) |
-| `CODEX_DUET_MODEL`, `CODEX_DUET_EFFORT` | Default model and effort |
-| `CODEX_DUET_TIMEOUT_MIN` | Limit per delegate turn in minutes (default 0, unlimited) |
-| `CODEX_DUET_MAX_PARALLEL` | Concurrent delegate turns on the machine (default 10); the rest wait in the queue |
-| `CODEX_DUET_SANDBOX` | Default sandbox (`inherit`) |
-| `CODEX_DUET_HOME` | Session storage location |
-| `CODEX_DUET_POLICY` | Alternate policy file (used by tests) |
-| `CODEX_DUET_CODEX_BIN` | Codex binary (default `codex`) |
-| `CODEX_DUET_AGY_BIN` | agy binary (default `agy`) |
-| `CODEX_DUET_AGY_HOME` | Plugin lookup directory for agy settings/logs (default `~/.gemini/antigravity-cli`); does not redirect the CLI or change `HOME` |
+| `AGENT_DUET_ENGINE` | Default engine at start: `codex` or `agy` (default `codex`) |
+| `AGENT_DUET_MODEL`, `AGENT_DUET_EFFORT` | Default model and effort |
+| `AGENT_DUET_TIMEOUT_MIN` | Limit per delegate turn in minutes (default 0, unlimited) |
+| `AGENT_DUET_TIMEOUT_MS` | Override the per-turn limit in milliseconds (mainly for tests) |
+| `AGENT_DUET_KILL_GRACE_MS` | Grace between SIGTERM and SIGKILL, or exit and pipe closure (default 5000 ms) |
+| `AGENT_DUET_MAX_PARALLEL` | Concurrent delegate turns on the machine (default 10); the rest wait in the queue |
+| `AGENT_DUET_QUEUE_POLL_MS` | Queue polling interval (default 3000 ms) |
+| `AGENT_DUET_SANDBOX` | Default sandbox (`inherit`) |
+| `AGENT_DUET_HOME` | Session storage location, used as given; default `$XDG_STATE_HOME/agent-duet` or `~/.local/state/agent-duet` |
+| `AGENT_DUET_POLICY` | Alternate policy file (used by tests) |
+| `AGENT_DUET_CODEX_BIN` | Codex binary (default `codex`) |
+| `AGENT_DUET_AGY_BIN` | agy binary (default `agy`) |
+| `AGENT_DUET_AGY_HOME` | Plugin lookup directory for agy settings/logs (default `~/.gemini/antigravity-cli`); does not redirect the CLI or change `HOME` |
 
 ## Tests
 
@@ -281,7 +288,7 @@ Run these from the plugin directory. `run.mjs` and `mod.mjs` also run in GitHub 
 
 - **No output while starting.** agy waits for all configured MCP servers to connect before working. Check VPN/network access and run `agy mcp list` with the same agy configuration; an unreachable server can hold up the turn. The queue and background timeout still apply.
 - **A tool is denied.** A headless turn cannot show an interactive permission question. Configure the needed allow rules in agy, or explicitly choose `--sandbox danger-full-access` (`--dangerously-skip-permissions`). `workspace-write` uses `--sandbox` and proceed-in-sandbox settings; it does not override every tool rule.
-- **Retry starts over.** Check that the saved conversation `.db` is still in `CODEX_DUET_AGY_HOME` (default `~/.gemini/antigravity-cli`). `retry` uses `--conversation` only when it is present; `--fresh` deliberately restarts.
+- **Retry starts over.** Check that the saved conversation `.db` is still in `AGENT_DUET_AGY_HOME` (default `~/.gemini/antigravity-cli`). `retry` uses `--conversation` only when it is present; `--fresh` deliberately restarts.
 - **Read-only violation.** Inspect the recorded paths and the files before proceeding. The check warns after the turn and never rolls changes back. It cannot detect every write; see “Security”.
 
 ## Codex CLI pitfalls (0.159)
@@ -293,16 +300,16 @@ Run these from the plugin directory. `run.mjs` and `mod.mjs` also run in GitHub 
 
 ## Development
 
-Claude Code automatically loads a clone in `~/.claude/skills/codex-duet` as `codex-duet@skills-dir`, without installation. Changes apply to new sessions. Do not also install the same plugin from the marketplace: an installed plugin takes precedence over a skills-dir plugin with the same name, and the clone appears as “Not loaded.”
+Claude Code automatically loads a clone in `~/.claude/skills/agent-duet` as `agent-duet@skills-dir`, without installation. Changes apply to new sessions. Do not also install the same plugin from the marketplace: an installed plugin takes precedence over a skills-dir plugin with the same name, and the clone appears as “Not loaded.”
 
 ## Disable or uninstall
 
 ```bash
-claude plugin disable codex-duet@codex-duet
-claude plugin uninstall codex-duet@codex-duet
+claude plugin disable agent-duet@agent-duet
+claude plugin uninstall agent-duet@agent-duet
 ```
 
-A clone in `~/.claude/skills` can be disabled the same way using `codex-duet@skills-dir`; delete its directory to uninstall it.
+A clone in `~/.claude/skills` can be disabled the same way using `agent-duet@skills-dir`; delete its directory to uninstall it.
 
 ## License
 

@@ -5,7 +5,7 @@ import type { On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 
-const HOME = '/state/codex-duet'
+const HOME = '/state/agent-duet'
 const ID = '20261018-171430-8f3a'
 const STATE = JSON.stringify({
   "id": "20261018-171430-8f3a",
@@ -110,7 +110,7 @@ const STATE = JSON.stringify({
   }
 })
 const PANE = {
-  title: 'Codex Duet', isFocused: false, bodyColumns: 44, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {},
+  title: 'Agent Duet', isFocused: false, bodyColumns: 44, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {},
 } as const
 
 const NOW = Date.parse('2026-10-18T17:30:00Z')
@@ -118,9 +118,9 @@ const SURFACES = ['terminal', 'desktop', 'mobile'] as const
 
 // Boots the mod over a session folder held in memory, as the runner leaves it on disk (a call on $ is answered
 // { value } or { deny }), and draws the pane docked at a narrow width.
-async function paneOver($: Engine, on: On, surface: typeof SURFACES[number], files: Record<string, string>) {
-  mock.env(on, { CODEX_DUET_HOME: HOME, HOME: '/nonexistent' })
-  mock.store(on)
+async function paneOver($: Engine, on: On, surface: typeof SURFACES[number], files: Record<string, string>, stored: Record<string, unknown> = {}) {
+  mock.env(on, { AGENT_DUET_HOME: HOME, HOME: '/nonexistent' })
+  mock.store(on, stored)
   const clock = mock.clock(on, { now: NOW })
   const at = (path: string) => files[path.slice(HOME.length + 1)]
   on('fs.list', ($, e) => ({ value: e.path === HOME ? [{ name: ID, kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false }] : [] }))
@@ -134,7 +134,7 @@ async function paneOver($: Engine, on: On, surface: typeof SURFACES[number], fil
   await $.session.start({ cwd: '/work/csv-import', surface, isInteractive: true })
   await clock.advance(2000)
   return $.ui.mount({
-    plugin: 'codex-duet', surface, component: 'Pane', requestId: 'codex-duet', props: PANE,
+    plugin: 'agent-duet', surface, component: 'Pane', requestId: 'agent-duet', props: PANE,
     viewport: { columns: 44, rows: 60, isFullscreen: true },
   })
 }
@@ -159,6 +159,40 @@ const TEXT = {
     disputed: /^Claude \(有争议\): validate runs in CI/,
     runsTests: '  · 运行测试 tests.test_importer_parse_rows',
   },
+}
+
+for (const hasNewPrefs of [false, true]) {
+  test(`renamed pane imports legacy atom preferences through the real host; new prefs win: ${hasNewPrefs}`, { options: { language: 'en' } }, async ($, on) => {
+    let legacyReads = 0
+    on('state.get', async ($, e, next) => {
+      if (e.plugin === 'codex-duet' && e.key === 'prefs') {
+        legacyReads += 1
+        return { value: { value: { band: false, toasts: false, score: false, sound: false }, version: 1 } }
+      }
+      return next(e)
+    })
+    const stored = hasNewPrefs ? { prefs: { band: true, toasts: true, score: true, sound: true } } : {}
+    const ui = await paneOver($, on, 'desktop', { [`${ID}/state.json`]: STATE }, stored)
+    await ui.press({ key: 'settings' })
+    expect(legacyReads).toBe(hasNewPrefs ? 0 : 1)
+    expect((await ui.find({ key: 'pref-sound' }))?.props.label).toBe(hasNewPrefs ? 'Sound: on' : 'Sound: off')
+    await ui.unmount()
+  })
+}
+
+for (const hasNewLanguage of [false, true]) {
+  test(`renamed pane keeps the old language until the new plugin explicitly selects auto: ${hasNewLanguage}`, { options: { language: 'auto' } }, async ($, on) => {
+    on('settings.read', () => ({ value: {
+      pluginConfigs: {
+        'codex-duet@skills-dir': { options: { language: 'ru' } },
+        ...(hasNewLanguage ? { 'agent-duet@inline': { options: { language: 'auto' } } } : {}),
+      },
+    } }))
+    on('process.run', () => ({ value: { exitCode: 0, stdout: '("en-US")', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+    const ui = await paneOver($, on, 'desktop', { [`${ID}/state.json`]: STATE })
+    expect(await ui.find({ type: 'Text', text: TEXT[hasNewLanguage ? 'en' : 'ru'].foreign })).toBeDefined()
+    await ui.unmount()
+  })
 }
 
 // GUI sessions may omit every POSIX locale variable; the default option then reads macOS preferences.

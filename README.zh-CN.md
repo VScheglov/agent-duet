@@ -1,10 +1,10 @@
 [English](README.md) | [Русский](README.ru.md)
 
-# codex-duet
+# agent-duet
 
 让 Claude 和所选引擎 **Codex 或 agy（Antigravity CLI）**自己协商完成代码审查。引擎提出问题，Claude 逐项修复、用证据提出异议，或留给你裁决。循环会一直持续，直到双方达成一致、陷入僵局，或用完轮次。不用再在聊天窗口之间复制内容。
 
-也可以反过来：在 **build** 模式下，引擎编写代码，Claude 担任架构师和审查者。这样主要消耗所选引擎的额度。插件仍叫 `codex-duet`，保留 `/codex-duet` 和 `/duet` 命令。全部五种模式（`plan`、`code`、`file`、`build`、`audit`）都支持两个引擎；默认使用 Codex。
+也可以反过来：在 **build** 模式下，引擎编写代码，Claude 担任架构师和审查者。这样主要消耗所选引擎的额度。技能命令为 `/agent-duet`，面板命令为 `/duet`。全部五种模式（`plan`、`code`、`file`、`build`、`audit`）都支持两个引擎；默认使用 Codex。
 
 为了按你的原话核对工作，审查可使用 `start --brief <file|->` 传入 Markdown，包含 `## Owner's request`（原话，必填）、`## Accepted amendments`（仅限你已接受的修改，并注明来源）和 `## Claimed result`（作者声称达到的结果）。build 的规格本身必须包含第一个章节，可包含已接受的修改；不使用单独的 `--brief`，audit 也不接受 brief。所选引擎和批准 build 前的 Claude 分别填写 `request_check`；审查报告需求被缩减，或 build 中双方判断不一致时，会交给你裁决。轮次摘要、`status` 和报告都会显示检查结果。
 
@@ -12,30 +12,32 @@
 
 每轮记录前，未关闭问题中新增或修改的引用会与该轮审查的快照核对，标记为 `ok`、`moved:<L>`、`other_file:<F>`、`MISSING` 或 `unchecked`。关闭问题或重复引用时保留此前的检查。摘要和提示词显示引用问题，报告保留标记，`/duet` 仅在未关闭问题上标出未找到或位于其他文件的引文。标记不会关闭问题，也不会改变停止决定；`MISSING` 表示应要求重新引用，不能据此自动否定问题。
 
+截至 0.12.0，本插件原名 **codex-duet**：旧会话、已保存的面板偏好、环境变量及 `codex-duet/` 分支自动继续工作。首次运行时，运行器会将旧的默认状态目录移至新目录，并留下符号链接以保留旧绝对路径；若两个目录均存在，则只使用新目录。显式指定的目录不会移动。面板只读取这些路径，跟踪文件与会话保存在同一位置。在为新插件配置语言（包括显式选择 `auto`）之前，旧语言设置仍作为回退。atom 状态在热重载后保留：偏好和可用的界面选择只迁移一次，新名称下已有的偏好优先。
+
 ## 安装
 
 需要：
 
 - Claude Code 2.1.275 或更新版本；
-- 已安装并登录的引擎：[Codex CLI](https://github.com/openai/codex)，且 `codex` 在 `PATH` 中；或 agy（Antigravity CLI，已用 1.5.7 测试），且 `agy` 在 `PATH` 中。可用 `CODEX_DUET_CODEX_BIN` 或 `CODEX_DUET_AGY_BIN` 指定其他可执行文件；
+- 已安装并登录的引擎：[Codex CLI](https://github.com/openai/codex)，且 `codex` 在 `PATH` 中；或 agy（Antigravity CLI，已用 1.5.7 测试），且 `agy` 在 `PATH` 中。可用 `AGENT_DUET_CODEX_BIN` 或 `AGENT_DUET_AGY_BIN` 指定其他可执行文件；
 - Node.js 22 或更新版本：运行器通过 `node scripts/duet.mjs` 启动；
 - code 和 build 模式需要 git。
 
 在 Claude Code 终端会话中运行：
 
 ```
-/plugin install codex-duet --marketplace VScheglov/codex-duet
+/plugin install agent-duet --marketplace VScheglov/agent-duet
 ```
 
 遇到 `Add marketplace?` 时回答 `y`，然后选择作用范围：选择 user 后，插件可用于所有项目。也可以在 shell 中运行：
 
 ```bash
-claude plugin install codex-duet --marketplace VScheglov/codex-duet
+claude plugin install agent-duet --marketplace VScheglov/agent-duet
 ```
 
-在不支持 `/plugin` 的 Claude 应用中，点击输入框旁的 +，依次选择 Plugins、Add marketplace，输入 `VScheglov/codex-duet`，再选择 Add plugin。
+在不支持 `/plugin` 的 Claude 应用中，点击输入框旁的 +，依次选择 Plugins、Add marketplace，输入 `VScheglov/agent-duet`，再选择 Add plugin。
 
-如果安装后看不到 `/codex-duet` 和 `/duet`，请新建会话或执行 `/reload-plugins`。技能命令的完整名称是 `/codex-duet:codex-duet`；只要没有其他命令占用同名，简写 `/codex-duet` 就能使用。
+如果安装后看不到 `/agent-duet` 和 `/duet`，请新建会话或执行 `/reload-plugins`。技能命令的完整名称是 `/agent-duet:agent-duet`；只要没有其他命令占用同名，简写 `/agent-duet` 就能使用。
 
 **建议：将后台命令的时限设为 12 小时。** 引擎的一轮工作可能很久，因此 Claude 会在后台启动它，并设置 `timeout: 43200000`。如果不调整配置，Claude Code 会将时限截为 2 小时，较长的一轮就会中断（可以通过 `retry` 继续）。为避免这种情况，在 `~/.claude/settings.json` 中加入：
 
@@ -56,10 +58,10 @@ claude plugin install codex-duet --marketplace VScheglov/codex-duet
 要从 shell 将语言设为俄语，请运行：
 
 ```bash
-echo '{"language":"ru"}' | claude plugin configure codex-duet --values-stdin
+echo '{"language":"ru"}' | claude plugin configure agent-duet --values-stdin
 ```
 
-可以将 `ru` 替换为 `en`、`zh` 或 `auto`。`--values-stdin` 读取一个值为单行字符串的 JSON 对象；对象中未提供的选项保留当前值。不加 `--values-stdin` 时，`claude plugin configure codex-duet` 只显示配置。也可以在 `/plugin` 菜单的插件所在行更改语言。
+可以将 `ru` 替换为 `en`、`zh` 或 `auto`。`--values-stdin` 读取一个值为单行字符串的 JSON 对象；对象中未提供的选项保留当前值。不加 `--values-stdin` 时，`claude plugin configure agent-duet` 只显示配置。也可以在 `/plugin` 菜单的插件所在行更改语言。
 
 更改后引擎会自动重新加载模块。此设置控制界面以及模块发送给 Claude 的消息；运行器的输出和策略原因使用英语。
 
@@ -76,19 +78,19 @@ echo '{"language":"ru"}' | claude plugin configure codex-duet --values-stdin
 ## 使用
 
 ```
-/codex-duet plan                       plan mode 中的计划或当前对话中的计划
-/codex-duet code                       未提交的改动（包括 untracked 文件）
-/codex-duet code --base main           从与 main 的 merge-base 开始审查整个分支
-/codex-duet file docs/spec.md          任意文件：测试用例、SQL、规格、配置
-/codex-duet code -- 检查迁移           `--` 后面是审查重点
-/codex-duet code --engine agy          使用 agy 审查
-/codex-duet audit --engine agy         使用 agy 进行一次性审计（read-only 限制见下文）
-/codex-duet status                     当前进度（压缩上下文后也很有用）
+/agent-duet plan                       plan mode 中的计划或当前对话中的计划
+/agent-duet code                       未提交的改动（包括 untracked 文件）
+/agent-duet code --base main           从与 main 的 merge-base 开始审查整个分支
+/agent-duet file docs/spec.md          任意文件：测试用例、SQL、规格、配置
+/agent-duet code -- 检查迁移           `--` 后面是审查重点
+/agent-duet code --engine agy          使用 agy 审查
+/agent-duet audit --engine agy         使用 agy 进行一次性审计（read-only 限制见下文）
+/agent-duet status                     当前进度（压缩上下文后也很有用）
 ```
 
 也可以直接说：“让 Codex 审查代码”“让 agy 审查代码”“让 agy 实现”“用 agy 做审计”。
 
-在 `start` 时用 `--engine codex|agy` 选择引擎。省略时先取 `CODEX_DUET_ENGINE`，再默认为 `codex`。选择会保存在会话中；`reply`、`review` 和 `retry` 不能更换引擎，要切换请新建会话。没有引擎字段的旧会话仍使用 Codex。
+在 `start` 时用 `--engine codex|agy` 选择引擎。省略时先取 `AGENT_DUET_ENGINE`，再默认为 `codex`。选择会保存在会话中；`reply`、`review` 和 `retry` 不能更换引擎，要切换请新建会话。没有引擎字段的旧会话仍使用 Codex。
 
 两个引擎共用的选项：`--max-rounds N`（默认 10）、`--model`、`--effort`、`--timeout-min`（每轮时限，默认不限制）、`--sandbox`（默认 `inherit`）。`reply`、`review` 和 `retry` 可以更换模型或推理级别。
 
@@ -105,7 +107,7 @@ echo '{"language":"ru"}' | claude plugin configure codex-duet --values-stdin
 | 日志 | `round-N.events.jsonl` | 原始 `round-N.agy.jsonl`，规范化 `round-N.events.jsonl` |
 | Fast | 按下文配置并确认 | 没有 Fast 模式或标记 |
 
-两个引擎解析后的回复都保存为 `round-N.codex.json`，保留现有 `codex-duet` 会话 ID 和命令。`CODEX_DUET_AGY_HOME` 指定插件读取 agy 设置和会话日志的目录（默认 `~/.gemini/antigravity-cli`）。它不会重定向 CLI；请指向 agy 实际使用的目录。身份验证保留真实的 `HOME`。
+两个引擎解析后的回复都保存为 `round-N.codex.json`；现有会话 ID 和内部状态字段保持不变。`AGENT_DUET_AGY_HOME` 指定插件读取 agy 设置和会话日志的目录（默认 `~/.gemini/antigravity-cli`）。它不会重定向 CLI；请指向 agy 实际使用的目录。身份验证保留真实的 `HOME`。
 
 agy 通常使用系列加级别：`--model gemini-4-carbon --effort high`。slug、显示名称和系列名称均不区分大小写。`gemini-3.8-flash-low` 这样的 slug 已固定级别：可以同时传入相同的 `--effort low`，不同级别则会被拒绝，并提示改用系列名称。系列只接受目录中列出的级别；仅指定系列时由 agy 选择级别。单独的 `--effort` 应用于 `settings.json` 模型所属的系列。在 `reply`、`review` 或 `retry` 中只更改 `--effort`，会替换已保存 slug 的级别。对于没有级别的独立模型，effort 会直接传入并附上说明，因为该行为尚未验证。
 
@@ -127,19 +129,19 @@ Codex 的 `--model` 和 `--effort` 默认取自 `~/.codex/config.toml`；也可�
 
 **中断的一轮。** 如果引擎开始工作后被中断（后台命令超时、点击“停止”或 CLI 崩溃），`retry` 会用简短的“从中断处继续”提示恢复同一个会话，第一轮也一样。只要会话仍可用，已完成的工作和已读取的内容就保留在上下文中：Codex 需要 `~/.codex/sessions` 中的线程日志；agy 需要其目录中的会话 `.db`，并使用 `--conversation` 恢复。文件不存在时会重新开始。`retry --fresh` 始终重新开始，但不会撤销磁盘上已有的改动。
 
-**同时处理多个任务。** 可以同时委派多个任务：每个 build 都有独立的 worktree 和分支。同一台机器最多同时运行十轮引擎任务（由 `CODEX_DUET_MAX_PARALLEL` 控制），其余任务按入队顺序等待（阶段为 `queued`），空出位置后自动启动。每轮引擎任务都会启动配置中的所有 MCP 服务器，并占用一个配额，因此不限制并发时，十个任务就可能产生数百个进程。只有引擎运行时才占用并发名额；Claude 审查期间名额会释放。排队时间计入后台命令的两小时时限，所以最好一次安排几个任务，而不是几十个。
+**同时处理多个任务。** 可以同时委派多个任务：每个 build 都有独立的 worktree 和分支。同一台机器最多同时运行十轮引擎任务（由 `AGENT_DUET_MAX_PARALLEL` 控制），其余任务按入队顺序等待（阶段为 `queued`），空出位置后自动启动。每轮引擎任务都会启动配置中的所有 MCP 服务器，并占用一个配额，因此不限制并发时，十个任务就可能产生数百个进程。只有引擎运行时才占用并发名额；Claude 审查期间名额会释放。排队时间计入后台命令的两小时时限，所以最好一次安排几个任务，而不是几十个。
 
 ## build 模式：引擎编写，Claude 审查
 
 ```
-/codex-duet build --engine agy        “交给 agy……” “让 agy 实现……”
+/agent-duet build --engine agy        “交给 agy……” “让 agy 实现……”
 ```
 
 1. Claude 编写规格：目标、范围、约束、验收标准和验证方法。
-2. 运行器从 HEAD 创建独立 worktree 和分支 `codex-duet/<id>`。你的工作区不会被改动，所选引擎看不到未提交的内容。
+2. 运行器从 HEAD 创建独立 worktree 和分支 `agent-duet/<id>`。你的工作区不会被改动，所选引擎看不到未提交的内容。
 3. 所选引擎实现功能、运行测试，并报告完成了什么、验证了什么、还有哪些疑问。
 4. Claude 查看本轮 diff，亲自在 worktree 中运行测试，并提出 C1…Cn 等问题。引擎修复或提出异议。停止策略与审查模式相同，僵局会交给你裁决（也会显示在 `/duet` 面板中）。
-5. 达成一致后，经你同意，`finish` 会将改动提交到分支并删除 worktree；分支由你自己合并。`discard` 会同时删除 worktree 和分支。
+5. 达成一致后，经你同意，`finish` 会将改动提交到分支并删除 worktree；分支由你自己合并。Conventional Commits 标题（包括 scope 或 `!`）原样保留；其他标题添加 `agent-duet: `，已有插件名前缀时不重复。提交正文注明实现所用引擎与 Claude 的审查。`discard` 会同时删除 worktree 和分支。
 
 给 Claude 的详细说明在 `references/build.md` 中。
 
@@ -148,7 +150,7 @@ Codex 的 `--model` 和 `--effort` 默认取自 `~/.codex/config.toml`；也可�
 ## audit 模式：引擎只检查，不修改
 
 ```
-/codex-duet audit --engine agy        “用 agy 做审计……” “让 agy 检查……并给出报告”
+/agent-duet audit --engine agy        “用 agy 做审计……” “让 agy 检查……并给出报告”
 ```
 
 这是一次性报告，不进行协商，适合审计代码、数据、基准或策略。因此 Claude 不必消耗 token 逐条回复。如果没有你的 `APPROVED` 就不能修改基准，审查模式并不合适：几乎所有问题都会交给你。build 也不合适，因为审计不应修改任何内容。
@@ -201,7 +203,7 @@ reply ─► 引擎（同一会话，resume）：resolved · withdrawn · open +
 | ↳ 升级处理时 | 显示引擎和 Claude 的立场，以及选择正确一方的按钮，再通过“将决定发送给 Claude”提交 |
 | **输入框上方状态条**与状态行 | 阶段、计时器和引擎当前动作；其他模块的状态条保留在其下方 |
 | **页脚** | 类似“Duet r3 ⏳ 4:12”的标签，点击可打开面板；即使关闭输入框上方状态条也会显示 |
-| **通知** | 一轮开始和结束、升级处理、失败；每轮结束后提供“继续 codex-duet”提示（Tab） |
+| **通知** | 一轮开始和结束、升级处理、失败；每轮结束后提供“继续 agent-duet”提示（Tab） |
 | **声音** | 升级处理（需要你裁决）、审查结束、某轮失败或引擎进程消失时播放；Claude 工作期间不播放声音。使用 Claude 应用内置的 `tool_approval_needed`、`enter_voice_mode`、`disconnected` 提示音，直接从应用播放，不复制到插件中。没有应用时使用 `sounds/` 中的备用声音 |
 
 **循环不会自行停下。** 如果会话正在等待 Claude 工作（回复问题，或在 build 模式下检查引擎本轮结果），而 Claude 结束了当前回合，模块会通过 `Stop` 钩子将它带回循环一次。以下情况不会触发：
@@ -243,24 +245,29 @@ code 审查或 build 进行期间（最后一轮之后的 12 小时内视为活�
 | `README.md`、`README.ru.md`、`README.zh-CN.md` | 英语、俄语和简体中文说明 |
 | `sounds/` | 没有 Claude 应用时使用的备用声音；运行 `node sounds/make.mjs` 可重新合成 |
 | `tests/` | `run.mjs`：运行器和策略；`mod.mjs`：使用模拟引擎测试模块；`pane.test.tsx`：使用真实引擎测试面板 |
-| `~/.local/state/codex-duet/<id>/` | 会话：`state.json`、各轮提示词和回复、`report.md` |
+| `~/.local/state/agent-duet/<id>/` | 会话：`state.json`、各轮提示词和回复、`report.md` |
 
 使用 `codex resume <thread id>` 重新打开 Codex 对话，或使用 `agy --conversation <conversation id>` 重新打开 agy 对话；ID 见报告。agy 原始输出保存在 `round-N.agy.jsonl`；`round-N.events.jsonl` 保存供验证与面板使用的规范化事件。解析后的回复保留兼容名称 `round-N.codex.json`。
 
 ## 环境变量
 
+下表使用 `AGENT_DUET_*`。旧的 `CODEX_DUET_*` 仍受支持；两者均设置时新名称优先，即使新值为空。Codex 自己的 `CODEX_HOME` 和 `~/.codex` 保持不变。
+
 | 变量 | 用途 |
 |---|---|
-| `CODEX_DUET_ENGINE` | 启动时的默认引擎：`codex` 或 `agy`（默认 `codex`） |
-| `CODEX_DUET_MODEL`、`CODEX_DUET_EFFORT` | 默认模型和 effort |
-| `CODEX_DUET_TIMEOUT_MIN` | 引擎每轮时限，单位为分钟（默认 0，即不限制） |
-| `CODEX_DUET_MAX_PARALLEL` | 同一台机器上同时运行的引擎轮次数（默认 10），其余排队 |
-| `CODEX_DUET_SANDBOX` | 默认沙箱模式（`inherit`） |
-| `CODEX_DUET_HOME` | 会话存储位置 |
-| `CODEX_DUET_POLICY` | 替代的策略文件（测试使用此方式） |
-| `CODEX_DUET_CODEX_BIN` | Codex 可执行文件（默认 `codex`） |
-| `CODEX_DUET_AGY_BIN` | agy 可执行文件（默认 `agy`） |
-| `CODEX_DUET_AGY_HOME` | 插件查找 agy 设置和日志的目录（默认 `~/.gemini/antigravity-cli`）；不会重定向 CLI 或更改 `HOME` |
+| `AGENT_DUET_ENGINE` | 启动时的默认引擎：`codex` 或 `agy`（默认 `codex`） |
+| `AGENT_DUET_MODEL`、`AGENT_DUET_EFFORT` | 默认模型和 effort |
+| `AGENT_DUET_TIMEOUT_MIN` | 引擎每轮时限，单位为分钟（默认 0，即不限制） |
+| `AGENT_DUET_TIMEOUT_MS` | 以毫秒覆盖每轮时限（主要用于测试） |
+| `AGENT_DUET_KILL_GRACE_MS` | SIGTERM 至 SIGKILL 或退出至关闭流的宽限时间（默认 5000 毫秒） |
+| `AGENT_DUET_MAX_PARALLEL` | 同一台机器上同时运行的引擎轮次数（默认 10），其余排队 |
+| `AGENT_DUET_QUEUE_POLL_MS` | 队列轮询间隔（默认 3000 毫秒） |
+| `AGENT_DUET_SANDBOX` | 默认沙箱模式（`inherit`） |
+| `AGENT_DUET_HOME` | 按原值使用的会话存储目录；默认为 `$XDG_STATE_HOME/agent-duet` 或 `~/.local/state/agent-duet` |
+| `AGENT_DUET_POLICY` | 替代的策略文件（测试使用此方式） |
+| `AGENT_DUET_CODEX_BIN` | Codex 可执行文件（默认 `codex`） |
+| `AGENT_DUET_AGY_BIN` | agy 可执行文件（默认 `agy`） |
+| `AGENT_DUET_AGY_HOME` | 插件查找 agy 设置和日志的目录（默认 `~/.gemini/antigravity-cli`）；不会重定向 CLI 或更改 `HOME` |
 
 ## 测试
 
@@ -283,7 +290,7 @@ claude plugin validate .
 
 - **启动时没有输出。** agy 会等待所有已配置的 MCP 服务器连接。检查 VPN/网络，并使用相同的 agy 配置运行 `agy mcp list`；无法连接的服务器可能阻塞本轮。排队和后台超时仍会生效。
 - **工具被拒绝。** 无界面运行时无法弹出交互式权限问题。请在 agy 中配置所需的 allow rules，或明确选择 `--sandbox danger-full-access`（`--dangerously-skip-permissions`）。`workspace-write` 使用 `--sandbox` 与 proceed-in-sandbox 设置，不会覆盖所有工具规则。
-- **Retry 重新开始。** 检查保存的会话 `.db` 是否仍在 `CODEX_DUET_AGY_HOME`（默认 `~/.gemini/antigravity-cli`）中。文件存在时 `retry` 才使用 `--conversation`；`--fresh` 则有意重新开始。
+- **Retry 重新开始。** 检查保存的会话 `.db` 是否仍在 `AGENT_DUET_AGY_HOME`（默认 `~/.gemini/antigravity-cli`）中。文件存在时 `retry` 才使用 `--conversation`；`--fresh` 则有意重新开始。
 - **Read-only 违规。** 继续前检查已记录的路径及文件。此检查在每轮后警告，绝不会自动回滚。它无法检测每次写入，限制见“安全”。
 
 ## Codex CLI 的注意事项（0.159）
@@ -295,16 +302,16 @@ claude plugin validate .
 
 ## 开发
 
-Claude Code 会自动将 `~/.claude/skills/codex-duet` 中的克隆加载为 `codex-duet@skills-dir`，无需安装。修改会在新会话中生效。此时不要再从市场安装同一个插件：已安装的插件会覆盖 skills-dir 中的同名插件，克隆会显示为“Not loaded”。
+Claude Code 会自动将 `~/.claude/skills/agent-duet` 中的克隆加载为 `agent-duet@skills-dir`，无需安装。修改会在新会话中生效。此时不要再从市场安装同一个插件：已安装的插件会覆盖 skills-dir 中的同名插件，克隆会显示为“Not loaded”。
 
 ## 禁用或卸载
 
 ```bash
-claude plugin disable codex-duet@codex-duet
-claude plugin uninstall codex-duet@codex-duet
+claude plugin disable agent-duet@agent-duet
+claude plugin uninstall agent-duet@agent-duet
 ```
 
-`~/.claude/skills` 中的克隆也可以用相同方式禁用，名称改为 `codex-duet@skills-dir`；删除时直接移除文件夹即可。
+`~/.claude/skills` 中的克隆也可以用相同方式禁用，名称改为 `agent-duet@skills-dir`；删除时直接移除文件夹即可。
 
 ## 许可证
 

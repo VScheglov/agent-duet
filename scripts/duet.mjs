@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-// codex-duet runner. One invocation runs at most one Codex turn:
+// agent-duet runner. One invocation runs at most one Codex turn:
 // Codex reviews with the owner's own Codex setup, sandbox included unless --sandbox says
 // otherwise; Claude answers every issue; scripts/policy.mjs decides whether to go on.
-// All state lives in $CODEX_DUET_HOME/<session>/ (default ~/.local/state/codex-duet).
+// All state lives in $AGENT_DUET_HOME/<session>/ (default ~/.local/state/agent-duet).
 
 import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -12,6 +12,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { confirmVerification, unknownVerification, verificationClaims, verificationLines } from './verification.mjs';
 import { checkQuotes, quoteCheckLine, recitesQuote } from './quotes.mjs';
+import { duetEnv, stateRoot } from './config.mjs';
 import { AGY_BIN, AGY_READ_ONLY, AgyEvents, agyAnswer, agyArgs, agyConversation, agyDefaults, agyError, checkAgyChoice, fingerprint, observedAgyModel, readOnlyChanges } from './agy.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -20,17 +21,16 @@ const SCHEMA = path.join(ROOT, 'schemas', 'review.schema.json');
 const BUILD_SCHEMA = path.join(ROOT, 'schemas', 'build.schema.json');
 const AUDIT_SCHEMA = path.join(ROOT, 'schemas', 'audit.schema.json');
 const PROMPTS = path.join(ROOT, 'prompts');
-const HOME = process.env.CODEX_DUET_HOME
-  || path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'codex-duet');
-const CODEX_BIN = process.env.CODEX_DUET_CODEX_BIN || 'codex';
+let STATE_HOME; // resolved in main so migration errors use the runner's normal error reporting
+const CODEX_BIN = duetEnv('CODEX_BIN') || 'codex';
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 const CLAUDE_SESSION = process.env.CLAUDE_CODE_SESSION_ID || null; // set by Claude Code in every Bash call
 const MODEL_RE = /^[\w.:/-]+$/;
 const EFFORT_RE = /^[a-z]+$/;
-const POLICY = process.env.CODEX_DUET_POLICY || path.join(ROOT, 'scripts', 'policy.mjs');
+const POLICY = duetEnv('POLICY') || path.join(ROOT, 'scripts', 'policy.mjs');
 
 const EMBED_LIMIT = 150_000; // max chars of subject content or diff inlined into one prompt
-const KILL_GRACE_MS = Number(process.env.CODEX_DUET_KILL_GRACE_MS) || 5000; // SIGTERM → SIGKILL, exit → pipes closed
+const KILL_GRACE_MS = Number(duetEnv('KILL_GRACE_MS')) || 5000; // SIGTERM → SIGKILL, exit → pipes closed
 const TIER_POLL_MS = 3000; // a running turn's log is read for its service tier this often,
 const TIER_LOOKS = 20; // this many times at most, and once more when the turn is over
 const KINDS = ['plan', 'code', 'file', 'build', 'audit'];
@@ -55,7 +55,7 @@ function guardEngine(st, o) {
 
 const USAGE = `Usage: duet.mjs <command> [options]
 
-  start   --engine codex|agy (default: CODEX_DUET_ENGINE, else codex)
+  start   --engine codex|agy (default: AGENT_DUET_ENGINE, else codex)
           --kind plan|code|file [--subject <path>|-]... [--base <ref>] [--focus <text>]
           [--brief <file>|-]  owner's request, accepted amendments and claimed result
           [--max-rounds 10] [--model <name>] [--effort <level>] [--timeout-min 0]
@@ -333,7 +333,7 @@ function hasOwnerRequest(text) {
 const now = () => new Date().toISOString();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const readJSON = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
-const sessionDir = (id) => path.join(HOME, id);
+const sessionDir = (id) => path.join(STATE_HOME, id);
 const statePath = (id) => path.join(sessionDir(id), 'state.json');
 
 function writeJSON(file, value) {
@@ -356,8 +356,8 @@ function loadState(id) {
 }
 
 function allSessions() {
-  if (!fs.existsSync(HOME)) return [];
-  return fs.readdirSync(HOME)
+  if (!fs.existsSync(STATE_HOME)) return [];
+  return fs.readdirSync(STATE_HOME)
     .filter((d) => fs.existsSync(statePath(d)))
     .map((d) => {
       try {
@@ -370,13 +370,18 @@ function allSessions() {
     .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
 }
 
-const covers = (st, dir) => dir === st.cwd || dir.startsWith(st.cwd + path.sep);
+const covers = (st, dir) => {
+  // A migrated build retains its old absolute cwd, now reached through the compatibility link.
+  let root = st.cwd;
+  try { root = fs.realpathSync(root); } catch {}
+  return dir === root || dir.startsWith(root + path.sep);
+};
 
 function resolveSession(id) {
   if (id) return loadState(id);
   const here = fs.realpathSync(process.cwd());
   const st = allSessions().find((s) => covers(s, here));
-  if (!st) throw new UsageError('no codex-duet session for this directory; pass --session <id> (see: duet.mjs list --all)');
+  if (!st) throw new UsageError('no agent-duet session for this directory; pass --session <id> (see: duet.mjs list --all)');
   return st;
 }
 
@@ -408,13 +413,13 @@ function lockHolder(st) {
 // drops it when the process dies: a crashed run leaves no lock that anyone has to break.
 const O_EXLOCK = ['darwin', 'freebsd', 'openbsd', 'netbsd'].includes(process.platform) ? 0x20 : 0;
 
-// One codex-duet call per session at a time, held from loading the state to writing it back.
+// One agent-duet call per session at a time, held from loading the state to writing it back.
 // The file also carries the holder's pid, for `status` and the UI.
 function acquireLock(id) {
   const file = lockFile(id);
   const busy = () => {
     const pid = lockOwner(id);
-    return new UsageError(`session ${id} is busy: another codex-duet call is running${pid ? ` (pid ${pid})` : ''}; wait for it to finish`);
+    return new UsageError(`session ${id} is busy: another agent-duet call is running${pid ? ` (pid ${pid})` : ''}; wait for it to finish`);
   };
   if (O_EXLOCK) {
     let fd;
@@ -439,7 +444,7 @@ function acquireLock(id) {
     if (err.code !== 'EEXIST') throw err;
     const pid = lockOwner(id);
     if (pid && isAlive(pid)) throw busy();
-    throw new UsageError(`session ${id} has a stale lock${pid ? ` from pid ${pid}` : ''}: make sure no codex-duet call is running, then delete ${file}`);
+    throw new UsageError(`session ${id} has a stale lock${pid ? ` from pid ${pid}` : ''}: make sure no agent-duet call is running, then delete ${file}`);
   }
   return () => {
     if (lockOwner(id) === process.pid) fs.rmSync(file, { force: true });
@@ -452,10 +457,10 @@ function acquireLock(id) {
 // the owner's whole MCP set and spends the same quota. A turn holds a slot, a kernel lock on a slot file,
 // only while Codex works; the slot frees when the turn ends or its process dies. Waiting turns go in the
 // order they queued: each waits with a ticket named by its queue time and holding its pid.
-const MAX_PARALLEL = Math.max(1, Number(process.env.CODEX_DUET_MAX_PARALLEL) || 10);
-const QUEUE_POLL_MS = Number(process.env.CODEX_DUET_QUEUE_POLL_MS) || 3000;
-const slotDir = () => path.join(HOME, '.slots');
-const ticketDir = () => path.join(HOME, '.queue');
+const MAX_PARALLEL = Math.max(1, Number(duetEnv('MAX_PARALLEL')) || 10);
+const QUEUE_POLL_MS = Number(duetEnv('QUEUE_POLL_MS')) || 3000;
+const slotDir = () => path.join(STATE_HOME, '.slots');
+const ticketDir = () => path.join(STATE_HOME, '.queue');
 
 // Slot i, locked by this process; null while another process holds it. Returns the release.
 function trySlot(i) {
@@ -944,7 +949,7 @@ function runCodex(st, round, prompt, threadId, schema = SCHEMA) {
     };
     // No limit unless one was asked for (--timeout-min): a turn at high effort can run for hours, and a
     // background Bash call has its own ceiling anyway (2 hours, or BASH_MAX_TIMEOUT_MS).
-    result.timeoutMs = Number(process.env.CODEX_DUET_TIMEOUT_MS) || (st.codex.timeoutMin ?? 0) * 60_000;
+    result.timeoutMs = Number(duetEnv('TIMEOUT_MS')) || (st.codex.timeoutMin ?? 0) * 60_000;
     const timer = result.timeoutMs > 0 ? setTimeout(() => {
       result.timedOut = true;
       terminate();
@@ -1322,7 +1327,7 @@ async function decide(st, reply) {
 function turnProblem(res, round) {
   if (res.engine === 'agy') {
     const waiting = !res.beganWork ? ' agy waits for all of its MCP servers to connect before a turn (agy mcp list); check the network or VPN.' : '';
-    if (res.cancelled) return `cancelled: codex-duet received SIGINT or SIGTERM; retry continues the interrupted agy turn.${waiting}`;
+    if (res.cancelled) return `cancelled: agent-duet received SIGINT or SIGTERM; retry continues the interrupted agy turn.${waiting}`;
     if (res.timedOut) {
       const limit = res.timeoutMs >= 60_000 ? `${Math.round(res.timeoutMs / 60_000)} min` : `${res.timeoutMs} ms`;
       return `agy did not finish within ${limit}.${waiting}`;
@@ -1344,7 +1349,7 @@ function turnProblem(res, round) {
   }
   // Codex may exit 0 on SIGTERM; the cause must still read as a cancel, not as a missing reply.
   if (res.cancelled) {
-    return 'cancelled: codex-duet received SIGINT or SIGTERM (often the Bash tool\'s limit: run rounds in the background '
+    return 'cancelled: agent-duet received SIGINT or SIGTERM (often the Bash tool\'s limit: run rounds in the background '
       + 'with timeout 43200000, which BASH_MAX_TIMEOUT_MS in ~/.claude/settings.json must allow; retry continues the cut-off turn)';
   }
   if (res.timedOut) {
@@ -1505,7 +1510,7 @@ async function initBuildSubject(st, o, dir) {
   if (!hasOwnerRequest(spec)) throw new UsageError("add a non-empty `## Owner's request` section (ASCII apostrophe) to the specification, quoting the owner's own words");
   fs.writeFileSync(path.join(dir, 'spec.md'), spec);
   st.brief = path.join(dir, 'spec.md');
-  const branch = checkToken(o.branch, 'branch', /^[\w./-]+$/) ?? `codex-duet/${st.id}`;
+  const branch = checkToken(o.branch, 'branch', /^[\w./-]+$/) ?? `agent-duet/${st.id}`;
   const worktree = path.join(dir, 'worktree');
   const added = git(['worktree', 'add', '-q', '-b', branch, worktree, base.stdout.trim()], { cwd: repo, allowFail: true });
   if (added.status !== 0) throw new UsageError(`cannot create the worktree: ${(added.stderr || '').trim()}`);
@@ -1652,7 +1657,7 @@ function renderBuildSummary(st, approvalCheck = null) {
   const last = st.rounds.at(-1);
   const { worktree, branch, base } = st.subject;
   const L = [
-    `## codex-duet ${st.id} · build · round ${st.round}/${st.maxRounds} (${duration(last.startedAt, last.finishedAt)})`,
+    `## agent-duet ${st.id} · build · round ${st.round}/${st.maxRounds} (${duration(last.startedAt, last.finishedAt)})`,
     `Worktree: ${worktree} (branch ${branch})`,
     modelLine(st),
     ...engineWarnings(st),
@@ -1832,8 +1837,8 @@ function specTitle(st) {
   return `${(space > SUBJECT_MAX / 2 ? head.slice(0, space) : head).trimEnd()}…`;
 }
 
-// The runner's commit names itself once: a title that starts with codex-duet already does.
-const commitSubject = (title) => (/^codex-duet\b/i.test(title) ? title : `codex-duet: ${title}`);
+// Keep Conventional Commits intact and avoid repeating the plugin's own name.
+const commitSubject = (title) => (/^(?:(?:feat|fix|docs|refactor|perf|test|build|ci|chore|style|revert)(?:\([^()\r\n]+\))?!?:|agent-duet\b)/i.test(title) ? title : `agent-duet: ${title}`);
 
 function postApprovalRound(st, tree, cause) {
   const approval = st.approval;
@@ -1917,7 +1922,7 @@ async function cmdFinish(o) {
     saveState(st);
     fs.writeFileSync(path.join(sessionDir(st.id), 'report.md'), renderReport(st));
     console.log([
-      `codex-duet ${st.id}: ${branch} is at ${head.slice(0, 10)}; the worktree is removed.`,
+      `agent-duet ${st.id}: ${branch} is at ${head.slice(0, 10)}; the worktree is removed.`,
       ...approvalReportLines(st),
       `Look:  git -C "${repo}" log --stat ${base.slice(0, 10)}..${branch}`,
       `Merge: git -C "${repo}" merge ${branch}`,
@@ -1938,7 +1943,7 @@ async function cmdDiscard(o) {
     removeWorktree(st, { deleteBranch: true });
     st.phase = 'discarded';
     saveState(st);
-    console.log(`codex-duet ${st.id}: the worktree is removed and ${st.subject.branch} is deleted.`);
+    console.log(`agent-duet ${st.id}: the worktree is removed and ${st.subject.branch} is deleted.`);
   } finally {
     release();
   }
@@ -2068,7 +2073,7 @@ function renderAuditSummary(st) {
   const last = st.rounds.at(-1);
   const findings = st.findings ?? [];
   return [
-    `## codex-duet ${st.id} · audit (${duration(last.startedAt, last.finishedAt)})`,
+    `## agent-duet ${st.id} · audit (${duration(last.startedAt, last.finishedAt)})`,
     `Task: ${st.subject.title} (${st.subject.task})`,
     `Directory: ${st.cwd}`,
     modelLine(st),
@@ -2087,7 +2092,7 @@ function renderAuditReport(st) {
   const last = st.rounds.at(-1);
   const findings = st.findings ?? [];
   const L = [
-    `# codex-duet audit — ${st.subject.title}`,
+    `# agent-duet audit — ${st.subject.title}`,
     '',
     `- Session: ${st.id}`,
     `- Directory: ${st.cwd}`,
@@ -2184,7 +2189,7 @@ function renderSummary(st) {
   const parked = parkedIssues(st);
   const closedNow = Object.values(st.issues).filter((i) => i.closedRound === st.round).sort(byPriority);
   const L = [
-    `## codex-duet ${st.id} · ${st.kind} · round ${st.round}/${st.maxRounds} (${duration(last.startedAt, last.finishedAt)})`,
+    `## agent-duet ${st.id} · ${st.kind} · round ${st.round}/${st.maxRounds} (${duration(last.startedAt, last.finishedAt)})`,
     `Subject: ${subjectLine(st)}`,
     modelLine(st),
     ...engineWarnings(st),
@@ -2246,7 +2251,7 @@ function renderReport(st) {
   const all = Object.values(st.issues).sort(byPriority);
   const cell = (s) => String(s).replace(/\|/g, '\\|').replace(/\n/g, ' ');
   const L = [
-    `# codex-duet report — ${st.id}`,
+    `# agent-duet report — ${st.id}`,
     '',
     `- Kind: ${st.kind}`,
     `- Subject: ${subjectLine(st)}`,
@@ -2373,7 +2378,7 @@ function initCodeSubject(st, o) {
 }
 
 async function cmdStart(o) {
-  const engine = checkEngine(o.engine ?? process.env.CODEX_DUET_ENGINE ?? 'codex');
+  const engine = checkEngine(o.engine ?? duetEnv('ENGINE') ?? 'codex');
   if (!KINDS.includes(o.kind)) throw new UsageError(`--kind must be one of: ${KINDS.join(', ')}`);
   let brief = null;
   if (o.brief != null) {
@@ -2395,11 +2400,11 @@ async function cmdStart(o) {
   if (o.kind === 'audit' && o.sandbox && o.sandbox !== 'read-only') {
     throw new UsageError(`an audit runs read-only: ${engine === 'agy' ? 'agy is told not to write and checked afterwards' : 'Codex examines and reports, it changes nothing'} (leave --sandbox out)`);
   }
-  const sandbox = o.kind === 'audit' ? 'read-only' : checkSandbox(o.sandbox ?? process.env.CODEX_DUET_SANDBOX ?? 'inherit');
+  const sandbox = o.kind === 'audit' ? 'read-only' : checkSandbox(o.sandbox ?? duetEnv('SANDBOX') ?? 'inherit');
   // Every option is checked before the session's directory exists: a refusal leaves nothing behind.
   const maxRounds = o.kind === 'audit' ? 1 : o['max-rounds'] ? toInt(o['max-rounds'], 'max-rounds') : 10;
-  const timeoutMin = toCount(o['timeout-min'] ?? process.env.CODEX_DUET_TIMEOUT_MIN ?? 0, 'timeout-min');
-  const choice = codexChoice(o, { model: process.env.CODEX_DUET_MODEL, effort: process.env.CODEX_DUET_EFFORT }, engine);
+  const timeoutMin = toCount(o['timeout-min'] ?? duetEnv('TIMEOUT_MIN') ?? 0, 'timeout-min');
+  const choice = codexChoice(o, { model: duetEnv('MODEL'), effort: duetEnv('EFFORT') }, engine);
   const ts = now().replace(/\D/g, '').slice(0, 14);
   const id = `${ts.slice(0, 8)}-${ts.slice(8)}-${crypto.randomBytes(2).toString('hex')}`;
   const dir = sessionDir(id);
@@ -2514,8 +2519,8 @@ function cmdStatus(o) {
       ? `is waiting for a free ${engineName(st)} slot since ${st.pending.queuedAt} (at most ${MAX_PARALLEL} turns run at once)`
       : `is running since ${st.pending.startedAt}`;
     console.log(busy
-      ? `codex-duet ${st.id}: round ${st.pending.round} ${waiting} (pid ${busy})`
-      : `codex-duet ${st.id}: round ${st.pending.round} did not complete${st.pending.error ? `: ${st.pending.error}` : ''}. Run: node "${SELF}" retry --session ${st.id}`);
+      ? `agent-duet ${st.id}: round ${st.pending.round} ${waiting} (pid ${busy})`
+      : `agent-duet ${st.id}: round ${st.pending.round} did not complete${st.pending.error ? `: ${st.pending.error}` : ''}. Run: node "${SELF}" retry --session ${st.id}`);
     if (!st.rounds.length && engineOf(st) === 'agy') console.log([modelLine(st), ...engineWarnings(st)].join('\n'));
   }
   if (st.rounds.length) {
@@ -2552,7 +2557,7 @@ function cmdVerify(o) {
 function cmdReport(o) {
   const st = resolveSession(o.session);
   if (engineOf(st) === 'agy' && st.kind === 'audit' && !st.audit) {
-    const report = [`# codex-duet audit — ${st.subject.title}`, `Engine: agy`, `Phase: ${st.phase}`, st.pending?.error ?? '', ...engineWarnings(st)].join('\n');
+    const report = [`# agent-duet audit — ${st.subject.title}`, `Engine: agy`, `Phase: ${st.phase}`, st.pending?.error ?? '', ...engineWarnings(st)].join('\n');
     fs.writeFileSync(path.join(sessionDir(st.id), 'report.md'), `${report}\n`);
     console.log(report);
     return;
@@ -2588,6 +2593,7 @@ const COMMANDS = {
 };
 
 async function main() {
+  STATE_HOME = stateRoot();
   const { cmd, o } = parseArgs(process.argv.slice(2));
   const command = COMMANDS[cmd];
   if (!command) throw cliError(`unknown command: ${cmd}`);
@@ -2595,7 +2601,7 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(`codex-duet: ${err.message}`);
+  console.error(`agent-duet: ${err.message}`);
   if (err.showUsage) console.error(`\n${USAGE}`);
   process.exit(err instanceof UsageError ? 2 : 1);
 });

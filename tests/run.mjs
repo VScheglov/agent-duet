@@ -10,28 +10,29 @@ import { confirmVerification } from '../scripts/verification.mjs';
 import { checkQuotes } from '../scripts/quotes.mjs';
 import { matchingTests, normalizationTests } from './verification.mjs';
 import { agyTests } from './agy.mjs';
+import { compatibilityTests } from './compatibility.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DUET = path.join(HERE, '..', 'scripts', 'duet.mjs');
-const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'codex-duet-test-')));
+const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'agent-duet-test-')));
 const repo = path.join(tmp, 'repo');
 const home = path.join(tmp, 'state');
 const scriptFile = path.join(tmp, 'codex-script.json');
 const fakeState = path.join(tmp, 'codex-calls.json');
 
 const baseEnv = {
-  ...process.env,
-  CODEX_DUET_ENGINE: 'codex',
-  CODEX_DUET_HOME: home,
-  CODEX_DUET_CODEX_BIN: path.join(HERE, 'fake-codex.mjs'),
-  CODEX_DUET_POLICY: path.join(HERE, 'fixture-policy.mjs'),
+  ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(?:AGENT|CODEX)_DUET_/.test(key))),
+  AGENT_DUET_ENGINE: 'codex',
+  AGENT_DUET_HOME: home,
+  AGENT_DUET_CODEX_BIN: path.join(HERE, 'fake-codex.mjs'),
+  AGENT_DUET_POLICY: path.join(HERE, 'fixture-policy.mjs'),
   FAKE_CODEX_SCRIPT: scriptFile,
   FAKE_CODEX_STATE: fakeState,
   // No model catalog unless a test brings one, and none of the owner's own defaults.
   CODEX_HOME: path.join(tmp, 'no-codex-home'),
-  CODEX_DUET_MODEL: '',
-  CODEX_DUET_EFFORT: '',
-  CODEX_DUET_TIMEOUT_MIN: '',
+  AGENT_DUET_MODEL: '',
+  AGENT_DUET_EFFORT: '',
+  AGENT_DUET_TIMEOUT_MIN: '',
   CLAUDE_CODE_SESSION_ID: '', // as from a plain shell, unless a test names a Claude session
 };
 
@@ -56,7 +57,7 @@ const lockHolderPid = (id) => {
   const file = path.join(home, id, 'lock');
   return fs.existsSync(file) ? fs.readFileSync(file, 'utf8').trim() : '';
 };
-const sessionId = (out) => /codex-duet (\d{8}-\d{6}-[0-9a-f]{4})/.exec(out)?.[1];
+const sessionId = (out) => /agent-duet (\d{8}-\d{6}-[0-9a-f]{4})/.exec(out)?.[1];
 const responses = (changes, list) => JSON.stringify({ changes, responses: list });
 
 function isAlive(pid) {
@@ -108,6 +109,7 @@ async function test(name, fn) {
   console.log(`ok - ${name}`);
 }
 
+await compatibilityTests(test, tmp);
 await matchingTests(test, tmp);
 await normalizationTests(test, tmp);
 
@@ -327,7 +329,7 @@ await test('a throwing policy escalates instead of crashing', () => {
   scriptCodex([turn('revise', [issue('C1', 'open')])]);
   fs.writeFileSync(path.join(tmp, 'q.sql'), 'select 1;\n');
   const r = duet(['start', '--kind', 'file', '--subject', 'q.sql'], {
-    cwd: tmp, env: { CODEX_DUET_POLICY: path.join(HERE, 'throwing-policy.mjs') },
+    cwd: tmp, env: { AGENT_DUET_POLICY: path.join(HERE, 'throwing-policy.mjs') },
   });
   assert.equal(r.code, 0, r.err);
   assert.match(r.out, /Decision: ESCALATE — policy error: boom/);
@@ -391,7 +393,7 @@ await test('C2: a timeout takes down the whole tree, a SIGTERM-proof descendant 
   fs.writeFileSync(path.join(tmp, 'hang.md'), 'x\n');
   const began = Date.now();
   const r = duet(['start', '--kind', 'file', '--subject', 'hang.md'], {
-    cwd: tmp, env: { CODEX_DUET_TIMEOUT_MS: '300', CODEX_DUET_KILL_GRACE_MS: '300' },
+    cwd: tmp, env: { AGENT_DUET_TIMEOUT_MS: '300', AGENT_DUET_KILL_GRACE_MS: '300' },
   });
   assert.equal(r.code, 1);
   assert.match(r.err, /did not finish within 300 ms/);
@@ -403,7 +405,7 @@ await test('C2: a descendant holding stdout after Codex exits does not hang the 
   scriptCodex([{ ...turn('approve', []), descendant: 'stdout' }]);
   fs.writeFileSync(path.join(tmp, 'linger.md'), 'x\n');
   const began = Date.now();
-  const r = duet(['start', '--kind', 'file', '--subject', 'linger.md'], { cwd: tmp, env: { CODEX_DUET_KILL_GRACE_MS: '300' } });
+  const r = duet(['start', '--kind', 'file', '--subject', 'linger.md'], { cwd: tmp, env: { AGENT_DUET_KILL_GRACE_MS: '300' } });
   assert.equal(r.code, 0, r.err);
   assert.ok(Date.now() - began < 5000, `took ${Date.now() - began} ms`);
   for (const pid of descendants()) await waitFor(() => !isAlive(pid), 2000);
@@ -413,7 +415,7 @@ await test('C2: a descendant holding no pipe is killed before the runner exits a
   scriptCodex([{ hang: true, descendant: 'quiet' }]); // codex itself dies on SIGTERM, its child does not
   fs.writeFileSync(path.join(tmp, 'quiet.md'), 'x\n');
   const r = duet(['start', '--kind', 'file', '--subject', 'quiet.md'], {
-    cwd: tmp, env: { CODEX_DUET_TIMEOUT_MS: '300', CODEX_DUET_KILL_GRACE_MS: '300' },
+    cwd: tmp, env: { AGENT_DUET_TIMEOUT_MS: '300', AGENT_DUET_KILL_GRACE_MS: '300' },
   });
   assert.equal(r.code, 1);
   assert.match(r.err, /did not finish within 300 ms/);
@@ -425,7 +427,7 @@ await test('C2: a descendant holding no pipe is killed before the runner exits a
 await test('C2: leftovers of a successful round are cleared out too', async () => {
   scriptCodex([{ ...turn('approve', []), descendant: 'quiet' }]);
   fs.writeFileSync(path.join(tmp, 'leftover.md'), 'x\n');
-  const r = duet(['start', '--kind', 'file', '--subject', 'leftover.md'], { cwd: tmp, env: { CODEX_DUET_KILL_GRACE_MS: '300' } });
+  const r = duet(['start', '--kind', 'file', '--subject', 'leftover.md'], { cwd: tmp, env: { AGENT_DUET_KILL_GRACE_MS: '300' } });
   assert.equal(r.code, 0, r.err);
   const [pid] = descendants();
   await waitFor(() => !isAlive(pid), 500);
@@ -459,7 +461,7 @@ await test('a cancelled round says so and can be retried', async () => {
   fs.writeFileSync(path.join(tmp, 'cancel.md'), 'x\n');
   // the timeout only matters if this test dies before its SIGTERM: the runner then cleans up by itself
   const run = duetAsync(['start', '--kind', 'file', '--subject', 'cancel.md'], {
-    cwd: tmp, env: { CODEX_DUET_KILL_GRACE_MS: '300', CODEX_DUET_TIMEOUT_MS: '20000' },
+    cwd: tmp, env: { AGENT_DUET_KILL_GRACE_MS: '300', AGENT_DUET_TIMEOUT_MS: '20000' },
   });
   let lock = null;
   let holder = 0;
@@ -475,7 +477,7 @@ await test('a cancelled round says so and can be retried', async () => {
   process.kill(holder, 'SIGTERM');
   const r = await run;
   assert.equal(r.code, 1);
-  assert.match(r.err, /cancelled: codex-duet received SIGINT or SIGTERM \(often the Bash tool's limit/);
+  assert.match(r.err, /cancelled: agent-duet received SIGINT or SIGTERM \(often the Bash tool's limit/);
   for (const pid of descendants()) await waitFor(() => !isAlive(pid), 2000);
   const retried = duet(['retry', '--session', path.basename(path.dirname(lock))], { cwd: tmp });
   assert.equal(retried.code, 0, retried.err);
@@ -551,7 +553,7 @@ await test('C6: owner decisions at the limit end the review even when the histor
   const keepOpen = turn('revise', [issue('C1', 'open', 'high', { reply: 'still wrong' })]);
   scriptCodex([turn('revise', [issue('C1', 'open')]), keepOpen, keepOpen]);
   fs.writeFileSync(path.join(tmp, 'stalled.md'), 'x\n');
-  const env = { CODEX_DUET_POLICY: path.join(HERE, '..', 'scripts', 'policy.mjs') }; // the real policy
+  const env = { AGENT_DUET_POLICY: path.join(HERE, '..', 'scripts', 'policy.mjs') }; // the real policy
   const start = duet(['start', '--kind', 'file', '--subject', 'stalled.md', '--max-rounds', '3'], { cwd: tmp, env });
   const sid = sessionId(start.out);
   for (const n of [1, 2]) {
@@ -587,7 +589,7 @@ await test('build: Codex implements the spec in a worktree on its own branch', (
   buildId = sessionId(r.out);
   const s = state(buildId);
   assert.equal(s.phase, 'awaiting-review');
-  assert.equal(s.subject.branch, `codex-duet/${buildId}`);
+  assert.equal(s.subject.branch, `agent-duet/${buildId}`);
   assert.ok(fs.existsSync(path.join(s.subject.worktree, 'greet.js')));
   assert.ok(!fs.existsSync(path.join(repo, 'greet.js')), 'the main checkout is untouched');
   const [call] = calls();
@@ -636,10 +638,11 @@ await test('build: approval ends the loop; finish commits on the branch and remo
   assert.ok(report.includes(`Approved tree: ${approval.tree}`), report);
   assert.ok(report.includes(`Committed tree: ${approval.tree}`), report);
   assert.match(spawnSync('git', ['show', `${subject.branch}:greet.js`], { cwd: repo, encoding: 'utf8' }).stdout, /"there"/);
-  assert.equal(spawnSync('git', ['log', '-1', '--format=%s', subject.branch], { cwd: repo, encoding: 'utf8' }).stdout.trim(), 'codex-duet: Greeting');
+  assert.equal(spawnSync('git', ['log', '-1', '--format=%s', subject.branch], { cwd: repo, encoding: 'utf8' }).stdout.trim(), 'agent-duet: Greeting');
+  assert.match(git(['log', '-1', '--format=%b', subject.branch]), /Implemented by Codex, reviewed by Claude in 2 round\(s\)/);
 });
 
-await test('build: finish keeps the spec title whole and names codex-duet once; only a paragraph without a heading is cut', () => {
+await test('build: finish keeps the spec title whole and names agent-duet once; only a paragraph without a heading is cut', () => {
   const subjectOf = (spec) => {
     scriptCodex([{ ...author('done'), write: { 'note.txt': `${spec.length}\n` } }]);
     const r = duet(['start', '--kind', 'build', '--subject', '-'], { input: `${spec}\n\n## Owner's request\n> Implement the change described above.\n` });
@@ -652,14 +655,22 @@ await test('build: finish keeps the spec title whole and names codex-duet once; 
     assert.equal(f.code, 0, f.err);
     return spawnSync('git', ['log', '-1', '--format=%s', state(id).subject.branch], { cwd: repo, encoding: 'utf8' }).stdout.trim();
   };
-  // the title that came out as "codex-duet: codex-duet 0.10.0: … Simplified Chinese by"
-  const named = 'codex-duet 0.10.0: English by default, Russian and Simplified Chinese by setting';
+  // the title that came out as "agent-duet: agent-duet 0.10.0: … Simplified Chinese by"
+  const named = 'agent-duet 0.10.0: English by default, Russian and Simplified Chinese by setting';
   assert.equal(subjectOf(`# ${named}\n\nBody.\n`), named);
+  for (const title of [
+    'feat: add greeting', 'fix(core): handle empty input', 'docs!: rewrite guide', 'refactor(core)!: rename plugin',
+    'perf: speed up reads', 'test: cover migration', 'build: bump version', 'ci: run tests', 'chore: rename',
+    'style: tidy text', 'revert: restore behavior',
+  ]) assert.equal(subjectOf(`# ${title}\n`), title);
+  for (const title of ['feature: add greeting', 'fix(core) handle input', 'Plan the change']) {
+    assert.equal(subjectOf(`# ${title}\n`), `agent-duet: ${title}`);
+  }
   const long = 'Add a greeting helper that also trims names, folds their case and handles empty input';
-  assert.equal(subjectOf(`# ${long}\n`), `codex-duet: ${long}`);
+  assert.equal(subjectOf(`# ${long}\n`), `agent-duet: ${long}`);
   const cut = subjectOf(`${'word '.repeat(40)}end\n`);
-  assert.match(cut, /^codex-duet: (word )+word…$/);
-  assert.ok(cut.length <= 'codex-duet: '.length + 120, cut);
+  assert.match(cut, /^agent-duet: (word )+word…$/);
+  assert.ok(cut.length <= 'agent-duet: '.length + 120, cut);
 });
 
 await test('build: discard removes the worktree and deletes the branch', () => {
@@ -676,7 +687,7 @@ await test('build: discard removes the worktree and deletes the branch', () => {
 });
 
 await test('build: an owner ruling ends a deadlock and reaches Codex as final', () => {
-  const env = { CODEX_DUET_POLICY: path.join(HERE, '..', 'scripts', 'policy.mjs') };
+  const env = { AGENT_DUET_POLICY: path.join(HERE, '..', 'scripts', 'policy.mjs') };
   const dispute = author('kept as is', [{ id: 'C1', action: 'disputed', note: 'the spec allows it' }]);
   scriptCodex([author('done'), dispute, dispute, author('fixed per owner', [{ id: 'C1', action: 'fixed', note: 'x.js:1' }])]);
   const start = duet(['start', '--kind', 'build', '--subject', '-'], { input: "Owner ruling test\n\n## Owner's request\n> Follow the owner's ruling.\n", env });
@@ -708,7 +719,7 @@ await test('build: reply and review keep to their own kind of session', () => {
 // ---- owner brief: preserve the owner's words and enforce the independent checks
 const ownerBrief = "## Owner's request\n> Keep both CSV and JSON exports.\n\n## Accepted amendments\n- none\n\n## Claimed result\nBoth exports work.\n";
 const requestSpec = "# Exports\n\n## Owner's request\n> Keep both CSV and JSON exports.\n\n## Accepted amendments\n- none\n\n## Goal\nImplement both exports.\n";
-const realPolicy = { CODEX_DUET_POLICY: path.join(HERE, '..', 'scripts', 'policy.mjs') };
+const realPolicy = { AGENT_DUET_POLICY: path.join(HERE, '..', 'scripts', 'policy.mjs') };
 
 // Approval checks use real trees, indexes, commits and hooks in separate repositories.
 let approvalRepos = 0;
@@ -1641,7 +1652,7 @@ await test("events: every line of Codex's stream is kept as it came, stamped wit
 
 // ---- a turn cut off after Codex began it (the Bash ceiling, a stop) goes on in its own thread on retry
 const cutHome = path.join(tmp, 'codex-home-cut'); // where the fake leaves its logs of threads
-const cutOff = { CODEX_HOME: cutHome, CODEX_DUET_TIMEOUT_MS: '500', CODEX_DUET_KILL_GRACE_MS: '300' };
+const cutOff = { CODEX_HOME: cutHome, AGENT_DUET_TIMEOUT_MS: '500', AGENT_DUET_KILL_GRACE_MS: '300' };
 const retrySid = (err) => /retry --session (\S+)/.exec(err)?.[1];
 
 await test('retry: a first turn cut off after Codex began it goes on in its own thread, with a short carry-on prompt', () => {
@@ -1703,7 +1714,7 @@ await test('audit: one read-only turn in the current directory, a summary and a 
   const r = duet(['start', '--kind', 'audit', '--subject', '-'], { input: '# Audit the ledger\nFind stale outcomes.\n' });
   assert.equal(r.code, 0, r.err);
   const sid = sessionId(r.out);
-  assert.match(r.out, /^## codex-duet \S+ · audit \(/m);
+  assert.match(r.out, /^## agent-duet \S+ · audit \(/m);
   assert.match(r.out, /^Task: Audit the ledger \(/m);
   assert.match(r.out, /^Findings: 2 \(high 1 · low 1\)$/m);
   assert.match(r.out, /^- A1 \[high\] Stale outcome — ledger\.py:40$/m);
@@ -1749,7 +1760,7 @@ await test('audit: a cut-off audit goes on in its own thread on retry', () => {
   assert.equal(state(sid).phase, 'done');
 });
 
-// ---- the queue: at most CODEX_DUET_MAX_PARALLEL Codex turns at once
+// ---- the queue: at most AGENT_DUET_MAX_PARALLEL Codex turns at once
 const callCount = () => {
   try {
     return calls().length;
@@ -1764,7 +1775,7 @@ const idsIn = (phase) => fs.readdirSync(home).filter((d) => {
     return false;
   }
 });
-const oneSlot = { CODEX_DUET_MAX_PARALLEL: '1', CODEX_DUET_QUEUE_POLL_MS: '50' };
+const oneSlot = { AGENT_DUET_MAX_PARALLEL: '1', AGENT_DUET_QUEUE_POLL_MS: '50' };
 
 await test('queue: with one slot the next turns wait as queued, then run in the order they queued', async () => {
   scriptCodex([{ delayMs: 1500, ...turn('approve', []) }, { delayMs: 300, ...turn('approve', []) }, turn('approve', [])]);

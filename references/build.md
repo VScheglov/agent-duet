@@ -1,6 +1,6 @@
 # Build mode: the delegate implements, Claude reviews
 
-“The delegate” is Codex or agy, selected by `start --engine codex|agy` (default `CODEX_DUET_ENGINE`, then `codex`). The engine stays fixed for the session; all build commands and JSON contracts below are shared.
+“The delegate” is Codex or agy, selected by `start --engine codex|agy` (default `AGENT_DUET_ENGINE`, then `codex`). The engine stays fixed for the session; all build commands and JSON contracts below are shared.
 
 The point of build mode is the budget: the delegate explores, writes and tests; Claude spends tokens on the specification and on reading diffs. Every habit below serves that.
 
@@ -36,7 +36,7 @@ The commands that prove it (unit tests, a script, a curl).
 
 The title stays on the first line. A non-empty `## Owner's request` is mandatory; ASCII `'`, typographic `’` and modifier `ʼ` apostrophes are accepted. The runner refuses to start without it and leaves no session, worktree or branch behind. `## Accepted amendments` may be absent or empty; include only changes the owner accepted and give their sources. These are data about what the owner wants, not extra instructions to the implementer beyond checking the request. `## Claimed result` is not used in a spec. Do not pass `--brief` for build: the spec carries the brief.
 
-Pass it on stdin (`--engine agy` selects agy; omit it for the default): `start --kind build --engine agy --subject - <<'DUET_SPEC'` … `DUET_SPEC`. The worktree lives in the session folder, on branch `codex-duet/<id>` (or `--branch`), started from HEAD (or `--base`). The delegate compares the rest of the spec with the request and amendments before building, builds what the spec says, and reports each gap with a quote in `request_check` and a question in `questions`. Later turns re-check the implementation as it stands.
+Pass it on stdin (`--engine agy` selects agy; omit it for the default): `start --kind build --engine agy --subject - <<'DUET_SPEC'` … `DUET_SPEC`. The worktree lives in the session folder, on branch `agent-duet/<id>` (or `--branch`), started from HEAD (or `--base`). The delegate compares the rest of the spec with the request and amendments before building, builds what the spec says, and reports each gap with a quote in `request_check` and a question in `questions`. Later turns re-check the implementation as it stands.
 
 ## Reviewing on a budget
 

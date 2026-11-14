@@ -1,4 +1,4 @@
-// The stopping policy for codex-duet negotiations.
+// The stopping policy for agent-duet negotiations.
 //
 // duet.mjs calls decideNextStep() after each Codex reply and follows its decision:
 //   continue — Claude responds to open issues, followed by another round;

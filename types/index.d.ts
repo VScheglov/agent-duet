@@ -55,7 +55,7 @@ export type DuetView = {
   engine: DuetEngine // states from before engine selection use codex
   kind: string
   label: string // a short name for lists and toasts: a build's branch, a review's repository or files
-  isQueued: boolean // the turn waits for a free Codex slot (at most CODEX_DUET_MAX_PARALLEL run at once)
+  isQueued: boolean // the turn waits for a free Codex slot (at most AGENT_DUET_MAX_PARALLEL run at once)
   queuedAhead: number | null // turns queued before this one, across every owner
   cwd: string // where Codex works: the session's folder, or a build's worktree
   project: string // the folder the session belongs to: a build's repository, else cwd
@@ -94,7 +94,14 @@ export type DuetView = {
 
 declare module 'claude-code' {
   interface PluginState {
+    // Compatibility reads only: carry live UI choices from pre-0.13.0 hot reloads.
     'codex-duet': {
+      prefs: DuetPrefs
+      focus: string
+      choices: Record<string, DuetChoice>
+      expanded: Record<string, boolean>
+    }
+    'agent-duet': {
       view: DuetView | null
       list: DuetView[] // this Claude session's tasks in play, newest change first
       focus: string // the task picked in the pane's list
