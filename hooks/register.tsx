@@ -5,7 +5,7 @@ import { en } from './locales/en.ts'
 import type { Locale } from './locales/en.ts'
 import { ru } from './locales/ru.ts'
 import { zh } from './locales/zh.ts'
-import { gitWrites } from './shell.ts'
+import { gitWrites, lexicalPath } from './shell.ts'
 
 import type { DuetChoice, DuetDiag, DuetIssue, DuetModel, DuetPlanStep, DuetPrefs, DuetRound, DuetVerification, DuetView } from '../types'
 
@@ -82,11 +82,11 @@ const checkCommand = (command: string) =>
 // review ended well all the same. A failure the same command's later run put right is history, not a problem.
 function verificationDetails(view: DuetView) {
   const receipt = view.verification
-  if (!receipt || !['partial', 'static-analysis-only'].includes(receipt.label)) return []
+  if (!receipt) return []
   const checks = receipt.checks.filter((check, n) => !(check.outcome === 'failed' && check.confirmation === 'confirmed'
     && receipt.checks.slice(n + 1).some((later) => later.command === check.command && later.outcome === 'passed' && later.confirmation === 'confirmed')))
   const describe = (check: DuetVerification['checks'][number], status: keyof typeof locale.verificationChecks) => {
-    const exit = check.event?.exit_code
+    const exit = check.event?.exit_code ?? check.events?.find((e) => e.exit_code != null && e.exit_code !== 0)?.exit_code
     return `${locale.verificationChecks[status]}: ${checkCommand(check.command)}${exit != null ? ` (exit ${exit})` : ''}${check.note ? ` — ${oneLine(check.note)}` : ''}`
   }
   const problems = checks.flatMap((check) => {
@@ -94,6 +94,9 @@ function verificationDetails(view: DuetView) {
     if (check.confirmation === 'contradicted' || check.confirmation === 'unconfirmed') return [describe(check, check.confirmation)]
     return check.outcome === 'failed' ? [describe(check, 'failed')] : []
   })
+  if (receipt.label === 'executed' || receipt.label === 'unknown') {
+    return problems.length ? [{ text: problems.join('; '), isProblem: true }] : []
+  }
   const note = [
     checks.length ? locale.verificationConfirmed(checks.filter((c) => c.outcome === 'passed' && c.confirmation === 'confirmed').length, checks.length) : '',
     ...checks.filter((c) => c.outcome === 'skipped').map((c) => describe(c, 'skipped')),
@@ -286,10 +289,9 @@ const FRESH_MS = 15_000
 
 // This Claude session's id, the same one the runner records as a review's owner from CLAUDE_CODE_SESSION_ID.
 let mySessionId = ''
-// The newest sessions' states, re-read only when state.json changes; and the code reviews and builds that
-// run anywhere, which the commit guard protects whichever Claude session drives them.
-const states = new Map<string, { mtimeMs: number; st: any }>()
-let guarded: { id: string; cwd: string; phase: string; engine?: string }[] = []
+type SessionFile = { id: string; mtimeMs: number; size: number; st: any }
+const states = new Map<string, SessionFile>()
+let guarded: { id: string; cwd: string; root: string; phase: string; engine?: string }[] = []
 
 // What the Stop hold knows about this Claude session: whether it drives a duet at all, whether the
 // person spoke last in the current turn, and whether Claude ran the runner since. A reload starts it over.
@@ -332,7 +334,8 @@ async function aliveOf($: EngineInterface, root: string, s: { id: string; mtimeM
   if (s.st.phase !== 'awaiting-codex' && s.st.phase !== 'queued') return null
   const known = liveness.get(s.id)
   if (known && known.mtimeMs === s.mtimeMs && now - known.checkedAt <= 5000) return known
-  const pid = Number(await $.fs.read(`${root}/${s.id}/lock`).catch(() => '')) || 0
+  const raw = Number(await $.fs.read(`${root}/${s.id}/lock`).catch(() => ''))
+  const pid = Number.isSafeInteger(raw) && raw > 1 ? raw : 0
   const gone = !pid || (await $.process.run(['kill', '-0', String(pid)])).exitCode !== 0
   const next = { pid, gone, checkedAt: now, mtimeMs: s.mtimeMs }
   liveness.set(s.id, next)
@@ -453,6 +456,10 @@ function buildView(st: any, now: number, live: Liveness | null, digest: Digest |
   const authorKey = st.kind === 'build' ? 'codex' : 'claude'
   const answers = raw.flatMap((i) => (i.history ?? []).filter((h: any) => h.by === authorKey))
   const count = (action: string) => answers.filter((h: any) => h.action === action).length
+  const lastTurn = (st.rounds ?? []).findLast((r: any) => r.kind !== 'post-approval')
+  const checks = st.kind === 'build'
+    ? [[name, lastTurn?.author?.request_check], ['Claude', st.rounds?.findLast((r: any) => r.verdict)?.request_check]]
+    : [[name, lastTurn?.request_check]]
   return {
     id: st.id,
     engine: st.engine === 'agy' ? 'agy' : 'codex',
@@ -480,8 +487,9 @@ function buildView(st: any, now: number, live: Liveness | null, digest: Digest |
     round: st.round ?? 0,
     maxRounds: st.maxRounds ?? 10,
     phase: st.phase,
-    isActive: ACTIVE_PHASES.includes(st.phase) && now - Date.parse(st.updatedAt) < ACTIVE_MS,
+    isActive: isRunning(st, now),
     runningRound,
+    attemptAt: since ?? null,
     isQueued,
     queuedAhead: isQueued ? queuedAhead : null,
     elapsedMs: since ? now - Date.parse(since) : 0, // Codex's time on the turn, or the wait in the queue
@@ -491,8 +499,9 @@ function buildView(st: any, now: number, live: Liveness | null, digest: Digest |
     decision: st.decision
       ? { action: st.decision.action, reason: oneLine(st.decision.reason), issues: st.decision.issues ?? [] }
       : null,
+    requestChecks: checks.filter(([, check]) => check?.status).map(([who, check]) => ({ who, status: check.status, notes: oneLine(check.notes) })),
     verification: st.kind === 'audit' ? null
-      : (st.rounds ?? []).findLast((r: any) => r.kind !== 'post-approval')?.verification
+      : lastTurn?.verification
         ?? { label: 'unknown', checks: [], gaps: [] },
     readOnlyViolations: (st.readOnlyViolations ?? (st.rounds ?? []).flatMap((r: any) =>
       (r.readOnlyViolations ?? []).map((violation: any) => ({ ...violation, round: violation.round ?? r.n }))))
@@ -510,9 +519,9 @@ function buildView(st: any, now: number, live: Liveness | null, digest: Digest |
     score: {
       fixed: count('fixed'),
       disputed: count('disputed'),
-      conceded: raw.filter((i) => i.status === 'withdrawn' && i.author?.action === 'disputed').length,
+      conceded: raw.filter((i) => i.status === 'withdrawn' && i.author?.action === 'disputed' && !(st.kind === 'build' && i.ownerRuled)).length,
       parked: count('needs-user'),
-      ownerDecided: count('owner-decided'),
+      ownerDecided: st.kind === 'build' ? raw.filter((i) => i.ownerRuled).length : count('owner-decided'),
     },
   }
 }
@@ -522,31 +531,38 @@ function buildView(st: any, now: number, live: Liveness | null, digest: Digest |
 const isMine = (st: any) => !st.owner || st.owner === mySessionId
 const isRunning = (st: any, now: number) => ACTIVE_PHASES.includes(st.phase) && now - Date.parse(st.updatedAt) < ACTIVE_MS
 
-// Session ids start with a UTC timestamp, so the newest names are the newest sessions; newest change first.
-// A directory's own mtime reads 0, so state.json is what is stat'ed. A state that cannot be read is skipped
-// and named, so one broken session does not blind the pane to the rest.
+// Creation order cannot tell us which builds are still active. Stat each ledger with bounded
+// concurrency, keeping its parsed state until the file changes or its directory disappears.
 async function scanSessions($: EngineInterface, root: string) {
-  const entries = await $.fs.list(root).catch(() => [])
-  const names = entries.filter((entry) => entry.kind === 'dir').map((entry) => entry.name).sort().reverse().slice(0, 30)
-  const seen: { id: string; mtimeMs: number; st: any }[] = []
+  const entries = await $.fs.list(root).catch((err) => {
+    if (String(err).includes('ENOENT')) return []
+    throw err
+  })
+  const dirs = entries.filter((entry) => entry.kind === 'dir')
+  const files = new Set<string>()
+  const seen: SessionFile[] = []
   let error = ''
-  for (const id of names) {
-    const stat = await $.fs.stat(`${root}/${id}/state.json`).catch(() => null)
-    if (stat?.kind !== 'file') continue
-    let known = states.get(id)
-    if (!known || known.mtimeMs !== stat.mtimeMs) {
+  const scan = async ({ name: id }: { name: string }) => {
+    const file = `${root}/${id}/state.json`
+    const stat = await $.fs.stat(file).catch(() => null)
+    if (stat?.kind !== 'file') return
+    files.add(file)
+    let known = states.get(file)
+    if (!known || known.mtimeMs !== stat.mtimeMs || known.size !== stat.size) {
       try {
-        known = { mtimeMs: stat.mtimeMs, st: JSON.parse(String(await $.fs.read(`${root}/${id}/state.json`))) }
+        known = { id, mtimeMs: stat.mtimeMs, size: stat.size, st: JSON.parse(String(await $.fs.read(file))) }
+        states.set(file, known)
       } catch (err) {
         error ||= `${id}: ${String((err as Error)?.message ?? err)}`
-        continue
       }
-      states.set(id, known)
     }
-    seen.push({ id, ...known })
+    if (known) seen.push(known)
   }
-  for (const id of [...states.keys()]) if (!names.includes(id)) states.delete(id)
-  return { seen: seen.sort((a, b) => b.mtimeMs - a.mtimeMs), error }
+  for (let start = 0; start < dirs.length; start += 20) {
+    await Promise.all(dirs.slice(start, start + 20).map(scan))
+  }
+  for (const file of states.keys()) if (!files.has(file)) states.delete(file)
+  return { seen: seen.sort((a, b) => b.mtimeMs - a.mtimeMs || b.id.localeCompare(a.id)), error }
 }
 
 // Which review this Claude session shows: its own while it runs; else one that runs elsewhere (the pane
@@ -588,16 +604,18 @@ async function readSession($: EngineInterface) {
     mySessionId ||= await $.session.id().catch(() => '')
     const now = await $.clock.now()
     const { seen, error } = await scanSessions($, root)
-    guarded = seen
+    guarded = await Promise.all(seen
       .filter((s) => (s.st.kind === 'code' || s.st.kind === 'build') && isRunning(s.st, now))
-      .map((s) => ({ id: s.id, cwd: s.st.cwd, phase: s.st.phase, engine: s.st.engine }))
+      .map(async (s) => ({ id: s.id, cwd: s.st.cwd, root: await canonical($, s.st.cwd), phase: s.st.phase, engine: s.st.engine })))
     // Places in the queue, across every owner: the runner serves waiting turns in the order they queued.
     const queue = seen
       .filter((s) => s.st.phase === 'queued')
       .sort((a, b) => String(a.st.pending?.queuedAt).localeCompare(String(b.st.pending?.queuedAt)))
       .map((s) => s.id)
     // This session's tasks in play: running, waiting on someone, or finished a moment ago.
-    const mine = seen.filter((s) => isMine(s.st) && (isRunning(s.st, now) || now - Date.parse(s.st.updatedAt) < RECENT_MS))
+    let recent = 0
+    const mine = seen.filter((s) => isMine(s.st) && (isRunning(s.st, now)
+      || (now - Date.parse(s.st.updatedAt) < RECENT_MS && recent++ < 30)))
     const picked = pickSession(seen, now)
     const focus: string = (await read($, focusAtom)) ?? ''
     const detailed = new Set([picked?.id, focus].filter(Boolean))
@@ -605,7 +623,9 @@ async function readSession($: EngineInterface) {
       const ahead = queue.indexOf(s.id)
       const digest = detailed.has(s.id) ? await digestOf($, root, s) : null
       const logAt = detailed.has(s.id) && s.st.phase === 'awaiting-codex' ? await logAtOf($, s.st, digest, now) : null
-      return buildView(s.st, now, await aliveOf($, root, s, now), digest, ahead >= 0 ? ahead : null, logAt)
+      const view = buildView(s.st, now, await aliveOf($, root, s, now), digest, ahead >= 0 ? ahead : null, logAt)
+      if (!view.owner) view.project = await canonical($, view.project)
+      return view
     }
     const list: DuetView[] = []
     for (const s of mine) list.push(await viewOf(s))
@@ -724,7 +744,7 @@ async function announceOne($: EngineInterface, view: DuetView, prefs: DuetPrefs,
     $.ui.toast(locale.toastAuthor(tag, view.round, open.length, blocking, engineName(view)), { timeoutMs: 8000 })
     void $.prompt.suggest({ text: locale.continuePrompt })
   } else if (view.phase === 'escalated') {
-    $.ui.toast(locale.toastEscalated(tag, (view.decision?.issues ?? []).join(', ')), { timeoutMs: 15000 })
+    $.ui.toast(locale.toastEscalated(tag, escalationDetail(view)), { timeoutMs: 15000 })
   } else if (view.phase === 'done') {
     $.ui.toast(view.kind === 'audit'
       ? locale.toastAuditDone(tag, view.findings.length)
@@ -758,25 +778,27 @@ async function legacyPrefs($: EngineInterface) {
 async function restoreUi($: EngineInterface) {
   // Host atom values survive hot reloads (CoreEngineInterface.state); $.store
   // survives new sessions too. Prefer either new-name value to legacy data.
-  let prefs = await $.store.get('prefs')
+  const saved = await $.store.get('prefs')
+  let prefs = saved
     ?? await read($, { plugin: 'agent-duet', key: 'prefs' } as const)
-  if (!await $.store.get('rename-migrated')) {
-    prefs ??= await read($, { plugin: 'codex-duet', key: 'prefs' } as const).catch(() => undefined)
-      ?? await legacyPrefs($)
-    if (prefs && typeof prefs === 'object') await $.store.set('prefs', prefs)
-    if (await read($, { plugin: 'agent-duet', key: 'focus' } as const) === undefined) {
-      const old = await read($, { plugin: 'codex-duet', key: 'focus' } as const).catch(() => undefined)
-      if (old !== undefined) await update($, focusAtom, () => old)
-    }
-    if (await read($, { plugin: 'agent-duet', key: 'choices' } as const) === undefined) {
-      const old = await read($, { plugin: 'codex-duet', key: 'choices' } as const).catch(() => undefined)
-      if (old !== undefined) await update($, choicesAtom, () => old)
-    }
-    if (await read($, { plugin: 'agent-duet', key: 'expanded' } as const) === undefined) {
-      const old = await read($, { plugin: 'codex-duet', key: 'expanded' } as const).catch(() => undefined)
-      if (old !== undefined) await update($, expandedAtom, () => old)
-    }
-    await $.store.set('rename-migrated', true)
+    ?? await read($, { plugin: 'codex-duet', key: 'prefs' } as const).catch(() => undefined)
+  const migrated = await $.store.get('rename-migrated')
+  if (!migrated) prefs ??= await legacyPrefs($)
+  if (!saved && prefs && typeof prefs === 'object') await $.store.set('prefs', prefs)
+  if (!migrated) await $.store.set('rename-migrated', true)
+  // The store marker is shared by the installation. Focus, choices and folds belong
+  // to each live Claude session; an existing new-name atom (including {}) wins.
+  if (await read($, { plugin: 'agent-duet', key: 'focus' } as const) === undefined) {
+    const old = await read($, { plugin: 'codex-duet', key: 'focus' } as const).catch(() => undefined)
+    if (old !== undefined) await update($, focusAtom, () => old)
+  }
+  if (await read($, { plugin: 'agent-duet', key: 'choices' } as const) === undefined) {
+    const old = await read($, { plugin: 'codex-duet', key: 'choices' } as const).catch(() => undefined)
+    if (old !== undefined) await update($, choicesAtom, () => old)
+  }
+  if (await read($, { plugin: 'agent-duet', key: 'expanded' } as const) === undefined) {
+    const old = await read($, { plugin: 'codex-duet', key: 'expanded' } as const).catch(() => undefined)
+    if (old !== undefined) await update($, expandedAtom, () => old)
   }
   if (prefs && typeof prefs === 'object') await update($, prefsAtom, () => ({ ...DEFAULT_PREFS, ...(prefs as Partial<DuetPrefs>) }))
 }
@@ -792,14 +814,70 @@ async function setPref($: EngineInterface, name: keyof DuetPrefs, value?: boolea
   return saved[name]
 }
 
-// Stops the given task's turn, running or waiting in the queue; /duet stop takes the one shown by default.
+// ps prints lstart to whole seconds. Use the same locale and time zone on both hosts.
+async function matchesRunner($: EngineInterface, pid: string, sessionId: string, latestStart: number) {
+  const ps = await $.process.run(['ps', '-ww', '-o', 'lstart=', '-o', 'command=', '-p', pid],
+    { env: { LC_ALL: 'C', TZ: 'UTC0' } })
+  if (ps.exitCode !== 0 || ps.isStdoutTruncated) return false
+  const [, weekday, month, day, time, year, command] =
+    /^(\w{3}) (\w{3}) +(\d{1,2}) (\d{2}:\d{2}:\d{2}) (\d{4})\s+(.+)$/.exec(ps.stdout.trim()) ?? []
+  if (!day || !command) return false
+  const started = Date.parse(`${weekday}, ${day.padStart(2, '0')} ${month} ${year} ${time} GMT`)
+  const lateByMs = started - latestStart
+  if (!Number.isFinite(lateByMs) || lateByMs > 1000) return false
+
+  // Match from the executable through the subcommand. The installed path can contain spaces.
+  const [, node, script, args = ''] =
+    /^(.+?)\s+(\/.*?\/duet\.mjs)\s+(?:start|reply|review|retry)(?:\s+(.*))?$/.exec(command) ?? []
+  if (!node || !script || !/(?:^|\/)node(?:js)?$/.test(node)) return false
+  if (/\s/.test(node) && (await $.fs.stat(node)).kind !== 'file') return false
+  const runner = `${$.plugin.root}/scripts/duet.mjs`
+  if (script !== runner) {
+    const [actual, installed] = await Promise.all([$.fs.stat(script, { resolve: true }), $.fs.stat(runner, { resolve: true })])
+    if (!actual.realPath || actual.realPath !== installed.realPath) return false
+  }
+  return Array.from(args.matchAll(/(?:^|\s)--session\s+(\S+)/g)).every((match) => match[1] === sessionId)
+}
+
+async function focusedView($: EngineInterface, list?: DuetView[]) {
+  const focus = await read($, focusAtom)
+  return (focus && (list ?? await read($, listAtom))?.find((v) => v.id === focus)) || await read($, viewAtom)
+}
+
 async function stopRound($: EngineInterface, given?: DuetView | null) {
-  const view: DuetView | null = given ?? await read($, viewAtom)
+  const view = given ?? await focusedView($)
   const round = view?.runningRound ?? (view?.isQueued ? view.round + 1 : null)
-  if (!round || !view?.pid) return locale.noRoundToStop(engineName(view))
-  const { exitCode } = await $.process.run(['kill', '-TERM', String(view.pid)])
-  if (exitCode !== 0) return locale.stopFailed(view.pid)
-  return locale.stoppingRound(round, view.isQueued)
+  if (!view || !round) return locale.noRoundToStop(engineName(view))
+  if (!drives(view, await canonical($, await $.session.cwd()))) return locale.stopForeign
+  if (!view.attemptAt || !Number.isSafeInteger(view.pid) || view.pid <= 1) return locale.stopUnverified
+  try {
+    const root = await stateRoot($)
+    const dir = `${root}/${view.id}`
+    const lock = `${dir}/lock`
+    const pid = String(await $.fs.read(lock)).trim()
+    if (pid !== String(view.pid)) return locale.stopUnverified
+    // Two concurrent starts can have the very same command line. A second claim
+    // on this PID anywhere in the active store makes the selected lock ambiguous.
+    const { seen } = await scanSessions($, root)
+    for (const other of seen) {
+      if (other.id === view.id || !['queued', 'awaiting-codex'].includes(other.st.phase)) continue
+      const holder = await $.fs.read(`${root}/${other.id}/lock`).catch(() => '')
+      if (String(holder).trim() === pid) return locale.stopUnverified
+    }
+    const latestStart = Math.min((await $.fs.stat(lock)).mtimeMs, Date.parse(view.attemptAt))
+    if (!await matchesRunner($, pid, view.id, latestStart)) return locale.stopUnverified
+
+    // Model and delivery updates can rewrite this file during ps. Recheck just
+    // the attempt's identity and the lock immediately before signalling.
+    const [ledger, holder] = await Promise.all([$.fs.read(`${dir}/state.json`), $.fs.read(lock)])
+    const state = JSON.parse(String(ledger))
+    if (state.id !== view.id || (state.owner ?? null) !== view.owner || state.phase !== view.phase
+      || state.pending?.round !== round || (view.isQueued ? state.pending.queuedAt : state.pending.startedAt) !== view.attemptAt
+      || String(holder).trim() !== pid) return locale.stopUnverified
+    const signal = await $.process.run(['kill', '-TERM', pid]).catch(() => null)
+    return signal?.exitCode === 0 ? locale.stoppingRound(round, view.isQueued) : locale.stopFailed(view.pid)
+  } catch {} // gone, stale, or the host cannot prove ownership
+  return locale.stopUnverified
 }
 
 const pick = ($: EngineInterface, key: string, side: DuetChoice) =>
@@ -831,7 +909,32 @@ async function sendDecisions($: EngineInterface, sessionId: string, kind: string
   $.ui.toast(locale.decisionsSent)
 }
 
-const covers = (root: string, dir: string) => dir === root || dir.startsWith(`${root}/`)
+async function resolveExisting($: EngineInterface, path: string) {
+  // A directory may be created by an earlier command in this Bash call. Resolve its
+  // existing parent and keep the missing suffix lexical, including on a migration link.
+  let parent = path
+  while (parent) {
+    const real = (await $.fs.stat(parent, { resolve: true }).catch(() => null))?.realPath
+    if (real) return lexicalPath(real + path.slice(parent.length))
+    const slash = parent.lastIndexOf('/')
+    if (slash <= 0) break
+    parent = parent.slice(0, slash)
+  }
+  return lexicalPath(path)
+}
+
+async function canonical($: EngineInterface, path: string) {
+  // Some stat implementations normalize their input first. Resolve each prefix before
+  // stepping up so Git's chdir("link/..") reaches the symlink target's physical parent.
+  const [first, ...parents] = path.split(/\/\.\.(?=\/|$)/)
+  let dir = await resolveExisting($, first || '/')
+  for (const rest of parents) {
+    dir = await resolveExisting($, (dir.slice(0, dir.lastIndexOf('/')) || '/') + rest)
+  }
+  return dir
+}
+
+const covers = (root: string, dir: string) => dir === root || dir.startsWith(root.endsWith('/') ? root : `${root}/`)
 
 // One folder inside the other: the review's repository and this Claude session are the same project.
 const sameTree = (a: string, b: string) => covers(a, b) || covers(b, a)
@@ -855,9 +958,9 @@ type StopFacts = {
 async function holdReason($: EngineInterface, e: StopFacts) {
   if (e.stop_hook_active || (loop.userSpoke && !loop.ranSinceUser)) return null
   if ((e.background_tasks?.length ?? 0) > 0 || (e.session_crons?.length ?? 0) > 0) return null
-  if (/\?\s*$/.test(e.last_assistant_message ?? '')) return null
+  if (/[?？][*_~"'`\p{Pe}\p{Pf}\s]*$/u.test(e.last_assistant_message ?? '')) return null
   await tick($) // the round may have ended a moment ago
-  const cwd = await $.session.cwd()
+  const cwd = await canonical($, await $.session.cwd())
   const waiting = lastList.filter((v) => v.isActive && CLAUDE_PHASES.includes(v.phase) && drives(v, cwd, loop.drives))
   if (!waiting.length) return null
   const after = locale.holdAfter
@@ -890,13 +993,15 @@ function footerSummary(active: DuetView[]) {
   return `Duet ×${active.length}${running ? ` ⏳${running}` : ''}${queued ? ` ⏸${queued}` : ''}${needYou ? ' 🙋' : ''}`
 }
 
+const escalationDetail = (v: DuetView) => v.decision?.issues.join(', ') || v.decision?.reason || ''
+
 // One line per task for the pane's list: what it is, where it stands, how long, on what model.
 function taskLine(v: DuetView) {
   const model = modelTag(v.codexModel, engineName(v))
   if (v.isProcessGone) return locale.taskGone(v.label)
   if (v.isQueued) return locale.taskQueued(v.label, v.queuedAhead, clock(v.elapsedMs))
   if (v.runningRound) return locale.taskRunning(v.label, v.runningRound, v.maxRounds, clock(v.elapsedMs), model)
-  if (v.phase === 'escalated') return locale.taskEscalated(v.label, (v.decision?.issues ?? []).join(', '))
+  if (v.phase === 'escalated') return locale.taskEscalated(v.label, escalationDetail(v))
   if (v.kind === 'audit' && v.phase === 'done') return locale.taskAuditDone(v.label, v.findings.length)
   return locale.taskOther(phaseWithVerification(v), v.label, v.round, v.maxRounds)
 }
@@ -983,7 +1088,7 @@ export const register: Register = (on, options) => {
     })
     await restoreUi($)
     $.clock.every(POLL_MS, () => tick($))
-    void tick($)
+    await tick($)
     return next(e)
   })
 
@@ -1013,17 +1118,21 @@ export const register: Register = (on, options) => {
       loop.drives = true
       loop.ranSinceUser = true
     }
-    if (!guarded.length) return next(e)
-    let hit: (typeof guarded)[number] | undefined
+    let targets: (string | null)[]
     try {
       const home = (await $.env.get('HOME')) ?? ''
       const writes = gitWrites(command, await $.session.cwd(), home)
-      hit = guarded.find((g) => writes.some((write) => write.dirs.some((dir) => dir === null || covers(g.cwd, dir))))
+      targets = [...new Set(writes.flatMap((write) => write.dirs))]
     } catch {
       // Excessive nesting or another unreadable command must not throw out of this gating hook.
       // Fall back conservatively only for a Git mention while a session is guarded.
-      if (/\bgit\b/.test(command)) hit = guarded[0]
+      targets = /\bgit\b/.test(command) ? [null] : []
     }
+    if (!targets.length) return next(e)
+    await tick($) // a review may have started or finished since the pane polled
+    if (!guarded.length) return next(e)
+    const resolved = await Promise.all(targets.map((dir) => dir === null ? null : canonical($, dir)))
+    const hit = guarded.find((g) => resolved.some((dir) => dir === null || covers(g.root, dir)))
     if (!hit) return next(e)
     return {
       deny: locale.commitDenied(hit.cwd, hit.id, phaseLabel(hit.phase, engineName(hit))),
@@ -1041,7 +1150,8 @@ export const register: Register = (on, options) => {
       loop.userSpoke = false // a turn of its own that the person did not start
     }
     if (!isPerson) return next(e)
-    const cwd = await $.session.cwd()
+    await tick($)
+    const cwd = await canonical($, await $.session.cwd())
     const active = lastList.filter((v) => v.isActive && drives(v, cwd))
     const first = active[0]
     if (!first) return next(e)
@@ -1081,7 +1191,7 @@ export const register: Register = (on, options) => {
     } else if (view.phase === 'awaiting-review') {
       line = locale.bandReview(view.round, view.maxRounds, engineName(view))
     } else if (view.phase === 'escalated') {
-      line = locale.bandEscalated((view.decision?.issues ?? []).join(', '))
+      line = locale.bandEscalated(escalationDetail(view))
       color = 'yellow'
     } else if (view.phase === 'codex-failed') {
       line = locale.bandFailed(view.failure)
@@ -1128,8 +1238,7 @@ export const register: Register = (on, options) => {
     const { Box, Button, Markdown, Text } = $.ui.resolve(e)
     // Several tasks: a list on top, and below the details of the one picked there (the default otherwise).
     const list: DuetView[] = (await read($, listAtom)) ?? []
-    const focus: string = (await read($, focusAtom)) ?? ''
-    const view: DuetView | null = list.find((v) => v.id === focus) ?? await read($, viewAtom)
+    const view = await focusedView($, list)
     const prefs: DuetPrefs = { ...DEFAULT_PREFS, ...(await read($, prefsAtom)) }
     const choices: Record<string, DuetChoice> = (await read($, choicesAtom)) ?? {}
     const expanded: Record<string, boolean> = (await read($, expandedAtom)) ?? {}
@@ -1296,15 +1405,15 @@ export const register: Register = (on, options) => {
           )}
           <Box gap={1} flexWrap="wrap" alignItems="center">
             <Text color={phaseColor} wrap="wrap">{phaseText}</Text>
-            {isWaiting && view.pid && !view.isProcessGone ? (
+            {isWaiting && view.isMine && view.pid > 0 && !view.isProcessGone ? (
               <Button key="stop" label={locale.stopButton} onPress={() => { void stopRound($, view).then((text) => $.ui.toast(text)) }} />
             ) : null}
           </Box>
-          {!view.runningRound ? verificationDetails(view).map(({ text, isProblem }, n) => (
+          {verificationDetails(view).filter((line) => !view.runningRound || line.isProblem).map(({ text, isProblem }, n) => (
             isProblem
               ? <Text key={`verification-${n}`} color="yellow" wrap="wrap">{text}</Text>
               : <Text key={`verification-${n}`} dimColor wrap="wrap">{text}</Text>
-          )) : null}
+          ))}
           {view.decision && !view.runningRound ? <Text dimColor wrap="wrap">{locale.decision(view.decision.action, view.decision.reason)}</Text> : null}
           {view.failure ? <Text color="red" wrap="wrap">{view.failure}</Text> : null}
           {view.readOnlyViolations.map((violation, n) => (
@@ -1331,9 +1440,12 @@ export const register: Register = (on, options) => {
           </Box>
         ) : null}
 
-        {escalated.length ? (
+        {view.phase === 'escalated' ? (
           <Box flexDirection="column" gap={1}>
             <Text weight="semibold" color="yellow">{locale.yourDecision}</Text>
+            {!escalated.length ? (view.requestChecks ?? []).map((check) => (
+              <Text key={check.who} wrap="wrap">{locale.requestCheck(check.who, check.status, check.notes)}</Text>
+            )) : null}
             {escalated.map((issue) => {
               const key = `${view.id}:${issue.id}`
               const choice = choices[key]
@@ -1360,7 +1472,7 @@ export const register: Register = (on, options) => {
               )
             })}
             {/* A decision goes to the Claude session that drives the review, so only that one sends it. */}
-            {view.isMine ? (
+            {view.isMine && escalated.length > 0 ? (
               <Button
                 key="send-decisions"
                 variant="primary"

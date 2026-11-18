@@ -3,13 +3,16 @@
 type Dir = string | null
 type Word = { value: string; quoted: boolean; tilde: boolean; assignment?: string }
 type Heredoc = { tag: Word; tabs: boolean; body: string }
-type Redirects = { substitutions: Node[][]; docs: Heredoc[]; stdin?: Heredoc | null; stdout: boolean }
+type Redirects = { substitutions: Node[][]; docs: Heredoc[]; stdin?: Heredoc | string | null; stdout: boolean; negated?: boolean }
 type Simple = Redirects & { kind: 'simple'; words: Word[]; end: string }
 type Group = Redirects & { kind: 'group'; body: Node[]; isolated: boolean; end: string }
-type Node = Simple | Group
+type Arm = { condition?: Node[]; body: Node[]; fallthrough?: 'next' | 'retest' }
+type Choice = Redirects & { kind: 'choice'; arms: Arm[]; exhaustive: boolean; end: string }
+type Node = Simple | Group | Choice
 type DirStack = { cwd: Dir; next: DirStack | null }
 type Context = { cwd: Dir; previous: Dir; stack: DirStack | null; env: Record<string, Word> }
-// cwd is the primary work tree; dirs also protects the repository selected by an explicit Git dir.
+// cwd is the lexical work tree. Keep the target spellings for stat: link/.. can land
+// somewhere else, and .git itself may be a symlink.
 export type GitWrite = { action: 'commit' | 'push' | 'stash'; cwd: Dir; dirs: Dir[] }
 
 const redirects = (): Redirects => ({ substitutions: [], docs: [], stdout: false })
@@ -41,9 +44,83 @@ class Reader {
   private at = 0
   constructor(private text: string) {}
 
-  read(stop = ''): Node[] {
+  private atWord(word: string) {
+    const next = this.text[this.at + word.length]
+    return this.text.startsWith(word, this.at) && (!next || space(next) || boundary(next))
+  }
+
+  private take(word: string) {
+    if (!this.atWord(word)) return false
+    this.at += word.length
+    return true
+  }
+
+  private trivia(pending: Heredoc[]) {
+    while (this.at < this.text.length) {
+      const c = this.text[this.at]
+      if (c === '\n') {
+        this.at++
+        for (const doc of pending) this.heredoc(doc)
+        pending.length = 0
+      } else if (space(c)) this.at++
+      else if (this.text.startsWith('\\\n', this.at)) this.at += 2
+      else if (c === '#') {
+        const end = this.text.indexOf('\n', this.at)
+        this.at = end < 0 ? this.text.length : end
+      } else break
+    }
+  }
+
+  private conditional(pending: Heredoc[]): Choice {
+    const arms: Arm[] = []
+    do {
+      const condition = this.read('', ['then'], pending)
+      if (!this.take('then')) throw new Error('expected then')
+      arms.push({ condition, body: this.read('', ['elif', 'else', 'fi'], pending) })
+    } while (this.take('elif'))
+    const exhaustive = this.take('else')
+    if (exhaustive) arms.push({ body: this.read('', ['fi'], pending) })
+    if (!this.take('fi')) throw new Error('expected fi')
+    return { ...redirects(), kind: 'choice', arms, exhaustive, end: '' }
+  }
+
+  private cases(pending: Heredoc[]): Choice {
+    const choice: Choice = { ...redirects(), kind: 'choice', arms: [], exhaustive: false, end: '' }
+    this.trivia(pending)
+    this.word(choice.substitutions) // the subject and patterns are data, but their substitutions run
+    this.trivia(pending)
+    if (!this.take('in')) throw new Error('expected in')
+    for (;;) {
+      this.trivia(pending)
+      if (this.take('esac')) return choice
+      if (this.text[this.at] === '(') this.at++
+      for (;;) {
+        this.trivia(pending)
+        const start = this.at
+        const pattern = this.word(choice.substitutions)
+        if (this.at === start) throw new Error('expected case pattern')
+        if (!pattern.quoted && pattern.value === '*') choice.exhaustive = true
+        this.trivia(pending)
+        const separator = this.text[this.at++]
+        if (separator === ')') break
+        if (separator !== '|') throw new Error('expected case pattern separator')
+      }
+      const arm: Arm = { body: this.read('', ['esac'], pending, true) }
+      choice.arms.push(arm)
+      if (this.text.startsWith(';;&', this.at)) {
+        arm.fallthrough = 'retest'
+        this.at += 3
+      } else if (this.text.startsWith(';&', this.at)) {
+        arm.fallthrough = 'next'
+        this.at += 2
+      } else if (this.text.startsWith(';;', this.at)) this.at += 2
+      else if (this.take('esac')) return choice
+      else throw new Error('unsupported case terminator')
+    }
+  }
+
+  read(stop = '', keywords: string[] = [], pending: Heredoc[] = [], caseBody = false): Node[] {
     const nodes: Node[] = []
-    const pending: Heredoc[] = []
     let cmd = simple()
     let jobStart = 0
     const flush = (end = '') => {
@@ -53,8 +130,22 @@ class Reader {
         cmd = simple()
       } else if (nodes.length && end) nodes[nodes.length - 1].end = end
     }
+    const prefix = () => cmd.words.every((w) => !w.quoted && (reserved.has(w.value) || w.value === 'time' || w.value === '-p'))
+    const compound = (node: Choice | Group) => {
+      if (prefix()) {
+        node.negated = cmd.words.filter((w) => w.value === '!').length % 2 === 1
+        node.stdin = cmd.stdin
+        node.stdout = cmd.stdout
+        node.docs.push(...cmd.docs)
+        node.substitutions.push(...cmd.substitutions)
+        cmd = simple()
+      } else flush()
+      nodes.push(node)
+    }
     while (this.at < this.text.length) {
       const c = this.text[this.at]
+      if (caseBody && (this.text.startsWith(';;', this.at) || this.text.startsWith(';&', this.at))) break
+      if (!cmd.words.length && keywords.some((word) => this.atWord(word))) break
       const braceEnd = this.at + 1 === this.text.length || space(this.text[this.at + 1]) || boundary(this.text[this.at + 1])
       if (stop && c === stop && (stop !== '}' || (braceEnd && !cmd.words.length))) {
         this.at++
@@ -90,10 +181,15 @@ class Reader {
           nodes.push(group(body, true, '&'))
         }
         if (op === ';' || op === '&') jobStart = nodes.length
-      } else if (c === '(' || (c === '{' && braceEnd && cmd.words.every((w) => !w.quoted && (reserved.has(w.value) || w.value === 'time' || w.value === '-p')))) {
+      } else if (this.atWord('if') && prefix()) {
+        this.at += 2
+        compound(this.conditional(pending))
+      } else if (this.atWord('case') && prefix()) {
+        this.at += 4
+        compound(this.cases(pending))
+      } else if (c === '(' || (c === '{' && braceEnd && prefix())) {
         this.at++
-        flush()
-        nodes.push(group(this.read(c === '(' ? ')' : '}'), c === '('))
+        compound(group(this.read(c === '(' ? ')' : '}'), c === '('))
       } else if (c === ')') {
         this.at++
         flush()
@@ -108,7 +204,7 @@ class Reader {
           const fd = io > this.at ? Number(this.text.slice(this.at, io)) : this.text[io] === '<' ? 0 : 1
           this.at = io
           const last = nodes.at(-1)
-          const target = !cmd.words.length && !cmd.docs.length && !cmd.substitutions.length && last?.kind === 'group' && !last.end ? last : cmd
+          const target = !cmd.words.length && !cmd.docs.length && !cmd.substitutions.length && last && last.kind !== 'simple' && !last.end ? last : cmd
           this.redirect(target, pending, fd)
         } else {
           cmd.words.push(this.word(cmd.substitutions))
@@ -123,7 +219,14 @@ class Reader {
     const c = this.text[this.at++]
     if (fd === 0) cmd.stdin = null
     if (fd === 1) cmd.stdout = true
-    if (c === '<' && this.text[this.at] === '<' && this.text[this.at + 1] !== '<') {
+    if (c === '<' && this.text.startsWith('<<', this.at)) {
+      this.at += 2
+      while (space(this.text[this.at])) this.at++
+      const word = this.word(cmd.substitutions)
+      if (fd === 0) cmd.stdin = word.value
+      return
+    }
+    if (c === '<' && this.text[this.at] === '<') {
       this.at++
       const tabs = this.text[this.at] === '-'
       if (tabs) this.at++
@@ -288,9 +391,17 @@ class Reader {
   }
 }
 
-// Lexical POSIX paths suffice here: no filesystem access, variable expansion or globbing. An absolute
-// target can restore a known cwd after a dynamic cd; relative targets keep that uncertainty.
-function resolveDir(cwd: Dir, word: Word | string, home: string): Dir {
+export function lexicalPath(path: string): string {
+  const parts: string[] = []
+  for (const part of path.split('/')) {
+    if (part === '..') parts.pop()
+    else if (part && part !== '.') parts.push(part)
+  }
+  return `/${parts.join('/')}`
+}
+
+// cd normally processes .. logically; Git -C and wrappers that chdir use the filesystem.
+function resolveDir(cwd: Dir, word: Word | string, home: string, physical = false): Dir {
   let target = typeof word === 'string' ? word : word.value
   if (dynamic.test(target)) return null
   if (target.startsWith('~') && (typeof word === 'string' || word.tilde)) {
@@ -301,24 +412,47 @@ function resolveDir(cwd: Dir, word: Word | string, home: string): Dir {
     if (cwd === null) return null
     target = `${cwd}/${target}`
   }
-  const parts: string[] = []
-  for (const part of target.split('/')) {
-    if (part === '..') parts.pop()
-    else if (part && part !== '.') parts.push(part)
-  }
-  return `/${parts.join('/')}`
+  return physical ? target : lexicalPath(target)
 }
 
 const envKey = (key: string) => key === 'GIT_DIR' || key === 'GIT_WORK_TREE'
 const wrappers = new Set(['env', 'sudo', 'command', 'builtin', 'exec', 'nohup', 'nice', 'timeout', 'xargs', 'time'])
 const wrapperValues: Record<string, Set<string>> = {
-  env: new Set(['-u', '-C', '-a', '--unset', '--chdir', '--argv0']),
+  env: new Set(['-u', '-C', '-a', '-S', '--unset', '--chdir', '--argv0', '--split-string']),
   sudo: new Set(['-u', '-g', '-h', '-p', '-C', '-T', '-R', '-D', '-r', '-t', '--user', '--group', '--host', '--prompt', '--close-from', '--command-timeout', '--chroot', '--chdir', '--role', '--type', '--other-user']),
   xargs: new Set(['-a', '-d', '-E', '-I', '-L', '-n', '-P', '-s', '--arg-file', '--delimiter', '--eof', '--replace', '--max-lines', '--max-args', '--max-procs', '--max-chars', '--process-slot-var']),
   nice: new Set(['-n', '--adjustment']),
   timeout: new Set(['-k', '-s', '--kill-after', '--signal']),
   time: new Set(['-o', '-f', '--output', '--format']),
   exec: new Set(['-a']),
+}
+
+// env -S splits arguments, not shell commands. Shell operators in an argument are data.
+// Expansion and env-specific escape sequences outside this literal subset are unknown.
+function splitEnv(value: string): Word[] {
+  const words: Word[] = []
+  let quote = ''
+  let part = ''
+  let started = false
+  const flush = () => {
+    if (started) words.push({ value: part, tilde: false, quoted: true })
+    part = ''
+    started = false
+  }
+  for (const c of value) {
+    if (c === '\\' || (c === '$' && quote !== "'")) throw new Error('dynamic env split string')
+    if (!quote && c === '#' && !started) break
+    if (!quote && /\s/.test(c)) flush()
+    else {
+      started = true
+      if (quote && c === quote) quote = ''
+      else if (!quote && (c === "'" || c === '"')) quote = c
+      else part += c
+    }
+  }
+  if (quote) throw new Error('unterminated env split string')
+  flush()
+  return words
 }
 
 // Consume wrapper options once, including their values, before looking for the actual executable.
@@ -369,8 +503,11 @@ function executable(words: Word[], ctx: Context, home: string): number {
       }
       if (name === 'env' && (option === '-' || key === '--ignore-environment')) ctx.env = {}
       if (name === 'env' && (key === '-u' || key === '--unset') && value) delete ctx.env[value.value]
+      if (name === 'env' && (key === '-S' || key === '--split-string') && value) {
+        words.splice(i, 0, ...splitEnv(value.value))
+      }
       if ((name === 'env' && (key === '-C' || key === '--chdir')) || (name === 'sudo' && (key === '-D' || key === '--chdir'))) {
-        ctx.cwd = value === undefined ? null : resolveDir(ctx.cwd, value, home)
+        ctx.cwd = value === undefined ? null : resolveDir(ctx.cwd, value, home, true)
       }
     }
     if (name === 'timeout' && i < words.length) i++ // duration
@@ -395,12 +532,12 @@ function gitWrite(words: Word[], at: number, ctx: Context, home: string): GitWri
     const key = equal < 0 ? arg : arg.slice(0, equal)
     if (arg === '-C' || (arg.startsWith('-C') && arg.length > 2)) {
       const dir = arg === '-C' ? words[i++] : { ...word, value: arg.slice(2) }
-      cwd = dir === undefined ? null : resolveDir(cwd, dir, home)
+      cwd = dir === undefined ? null : resolveDir(cwd, dir, home, true)
     } else if (key === '--work-tree' || key === '--git-dir') {
       const dir = equal < 0 ? words[i++] : { ...word, value: arg.slice(equal + 1) }
       if (key === '--work-tree') workTree = dir
       else gitDir = dir
-    } else if (arg === '-c' || key === '--namespace' || key === '--config-env' || key === '--super-prefix') {
+    } else if (arg === '-c' || key === '--namespace' || key === '--config-env' || key === '--super-prefix' || key === '--attr-source') {
       if (equal < 0) i++
     }
     // All remaining global flags have no separate value, including --exec-path[=path].
@@ -408,71 +545,144 @@ function gitWrite(words: Word[], at: number, ctx: Context, home: string): GitWri
   const action = words[i]?.value
   if (action !== 'commit' && action !== 'push' && action !== 'stash') return null
   if (action === 'stash' && ['list', 'show'].includes(words[i + 1]?.value)) return null
-  let repoDir = gitDir === undefined ? undefined : resolveDir(cwd, gitDir, home)
-  if (repoDir?.endsWith('.git')) repoDir = repoDir.slice(0, repoDir.lastIndexOf('/')) || '/'
-  if (workTree !== undefined) cwd = resolveDir(cwd, workTree, home)
+  const repoDir = gitDir === undefined ? undefined : resolveDir(cwd, gitDir, home, true)
+  if (workTree !== undefined) cwd = resolveDir(cwd, workTree, home, true)
   else if (repoDir !== undefined) cwd = repoDir
-  return { action, cwd, dirs: repoDir !== undefined && repoDir !== cwd ? [cwd, repoDir] : [cwd] }
+  const logical = cwd === null ? null : lexicalPath(cwd)
+  return {
+    action,
+    cwd: workTree === undefined && repoDir !== undefined && logical?.endsWith('/.git') ? logical.slice(0, -5) || '/' : logical,
+    dirs: repoDir !== undefined && repoDir !== cwd ? [cwd, repoDir] : [cwd],
+  }
 }
 
-function inspect(nodes: Node[], ctx: Context, home: string, writes: GitWrite[], input?: string): string | undefined {
-  let piped = false
-  let pipeInput: string | undefined
-  let output: string | undefined
-  let alternative: Context | null = null
-  for (const node of nodes) {
-    // Each pipeline element and background job has its own directory. Braces share the parent shell;
-    // parentheses, substitutions and shell -c do not, even if they contain cd or pushd.
-    const local = piped || node.end === '|' || node.end === '&' ? fork(ctx) : ctx
-    const before = node.end === '||' ? fork(local) : null
-    const incoming = piped ? pipeInput : input
-    piped = node.end === '|'
-    for (const sub of node.substitutions) inspect(sub, fork(local), home, writes)
-    let stdinScript = node.stdin === undefined ? incoming : node.stdin?.body
-    for (const doc of node.docs) {
-      if (!doc.tag.quoted) {
-        const expanded = new Reader(doc.body).expandHeredoc()
-        for (const sub of expanded.substitutions) inspect(sub, fork(local), home, writes)
-        if (doc === node.stdin) stdinScript = expanded.text
-      }
+// The next operand of an AND/OR list sees only the exits on which it actually runs.
+// Join at each operator so the number of contexts stays constant even for long chains.
+type Exits = { success: Context; failure: Context; output?: string }
+function inspect(nodes: Node[], ctx: Context, home: string, writes: GitWrite[], input?: string): Exits {
+  let exits: Exits = { success: ctx, failure: ctx }
+  let previous = ''
+  for (let i = 0; i < nodes.length; i++) {
+    let node = nodes[i]
+    const entry = previous === '&&' ? exits.success : previous === '||' ? exits.failure : ctx
+    const pipeline = node.end === '|'
+    const negated = node.negated || (node.kind === 'simple' && !node.words[0]?.quoted && node.words[0]?.value === '!')
+    let local = fork(entry)
+    let result = inspectNode(node, local, home, writes, input)
+    while (node.end === '|' && i + 1 < nodes.length) {
+      node = nodes[++i]
+      result = inspectNode(node, fork(entry), home, writes, result.output)
     }
-    output = node.kind === 'group'
-      ? inspect(node.body, node.isolated ? fork(local) : local, home, writes, stdinScript)
-      : inspectSimple(node, local, home, writes, stdinScript)
-    if (node.stdout) output = undefined
-    pipeInput = output
-    if (before) {
-      // The right side of cd X || ... runs after a failed cd, in the old directory. After the
-      // alternatives rejoin, differing directories/environment values are statically unknown.
-      alternative = join(alternative, local)
-      Object.assign(local, before)
+    // All stages run in separate shells. Only their data passes from one to the next.
+    if (pipeline) {
+      local = entry
+      result = { success: entry, failure: entry, output: result.output }
     }
-    if (alternative && node.end !== '||' && node.end !== '&&') {
-      Object.assign(ctx, join(alternative, ctx))
-      alternative = null
+    if (negated) [result.success, result.failure] = [result.failure, result.success]
+    if (previous === '&&') {
+      result.failure = join(exits.failure, result.failure)
+      Object.assign(ctx, join(ctx, local))
+    } else if (previous === '||') {
+      Object.assign(ctx, join(exits.success, local))
+      result.success = join(exits.success, result.success)
+    } else Object.assign(ctx, local)
+    exits = result
+    previous = node.end
+  }
+  // Forward known stdin only through a single command. Other output is runtime-built.
+  return { ...exits, output: nodes.length === 1 ? exits.output : undefined }
+}
+
+function inspectNode(node: Node, local: Context, home: string, writes: GitWrite[], input?: string): Exits {
+  for (const sub of node.substitutions) inspect(sub, fork(local), home, writes)
+  let stdin = node.stdin === undefined ? input : typeof node.stdin === 'string' ? node.stdin : node.stdin?.body
+  for (const doc of node.docs) {
+    if (!doc.tag.quoted) {
+      const expanded = new Reader(doc.body).expandHeredoc()
+      for (const sub of expanded.substitutions) inspect(sub, fork(local), home, writes)
+      if (doc === node.stdin) stdin = expanded.text
     }
   }
-  // Only forward known, unchanged heredoc data (cat, including a single-command group). Arbitrary
-  // program output remains runtime-built code, outside the guard's static-command contract.
-  return nodes.length === 1 ? output : undefined
+  if (node.kind === 'choice') {
+    let remaining = fork(local)
+    let after: Context | null = null
+    let success: Context | null = null
+    let failure: Context | null = null
+    let nextBody: Context | null = null
+    for (const arm of node.arms) {
+      const condition = arm.condition ? inspect(arm.condition, remaining, home, writes, stdin) : null
+      const body = join(nextBody, condition?.success ?? remaining)
+      if (condition) remaining = condition.failure
+      const result = inspect(arm.body, body, home, writes, stdin)
+      nextBody = arm.fallthrough === 'next' ? body : null
+      if (arm.fallthrough === 'retest') remaining = join(remaining, body)
+      if (nextBody && arm !== node.arms.at(-1)) continue
+      success = join(success, result.success)
+      failure = join(failure, result.failure)
+      after = join(after, body)
+    }
+    // An if without else or a case without a catch-all can execute no body.
+    if (!node.exhaustive) {
+      after = join(after, remaining)
+      success = join(success, remaining)
+    }
+    Object.assign(local, after)
+    return { success: success ?? local, failure: failure ?? local }
+  }
+  if (node.kind === 'group') {
+    const result = inspect(node.body, node.isolated ? fork(local) : local, home, writes, stdin)
+    return { success: node.isolated ? local : result.success, failure: node.isolated ? local : result.failure,
+      output: node.stdout ? undefined : result.output }
+  }
+  // A failed cd leaves the previous directory. An eval can have made changes on either exit.
+  const exits = { success: local, failure: fork(local) }
+  const output = inspectSimple(node, local, exits, home, writes, stdin)
+  return { ...exits, output: node.stdout ? undefined : output }
 }
 
-function inspectSimple(node: Simple, local: Context, home: string, writes: GitWrite[], stdinScript?: string): string | undefined {
+function inspectSimple(node: Simple, local: Context, exits: Exits, home: string, writes: GitWrite[], stdinScript?: string): string | undefined {
   const invocation = fork(local)
-  const at = executable(node.words, invocation, home)
-  if (at >= node.words.length) {
+  const words = [...node.words] // env -S can insert words into the argument vector
+  const at = executable(words, invocation, home)
+  if (at >= words.length) {
     // Assignment-only commands persist; assignments in env/sudo invocations do not.
     if (node.words.every((w) => w.assignment)) local.env = invocation.env
     return
   }
-  const name = program(node.words[at].value)
-  const args = node.words.slice(at + 1)
+  const name = program(words[at].value)
+  const args = words.slice(at + 1)
   if (name === 'git') {
-    const write = gitWrite(node.words, at + 1, invocation, home)
+    const write = gitWrite(words, at + 1, invocation, home)
     if (write) writes.push(write)
+  } else if (name === 'export') {
+    for (const word of args) {
+      const match = assignment.exec(word.value)
+      if (match && envKey(match[1])) local.env[match[1]] = { ...word, value: match[2] }
+    }
+  } else if (name === 'unset') {
+    for (const word of args) if (envKey(word.value)) delete local.env[word.value]
   } else if (name === 'cd' || name === 'pushd') {
     const afterOptions = args.findIndex((w) => w.value === '--')
     const given = afterOptions < 0 ? args.find((w) => w.value === '-' || !w.value.startsWith('-')) : args[afterOptions + 1]
+    const index = name === 'pushd' && args.find((w) => /^[+-]\d+$/.test(w.value))
+    if (index) {
+      const dirs = [local.cwd]
+      for (let at = local.stack; at; at = at.next) dirs.push(at.cwd)
+      const n = Number(index.value.slice(1))
+      const from = index.value[0] === '+' ? n : dirs.length - 1 - n
+      if (from < 0 || from >= dirs.length || args.some((w) => w.value === '-n')) {
+        local.cwd = null // an inherited directory stack or shell-specific -n rotation
+        local.previous = null
+        local.stack = null
+      } else if (from) {
+        const rotated = [...dirs.slice(from), ...dirs.slice(0, from)]
+        local.previous = local.cwd
+        local.cwd = rotated[0]
+        local.stack = null
+        for (let i = rotated.length - 1; i > 0; i--) local.stack = { cwd: rotated[i], next: local.stack }
+      }
+      return
+    }
     if (name === 'pushd' && !given) {
       const dir = local.stack?.cwd ?? null
       if (local.stack) local.stack = { cwd: local.cwd, next: local.stack.next }
@@ -497,35 +707,39 @@ function inspectSimple(node: Simple, local: Context, home: string, writes: GitWr
     local.stack = local.stack?.next ?? null
   } else if (name === 'eval') {
     const evaluated = fork(invocation)
-    const output = inspect(new Reader(args.map((w) => w.value).join(' ')).read(), evaluated, home, writes, stdinScript)
+    const result = inspect(new Reader(args.map((w) => w.value).join(' ')).read(), evaluated, home, writes, stdinScript)
     // Prefix assignments apply while eval runs; directory changes and assignments made by the
     // evaluated code stay in this shell. Restore any temporarily shadowed environment values.
     for (let i = 0; i < at; i++) {
-      const key = node.words[i].assignment
+      const key = words[i].assignment
       if (key && envKey(key)) {
-        if (local.env[key] === undefined) delete evaluated.env[key]
-        else evaluated.env[key] = local.env[key]
+        for (const frame of [evaluated, result.success, result.failure]) {
+          if (local.env[key] === undefined) delete frame.env[key]
+          else frame.env[key] = local.env[key]
+        }
       }
     }
     Object.assign(local, evaluated)
-    return output
+    Object.assign(exits, result)
+    return result.output
   } else if (shells.has(name)) {
     let i = 0
     let inline = false
     let readsStdin = false
-    while (i < args.length && args[i].value.startsWith('-')) {
+    while (i < args.length && /^[-+]./.test(args[i].value)) {
       const option = args[i++].value
       if (option === '--') break
       if (/^-[^-]*c/.test(option)) {
         inline = true
+        if (args[i]?.value === '--') i++
         break
       }
       if (/^-[^-]*s/.test(option)) readsStdin = true
-      if (['-o', '-O', '--rcfile', '--init-file'].includes(option)) i++
+      if (/^[-+][^-]*[oO]$/.test(option) || ['--rcfile', '--init-file'].includes(option)) i++
     }
-    if (inline && args[i]) return inspect(new Reader(args[i].value).read(), fork(invocation), home, writes, stdinScript)
+    if (inline && args[i]) return inspect(new Reader(args[i].value).read(), fork(invocation), home, writes, stdinScript).output
     if (!inline && (readsStdin || i === args.length || args[i].value === '-') && stdinScript !== undefined) {
-      return inspect(new Reader(stdinScript).read(), fork(invocation), home, writes)
+      return inspect(new Reader(stdinScript).read(), fork(invocation), home, writes).output
     }
   } else if (name === 'cat' && args.every((w) => ['-', '--', '-u'].includes(w.value))) {
     return stdinScript
