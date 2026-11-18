@@ -2,7 +2,7 @@
 // Self-test for the mod (hooks/register.tsx) on a stand-in engine: node tests/mod.mjs
 // The sessions it reads are real ones, made by scripts/duet.mjs against the fake Codex.
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -460,6 +460,42 @@ for (const [command, expected] of parserCases) {
 }
 
 const extraHookCases = [
+  [`test -n "$x" || cd "${elsewhere}" && git push`, true],
+  [`test -n "$x" && cd "${elsewhere}"; git push`, true],
+  [`test -n "$x" && cd "${elsewhere}" && test -e x || git push`, true],
+  [`if test -e a; then cd "${elsewhere}"; elif test -e b; then :; else git push; fi`, true],
+  [`if cd "${elsewhere}"; then git push; else :; fi`, false],
+  [`if cd "${elsewhere}"; then :; else git push; fi`, true],
+  [`cd "${elsewhere}"; if test -e a; then cd "${repo}"; else git push; fi`, false],
+  [`if ! { cd "${elsewhere}"; test -e x; }; then git push; fi`, false],
+  [`cd "${elsewhere}"; if ! { cd "${repo}"; test -e x; }; then git push; fi`, true],
+  [`! if cd "${elsewhere}"; then :; else git push; fi`, true],
+  [`cd "${elsewhere}"; eval 'cd "${repo}"; false' || git push`, true],
+  [`case "$x" in a|b) cd "${elsewhere}" ;; c) git push ;; esac`, true],
+  [`cd "${elsewhere}"; case "$x" in a) cd "${repo}" ;; b) git push ;; esac`, false],
+  [`case "$x" in a) cd "${elsewhere}" ;; esac; git push`, true],
+  [`(case "$x" in (a) cd "${elsewhere}" ;; (b) git push ;; esac)`, true],
+  ["case x in git|commit) echo 'git commit' ;; esac", false],
+  [`cd "${elsewhere}"; case "$x" in a) cd "${repo}" ;& b) git push ;; esac`, true],
+  [`cd "${elsewhere}"; case "$x" in a) cd "${repo}" ;;& b) git push ;; esac`, true],
+  ["case x in a) echo 'git push' ;& b) cat <<'EOF'\ngit commit\nEOF\n;; esac", false],
+  ["if cat <<'EOF'; then\ngit push\nEOF\n:; fi", false],
+  ["case x in a) cat <<'EOF' ;;\ngit push\nEOF\nesac", false],
+  ["sh -c -- 'git push'", true], ["bash +e -lc -- 'git stash'", true],
+  ["zsh +o nomatch -c 'git push'", true], ["set +o noglob; git push", true],
+  ['git --attr-source HEAD commit', true], ['git --attr-source=HEAD commit', true],
+  [`cd "${elsewhere}"; export GIT_DIR="${repo}/.git"; git push`, true],
+  [`export GIT_WORK_TREE="${elsewhere}"; git push`, false],
+  ["env -S 'git push'", true], ["env --split-string='git' push", true],
+  [`env -S 'git -C "${outsideSpace}"' push`, false], ["env -S 'echo git push'", false],
+  ["env -S 'sh -c \"git push\"'", true],
+  ["bash <<< 'git push'", true], ["cat <<< 'git push' | sh", true],
+  ["cat <<< 'git push'", false], ["sh 3<<< 'git push'", false],
+  ["sh <<< 'git push' </dev/null", false], ["cat <<< \"$(git push)\"", true],
+  [`pushd "${elsewhere}"; pushd +1; git push`, true],
+  [`pushd "${elsewhere}"; pushd +0; git push`, false],
+  [`pushd "${elsewhere}"; pushd "${outsideSpace}"; pushd -0; git push`, true],
+  [`pushd "${elsewhere}"; pushd +1; popd; git push`, false],
   ...writeActions.flatMap((action) => [
     [`git --git-dir="${repo}/.git" --work-tree="${outsideSpace}" ${action}`, true],
     [`git --work-tree="${outsideSpace}" --git-dir="${repo}/.git" ${action}`, true],
@@ -518,12 +554,12 @@ for (const [command, denied] of extraHookCases) {
 }
 
 for (const [command, dirs] of [
-  ['git --git-dir=/review/.git --work-tree=/elsewhere commit', ['/elsewhere', '/review']],
-  ['git --work-tree=/elsewhere --git-dir=/review/.git commit', ['/elsewhere', '/review']],
-  ['GIT_DIR=/review/.git GIT_WORK_TREE=/elsewhere git push', ['/elsewhere', '/review']],
-  ['git -C sub --git-dir=../.git --work-tree=../../elsewhere push', ['/elsewhere', '/review']],
+  ['git --git-dir=/review/.git --work-tree=/elsewhere commit', ['/elsewhere', '/review/.git']],
+  ['git --work-tree=/elsewhere --git-dir=/review/.git commit', ['/elsewhere', '/review/.git']],
+  ['GIT_DIR=/review/.git GIT_WORK_TREE=/elsewhere git push', ['/elsewhere', '/review/.git']],
+  ['git -C sub --git-dir=../.git --work-tree=../../elsewhere push', ['/review/sub/../../elsewhere', '/review/sub/../.git']],
   ['git --git-dir=$REPO/.git --work-tree=/elsewhere push', ['/elsewhere', null]],
-  ['git --git-dir=/review/.git push', ['/review']],
+  ['git --git-dir=/review/.git push', ['/review/.git']],
 ]) {
   await test(`shell parser reports every affected directory: ${JSON.stringify(command)}`, () => {
     assert.deepEqual(gitWrites(command, '/review', '/home/me').map((write) => write.dirs), [dirs]);
@@ -1039,6 +1075,269 @@ async function languageEngine(options, localeEnv = {}, defaultsResult) {
   };
   return { engine, sid, write, stateHome };
 }
+
+await test('old active build survives hundreds of newer ledgers in guard, Stop and context', async () => {
+  const { engine, sid, write, stateHome } = await languageEngine({ language: 'en' });
+  const build = buildOf('long-running');
+  write({ ...build, phase: 'awaiting-review', updatedAt: ago(6 * 3600_000) });
+  const file = path.join(stateHome, sid, 'state.json');
+  fs.utimesSync(file, new Date(ago(6 * 3600_000)), new Date(ago(6 * 3600_000)));
+  for (let i = 0; i < 200; i++) {
+    const id = `20991231-235959-${i.toString(16).padStart(4, '0')}`;
+    fs.mkdirSync(path.join(stateHome, id));
+    fs.writeFileSync(path.join(stateHome, id, 'state.json'), JSON.stringify({
+      id, cwd: repo, kind: 'audit', phase: 'done', updatedAt: ago(20 * 60_000),
+    }));
+  }
+  assert.ok((await engine.bash(`git -C "${build.cwd}" push`)).deny?.includes(sid));
+  assert.ok((await engine.stop()).block?.includes(sid));
+  assert.ok((await engine.prompt('Progress?')).context?.join('').includes(sid));
+  const before = engine.reads.length;
+  await engine.tick();
+  assert.equal(engine.reads.slice(before).filter((f) => f.endsWith('/state.json')).length, 0);
+  write({ ...build, phase: 'awaiting-review', updatedAt: ago(13 * 3600_000) });
+  await engine.tick();
+  assert.equal((await engine.bash(`git -C "${build.cwd}" push`)).result, 'core reached');
+  assert.equal((await engine.prompt('Progress?')).context, undefined);
+});
+
+await test('migrated build and ownerless review recognize both symlink spellings', async () => {
+  const { engine, sid, write, stateHome } = await languageEngine({ language: 'en' });
+  const alias = stateHome + '-legacy';
+  fs.symlinkSync(stateHome, alias);
+  const physical = path.join(stateHome, sid, 'worktree');
+  const legacy = path.join(alias, sid, 'worktree');
+  fs.mkdirSync(path.join(physical, 'sub'), { recursive: true });
+  for (const [root, target] of [[legacy, physical], [physical, legacy]]) {
+    write({ kind: 'build', cwd: root, subject: { repo, branch: 'codex-duet/old', worktree: root }, phase: 'awaiting-review' });
+    engine.setCwd(path.join(target, 'sub'));
+    await engine.tick();
+    assert.ok((await engine.bash('git commit')).deny?.includes(sid));
+    assert.ok((await engine.bash(`git -C "${target}" stash`)).deny?.includes(sid));
+    assert.ok((await engine.bash(`mkdir -p "${target}/new"; git -C "${target}/new" push`)).deny?.includes(sid));
+    assert.equal((await engine.bash(`git -C "${elsewhere}" push`)).result, 'core reached');
+  }
+  const link = path.join(stateHome, 'via-subdir');
+  fs.symlinkSync(path.join(physical, 'sub'), link);
+  assert.ok((await engine.bash(`git -C "${link}/.." push`)).deny?.includes(sid));
+  write({ owner: null, cwd: legacy });
+  await engine.tick();
+  engine.setCwd(physical);
+  await engine.bash(`${RUNNER} status --session ${sid}`);
+  assert.ok((await engine.stop()).block?.includes(sid));
+  assert.ok((await engine.prompt('Progress?')).context?.join('').includes(sid));
+});
+
+await test('each live Claude session imports its own pane choices once across a shared store', async () => {
+  const env = { AGENT_DUET_HOME: path.join(tmp, 'two-panes') };
+  const store = new Map();
+  for (const sessionId of ['claude-a', 'claude-b']) {
+    const choices = { [sessionId + ':C1']: 'claude' };
+    const initialState = new Map([['codex-duet:focus', sessionId], ['codex-duet:choices', choices],
+      ['codex-duet:expanded', { [sessionId]: true }]]);
+    const args = { env, cwd: repo, initialState, sessionId, store };
+    if (sessionId === 'claude-b') initialState.set('codex-duet:prefs', { sound: false });
+    const engine = await boot(compiled, args);
+    assert.equal(engine.atoms.get('agent-duet:focus'), sessionId);
+    assert.deepEqual(engine.atoms.get('agent-duet:choices'), choices);
+    assert.deepEqual(engine.atoms.get('agent-duet:expanded'), { [sessionId]: true });
+    if (sessionId === 'claude-b') assert.equal(engine.atoms.get('agent-duet:prefs').sound, false);
+    initialState.set('agent-duet:focus', '');
+    initialState.set('agent-duet:choices', {});
+    const reload = await boot(compiled, args);
+    assert.equal(reload.atoms.get('agent-duet:focus'), '');
+    assert.deepEqual(reload.atoms.get('agent-duet:choices'), {});
+  }
+});
+
+await test('Stop refuses a live unrelated PID and a stale button without sending TERM', async () => {
+  const { engine, sid, write, stateHome } = await languageEngine({ language: 'en' });
+  const lock = path.join(stateHome, sid, 'lock');
+  write({ phase: 'awaiting-codex', pending: { round: 2, startedAt: ago(1000) } });
+  fs.writeFileSync(lock, String(process.pid)); // the test process is alive but owns no runner lock
+  await engine.tick();
+  const pane = await engine.render('Pane');
+  const result = await engine.command('duet', 'stop');
+  assert.doesNotMatch(result.text, /Stopping/);
+  assert.match(result.text, /verify|belongs|ownership/i);
+  fs.writeFileSync(lock, '0');
+  if (nodes(pane).some((n) => n.props.key === 'stop')) await engine.press(pane, 'stop');
+  assert.ok(!engine.procs.some((cmd) => cmd.startsWith('kill -TERM')));
+});
+
+await test('Stop selects the focused queued runner and revalidates the running pane button', async () => {
+  const stateHome = path.join(tmp, 'stop-runners');
+  const children = [];
+  const pluginAlias = path.join(tmp, 'installed plugin');
+  fs.symlinkSync(path.dirname(path.dirname(DUET)), pluginAlias);
+  const env = { ...baseEnv, AGENT_DUET_HOME: stateHome, AGENT_DUET_MAX_PARALLEL: '1',
+    AGENT_DUET_QUEUE_POLL_MS: '25', AGENT_DUET_KILL_GRACE_MS: '100', AGENT_DUET_TIMEOUT_MS: '15000',
+    FAKE_CODEX_SCRIPT: path.join(tmp, 'stop-script.json'), FAKE_CODEX_STATE: path.join(tmp, 'stop-calls.json') };
+  fs.writeFileSync(env.FAKE_CODEX_SCRIPT, JSON.stringify([{ hang: true, started: true }]));
+  const records = () => fs.existsSync(stateHome) ? fs.readdirSync(stateHome).flatMap((id) => {
+    try { return [JSON.parse(fs.readFileSync(path.join(stateHome, id, 'state.json'), 'utf8'))]; } catch { return []; }
+  }) : [];
+  const start = async (phase) => {
+    const child = spawn(process.execPath, [path.join(pluginAlias, 'scripts', 'duet.mjs'), 'start', '--kind', 'code'], { cwd: repo, env, stdio: 'ignore' });
+    children.push(child);
+    await waitFor(() => records().some((s) => s.phase === phase), 4000);
+    return records().find((s) => s.phase === phase).id;
+  };
+  try {
+    const running = await start('awaiting-codex');
+    const queued = await start('queued');
+    const ledger = path.join(stateHome, running, 'state.json');
+    const newest = new Date(Date.now() + 1000);
+    fs.utimesSync(ledger, newest, newest);
+    let duringStop;
+    const engine = await boot(compiled, { env, cwd: repo, options: { language: 'en' }, stopChildren: children,
+      onProcess: ([program]) => {
+        if (program === 'ps' && duringStop) {
+          duringStop();
+          duringStop = undefined;
+        }
+      },
+    });
+    assert.equal(engine.atoms.get('agent-duet:view').id, running, 'the default differs from the row to cancel');
+    const select = async (id) => engine.press(await engine.render('Pane'), `task-${id}`);
+    await select(running);
+    const runningPane = await engine.render('Pane');
+    const previous = fs.readFileSync(ledger, 'utf8');
+    const changed = JSON.parse(previous);
+    changed.pending.startedAt = ago(60_000); // same PID and round number, different attempt
+    fs.writeFileSync(ledger, JSON.stringify(changed));
+    await engine.press(runningPane, 'stop');
+    assert.match(engine.toasts.at(-1), /verify/);
+    fs.writeFileSync(ledger, previous);
+    // Even a real runner from the same project cannot be stopped using another session's lock.
+    const queuedLock = path.join(stateHome, queued, 'lock');
+    fs.writeFileSync(queuedLock, String(children[0].pid));
+    const mixed = await boot(compiled, { env, cwd: repo, options: { language: 'en' }, stopChildren: children });
+    await mixed.press(await mixed.render('Pane'), `task-${queued}`);
+    assert.match((await mixed.command('duet', 'stop')).text, /verify/);
+    fs.writeFileSync(queuedLock, String(children[1].pid));
+    await select(queued);
+    const stopped = await engine.command('duet', 'stop');
+    assert.match(stopped.text, /Stopping queued round 1/);
+    await waitFor(() => records().some((s) => s.id === queued && s.phase === 'codex-failed'));
+    assert.ok(records().some((s) => s.id === running && s.phase === 'awaiting-codex'));
+    const signals = () => engine.procs.filter((cmd) => cmd.startsWith('kill -TERM'));
+    assert.deepEqual(signals(), [`kill -TERM ${children[1].pid}`]);
+    await waitFor(() => children[1].exitCode !== null);
+    fs.rmSync(path.join(stateHome, queued), { recursive: true });
+
+    const lock = path.join(stateHome, running, 'lock');
+    const pid = fs.readFileSync(lock, 'utf8');
+    const times = fs.statSync(lock);
+    fs.utimesSync(lock, times.atime, new Date(ago(60_000))); // a new process using an old lock's PID
+    await engine.press(runningPane, 'stop');
+    assert.match(engine.toasts.at(-1), /verify/);
+    fs.utimesSync(lock, times.atime, times.mtime);
+
+    const otherScripts = path.join(tmp, 'different plugin', 'scripts');
+    fs.mkdirSync(otherScripts, { recursive: true });
+    const otherRunner = path.join(otherScripts, 'duet.mjs');
+    fs.writeFileSync(otherRunner, `import { openSync } from 'node:fs';
+      openSync(process.argv[3], 'r+'); process.send('ready'); setInterval(() => {}, 1000);`);
+    const other = spawn(process.execPath, [otherRunner, 'start', lock, DUET, 'retry', '--session', running],
+      { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
+    children.push(other);
+    let ready = false;
+    other.once('message', () => { ready = true; });
+    await waitFor(() => ready); // holds a read/write FD on the same inode, without owning its lock
+    fs.writeFileSync(lock, String(other.pid)); // stale pane, then a fresh view with an unrelated live PID
+    await engine.press(runningPane, 'stop');
+    assert.match(engine.toasts.at(-1), /verify/);
+    const fresh = await boot(compiled, { env, cwd: repo, options: { language: 'en' }, stopChildren: children });
+    assert.match((await fresh.command('duet', 'stop')).text, /verify/);
+    assert.equal(other.signalCode, null);
+    fs.writeFileSync(lock, pid);
+    const foreign = await boot(compiled, { env, cwd: repo, options: { language: 'en' }, sessionId: 'claude-other', stopChildren: children });
+    assert.match((await foreign.command('duet', 'stop')).text, /another Claude session/);
+    assert.ok(!nodes(await foreign.render('Pane')).some((n) => n.props.key === 'stop'));
+    duringStop = () => fs.writeFileSync(lock, String(other.pid));
+    await engine.press(runningPane, 'stop');
+    assert.match(engine.toasts.at(-1), /verify/);
+    fs.writeFileSync(lock, pid);
+    duringStop = () => fs.writeFileSync(ledger, JSON.stringify(changed));
+    await engine.press(runningPane, 'stop');
+    assert.match(engine.toasts.at(-1), /verify/);
+    fs.writeFileSync(ledger, previous);
+    duringStop = () => {
+      // A running turn observes a model and rewrites its ledger while Stop checks its process.
+      const state = JSON.parse(fs.readFileSync(ledger, 'utf8'));
+      state.pending.codexModel = { model: 'observed-during-the-turn' };
+      fs.writeFileSync(ledger, JSON.stringify(state));
+    };
+    await engine.press(runningPane, 'stop');
+    assert.match(engine.toasts.at(-1), /Stopping round 1/);
+    assert.equal(duringStop, undefined, 'the model update ran during the process check');
+    assert.deepEqual(signals(), [`kill -TERM ${children[1].pid}`, `kill -TERM ${pid}`]);
+    await waitFor(() => records().some((s) => s.id === running && s.phase === 'codex-failed'));
+  } finally {
+    for (const child of children) if (child.exitCode === null && child.signalCode === null) child.kill();
+    await waitFor(() => children.every((c) => c.exitCode !== null || c.signalCode !== null), 5000);
+  }
+});
+
+for (const language of ['en', 'ru', 'zh']) {
+  await test(`${language}: an issue-free escalation gives its reason and both request checks`, async () => {
+    const { engine, write, sid, stateHome } = await languageEngine({ language });
+    const reason = 'The reviewers disagree on the requested scope';
+    const check = (status, notes) => ({ status, notes });
+    write({ ...buildOf('scope'), phase: 'escalated', issues: {}, decision: { action: 'escalate', issues: [], reason },
+      rounds: [{ n: 1, verdict: 'approve', author: { request_check: check('narrowed', 'CSV export is missing') },
+        request_check: check('matches', 'CSV export is optional') }] });
+    const second = '20991231-000001-abcd';
+    fs.mkdirSync(path.join(stateHome, second));
+    fs.writeFileSync(path.join(stateHome, second, 'state.json'), JSON.stringify({
+      id: second, kind: 'code', cwd: repo, phase: 'awaiting-author', updatedAt: ago(1000),
+    }));
+    const newest = new Date(Date.now() + 1000);
+    fs.utimesSync(path.join(stateHome, sid, 'state.json'), newest, newest);
+    await engine.tick();
+    assert.ok(engine.toasts.some((line) => line.includes(reason)));
+    assert.ok(lines(await engine.render('AbovePrompt')).join('').includes(reason));
+    const pane = await engine.render('Pane');
+    assert.ok(nodes(pane).find((n) => n.props.key === `task-${sid}`).props.label.includes(reason));
+    for (const note of ['CSV export is missing', 'CSV export is optional']) assert.ok(lines(pane).join('\n').includes(note));
+    assert.ok(!nodes(pane).some((n) => n.props.key === 'send-decisions'));
+  });
+}
+
+await test('build scoreboard separates owner rulings from reviewer concessions', async () => {
+  const { engine, write } = await languageEngine({ language: 'en' });
+  const disputed = { action: 'disputed', round: 1, note: 'as specified' };
+  write({ ...buildOf('scores'), issues: {
+    C1: { ...issue('C1', 'withdrawn'), author: disputed, ownerRuled: true },
+    C2: { ...issue('C2', 'open'), author: disputed, ownerRuled: true },
+    C3: { ...issue('C3', 'withdrawn'), author: disputed },
+  } });
+  await engine.tick();
+  assert.ok(lines(await engine.render('Pane')).includes('Claude conceded: 1 · owner decisions: 2'));
+});
+
+await test('executed verification keeps an outstanding compound failure visible during the next turn', async () => {
+  const { engine, write } = await languageEngine({ language: 'en' });
+  write({ phase: 'awaiting-codex', pending: { round: 2, startedAt: ago(1000) }, rounds: [{
+    n: 1, verification: { label: 'executed', gaps: [], checks: [{
+      command: 'make unit && make smoke', outcome: 'failed', confirmation: 'confirmed',
+      events: [{ exit_code: 0 }, { exit_code: 23 }],
+    }] },
+  }] });
+  await engine.tick();
+  assert.ok(lines(await engine.render('Pane')).includes('failed: make unit && make smoke (exit 23)'));
+});
+
+await test('Stop recognizes fullwidth questions and closing Markdown, quotes and brackets', async () => {
+  const { engine, write } = await languageEngine({ language: 'zh' });
+  write();
+  await engine.tick();
+  for (const message of ['要继续吗？', '**May I proceed?**', 'Вопрос «Продолжить?»', '(Retry?)', '“继续吗？”', '【继续吗？】']) {
+    assert.equal((await engine.stop({ last_assistant_message: message })).block, undefined, message);
+  }
+  assert.ok((await engine.stop({ last_assistant_message: 'The output says “retry?”. I fixed it.' })).block);
+});
 
 const AGY_TEXT = {
   en: { thinking: '⏳ agy is thinking', writing: '⏳ agy is writing code', auditing: '⏳ agy is auditing',

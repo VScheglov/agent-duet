@@ -176,32 +176,35 @@ The module reads the session files every 2 seconds and shows the review that bel
 | **Toasts** | Round start and end, escalation, failure; after a round, a “continue agent-duet” suggestion (Tab) |
 | **Sound** | Escalation (your decision is needed), review completion, round failure, or a missing delegate process; Claude's own turns make no sound. Uses the Claude app's built-in sounds `tool_approval_needed`, `enter_voice_mode` and `disconnected`, played by the app rather than copied into the plugin. Without the app, fallback sounds from `sounds/` play |
 
+Each live Claude session carries its own selected task, pending choices and expanded issues over from codex-duet once. Saved settings apply across sessions.
+
 The pane, from top to bottom:
 
 - **Task list**, when there are several tasks: ⏳ running, ⏸ queued with its position, 🙋 needs you, ✅ done, with timer and model. Click a row for details.
 - **Status**: phase and round timer; model and effort, with ⚡ Fast only on Codex turns that use it; “Now: …” with the delegate's current command, or “thinking for N min” when its event stream has been quiet for more than two minutes, plus how long ago its conversation log was updated, when known (Codex's thread log can keep growing while it thinks silently).
+- **Verification** shows the command and exit code of an outstanding confirmed failure, even when every check ran and the receipt says `executed`. A later confirmed pass for the same command clears that warning.
 - **The delegate's words**: its latest message in full, rendered as Markdown (paragraphs, lists, `code`), with its age if older than two minutes; its actions (“runs tests …”, “runs a Python script”); its plan.
+- **On escalation**, the pane shows the reason. For disputed issues, choose a side and send the decisions to Claude. For a disagreement about the request with no open issues, read each side’s recorded assessment.
 - **Issue board**: ● open, ⏸ parked, ✓ fixed, ↩ withdrawn, ⚔×N disputes, and a ▰▱ bar of closed issues out of all (N/M). Titles wrap instead of being cut off; ▸ expands both sides' statements; closed issues stay collapsed while any are open.
-- **On escalation**: the delegate's and Claude's positions, buttons to choose who is right, and “Send decisions to Claude”.
-- **At the bottom**: the scoreboard, round history, a Stop button (it also stops a queued turn) and collapsed Settings.
+- **The scoreboard** counts an owner’s ruling on a build issue separately from a reviewer’s concession. Round history and Settings follow.
 
 Pane text wraps to fit; only task-list rows and delegate commands are truncated.
 
 ### Keeping the loop going
 
-If a session is waiting for Claude (to answer issues, or to review a build round) and Claude ends its turn, the module sends Claude back to the loop once, through the `Stop` hook. It does not do so when:
+The reminder and the context summary cover every active task this Claude session drives, even after hundreds of newer sessions. If a session is waiting for Claude (to answer issues, or to review a build round) and Claude ends its turn, the module sends Claude back to the loop once, through the `Stop` hook. The reminder stays quiet in these cases.
 
-- Claude has asked you a question;
-- you sent a message and Claude answered it without touching the loop;
-- a background task is running or a session wake-up is scheduled;
-- the session is waiting for your decision (escalation);
-- Claude has just been sent back to the loop already.
+- Claude has asked you a question. The hook recognizes both `?` and `？`, including when Markdown, quotes or brackets follow the question mark.
+- You sent a message and Claude answered it without touching the loop.
+- A background task is running or a session wake-up is scheduled.
+- The session is waiting for your decision (escalation).
+- Claude has just been sent back to the loop.
 
 ### Git write guard
 
-While a code review or a build is active (and for 12 hours after its last turn), Claude cannot run `git commit`, `push` or `stash` in that repository (for a build, in its worktree), from any session. The guard catches Claude's slips; it is not a sandbox.
+The guard helps prevent accidental Git writes by Claude. It covers every code review and build in an active phase whose ledger was updated within the last 12 hours. From any Claude session it blocks `git commit`, `push` and `stash` in the reviewed repository or build worktree. Symlinks, including the old `codex-duet` name for a migrated worktree, resolve to the same directory.
 
-- **Recognized:** quoted paths, `cd`/`pushd`, Git global options, environment assignments, command wrappers, compound commands, substitutions, `eval`, shell `-c`, and heredocs fed to a shell. When both a Git directory and a work tree are given, a write is blocked if either is in a guarded tree.
+- **Recognized:** quoted paths, `cd`/`pushd`, Git global options, environment assignments, command wrappers, compound commands, substitutions, `eval`, shell `-c`, and heredocs or here-strings fed to a shell. The guard follows alternative paths through `&&`, `||`, `if` and `case`, directory-stack rotations such as `pushd +1`, exported Git paths, `env -S`, `git --attr-source` and shell options such as `+o` and `-c --`. When both a Git directory and a work tree are given, a write is blocked if either is in a guarded tree.
 - **Blocked to be safe:** a Git write whose directory depends on variables, substitutions or globs, whenever any session is guarded. If parsing fails (for example, on excessive nesting), any command containing the word `git` is blocked while a session is guarded; other commands pass.
 - **Allowed:** quoted mentions, comments, data heredocs, `stash list` and `stash show`.
 - **Not recognized:** Git aliases (`git ci`, `git -c alias.x=commit x`), scripts and Makefiles that commit (`sh release.sh`, `npm run release`), and other commands assembled at run time.
@@ -212,7 +215,7 @@ Your messages in the reviewed project get a session summary attached, so Claude 
 
 ### Pane commands
 
-`/duet` opens the pane; `/duet stop` stops the current round (continue later with `retry`); `/duet band|toasts|score|sound on|off` turns interface features on or off (the same buttons are in Settings at the bottom of the pane); `/duet sound test` or the “▶ Sounds” button plays all three sounds in turn. The module never writes session files; it only leaves a one-line `.ui-trace.json` trace for debugging.
+`/duet` opens the pane. The Stop button and `/duet stop` stop the selected running or queued round. Before sending TERM, the module checks the Claude session and the selected attempt. It uses `ps` to verify the runner command and start time for the PID in the session lock. A PID can still be reused between that check and the signal. If the host cannot verify the process identity, Stop explains why it refused. Resume a stopped round with `retry`. Use `/duet band|toasts|score|sound on|off` or the Settings buttons to toggle interface features. Use `/duet sound test` or “▶ Sounds” to play the three sounds in turn. The module never writes session files; it only leaves a one-line `.ui-trace.json` trace for debugging.
 
 ## Engine differences
 

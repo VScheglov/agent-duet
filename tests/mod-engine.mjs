@@ -75,7 +75,7 @@ function entry(dir, d) {
 }
 
 // root: where the plugin is installed, as $.plugin.root tells the module; the test's checkout by default
-export async function boot(file, { env, cwd, options = {}, settings = {}, initialState = new Map(), store = new Map(), defaultsResult = { exitCode: 1, stdout: '', stderr: '' }, sessionId = 'claude-me', root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..') }) {
+export async function boot(file, { env, cwd, options = {}, settings = {}, initialState = new Map(), store = new Map(), stopChildren = [], onProcess, defaultsResult = { exitCode: 1, stdout: '', stderr: '' }, sessionId = 'claude-me', root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..') }) {
   // Preference migration reads plugin-scoped JSON too; never consult the owner's store in a test.
   env = { CLAUDE_CONFIG_DIR: path.join(path.dirname(file), 'claude-config'), ...env };
   // a fresh module instance per boot, so its module-level state starts empty, as after a reload
@@ -87,7 +87,7 @@ export async function boot(file, { env, cwd, options = {}, settings = {}, initia
   const stored = store;
   const timers = [];
   // sounds: an afplay'd file by its name, an engine-played clip by its asset path
-  const seen = { toasts: [], sounds: [], statuses: [], opened: [], suggested: [], submitted: [], procs: [] };
+  const seen = { toasts: [], sounds: [], statuses: [], opened: [], suggested: [], submitted: [], procs: [], reads: [] };
   // files the test decides exist or not, whatever the disk says (the Claude app's sounds)
   const fakeFiles = new Map();
   let afplayExit = 0;
@@ -127,15 +127,25 @@ export async function boot(file, { env, cwd, options = {}, settings = {}, initia
         return { kind: st.isDirectory() ? 'dir' : st.isFile() ? 'file' : 'other', size: st.size, mtimeMs: st.mtimeMs, isLink: fs.lstatSync(p).isSymbolicLink(), ...(options?.resolve ? { realPath: fs.realpathSync(p) } : {}) };
       },
       read: async (p) => {
+        seen.reads.push(p);
         if (fs.statSync(p).size > 4_194_304) throw new Error(`${p}: over 4 MiB`); // as the engine refuses
         return fs.readFileSync(p, 'utf8');
       },
       write: async (p, text) => fs.writeFileSync(p, text),
     },
-    // kill -0 asks whether a pid lives; other signals are only recorded, never sent; afplay plays nothing
+    // Stop can signal only children owned by its integration test. afplay plays nothing.
     process: {
-      run: async (argv) => {
+      run: async (argv, options) => {
         seen.procs.push(argv.join(' '));
+        onProcess?.(argv);
+        if (argv[0] === 'ps') {
+          const r = spawnSync('ps', argv.slice(1), { encoding: 'utf8', env: { ...process.env, ...options?.env } });
+          return { exitCode: r.status ?? 1, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
+        }
+        if (argv[0] === 'kill' && argv[1] === '-TERM') {
+          const child = stopChildren.find((c) => c.pid === Number(argv[2]) && c.exitCode === null && c.signalCode === null);
+          return { exitCode: child?.kill('SIGTERM') ? 0 : 1, stdout: '', stderr: '' };
+        }
         if (argv[0] === 'defaults') {
           if (defaultsResult instanceof Error) throw defaultsResult;
           return defaultsResult;

@@ -140,6 +140,22 @@ async function paneOver($: Engine, on: On, surface: typeof SURFACES[number], fil
 }
 
 const LANGUAGES = ['ru', 'en', 'zh'] as const
+test('executed receipt shows the outstanding failure and its exit code', { options: { language: 'en' } }, async ($, on) => {
+  const check = (command: string, ok: boolean) => ({
+    command, outcome: ok ? 'passed' : 'failed', confirmation: 'confirmed', note: '',
+    event: { command, exit_code: ok ? 0 : 7, status: ok ? 'completed' : 'failed' },
+  })
+  const state = { ...JSON.parse(STATE), owner: 'claude-me', phase: 'done',
+    rounds: [{ n: 1, verification: { label: 'executed', gaps: [], checks: [
+      check('make lint', false), check('make lint', true), check('make test', false),
+    ] } }, { n: 2, kind: 'post-approval' }] }
+  const ui = await paneOver($, on, 'desktop', { [`${ID}/state.json`]: JSON.stringify(state) })
+  expect(await ui.find({ type: 'Text', text: '✅ done · verification: executed' })).toBeDefined()
+  expect((await ui.find({ type: 'Text', text: 'failed: make test (exit 7)' }))?.props.color).toBe('yellow')
+  expect(await ui.find({ type: 'Text', text: /failed: make lint/ })).toBeUndefined()
+  await ui.unmount()
+})
+
 const TEXT = {
   ru: {
     title: JSON.parse(STATE).issues.C1.title as string,

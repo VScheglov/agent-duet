@@ -70,11 +70,13 @@ export type DuetView = {
   phase: string
   isActive: boolean
   runningRound: number | null
+  attemptAt: string | null // queuedAt or startedAt identifies the displayed attempt across retries
   elapsedMs: number
   pid: number
   isProcessGone: boolean
   failure: string
   decision: { action: string; reason: string; issues: string[] } | null
+  requestChecks: { who: string; status: string; notes: string }[]
   verification: DuetVerification | null // the latest real Codex turn; null for audits
   readOnlyViolations: DuetReadOnlyViolation[] // cumulative read-only changes reported by the runner
   issues: DuetIssue[]
