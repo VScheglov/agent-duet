@@ -28,7 +28,9 @@ const script = JSON.parse(fs.readFileSync(process.env.FAKE_CODEX_SCRIPT, 'utf8')
 const statePath = process.env.FAKE_CODEX_STATE;
 const state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, 'utf8')) : { calls: [] };
 const step = script[state.calls.length];
-state.calls.push({ args, prompt, cwd: process.cwd() });
+const call = { args, prompt, cwd: process.cwd() };
+if (step?.probeEnv) call.gitSelectors = step.probeEnv.filter((key) => key in process.env);
+state.calls.push(call);
 fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
 
 // Like a stuck MCP server: ignores SIGTERM, outlives us.
@@ -41,13 +43,13 @@ function stubbornDescendant(kind) {
 }
 
 // One log file per thread, appended to on every turn, like Codex's own.
-function logSettings(threadId, tier) {
+function logRecord(threadId, type, payload) {
   const dir = path.join(process.env.CODEX_HOME, 'sessions', '2026', '10', '04');
   fs.mkdirSync(dir, { recursive: true });
   const record = {
     timestamp: new Date().toISOString(),
-    type: 'event_msg',
-    payload: { type: 'thread_settings_applied', thread_id: threadId, thread_settings: { model: 'gpt-6.1-sol', service_tier: tier } },
+    type,
+    payload,
   };
   fs.appendFileSync(path.join(dir, `rollout-2026-10-04T00-00-00-${threadId}.jsonl`), `${JSON.stringify(record)}\n`);
 }
@@ -69,19 +71,23 @@ function emitCommands() {
 }
 const resume = args[0] === 'exec' && args[1] === 'resume';
 const threadId = resume ? args[2] : crypto.randomUUID();
-if (step.hang) {
-  if (step.started) {
-    if (step.tier) logSettings(threadId, step.tier);
-    emit({ type: 'thread.started', thread_id: threadId });
+// Opening a thread and accepting a user message are separate events.
+if (!step.hang || step.started) {
+  if (!step.noRollout) {
+    if (!resume) logRecord(threadId, 'session_meta', { id: threadId });
+    if (step.tier) logRecord(threadId, 'event_msg', { type: 'thread_settings_applied', thread_id: threadId, thread_settings: { service_tier: step.tier } });
+    if (!step.threadOnly) logRecord(threadId, 'event_msg', { type: 'user_message', message: prompt });
   }
+  emit({ type: 'thread.started', thread_id: threadId });
+  if (!step.threadOnly && !step.rolloutOnly) emit({ type: 'turn.started' });
+}
+if (step.interrupt) process.exit(1);
+if (step.hang) {
   emitCommands();
   if (step.descendant) stubbornDescendant(step.descendant);
   if (step.ignoreTerm) process.on('SIGTERM', () => {});
   setInterval(() => {}, 1000);
 } else {
-  if (step.tier) logSettings(threadId, step.tier);
-  emit({ type: 'thread.started', thread_id: threadId });
-  emit({ type: 'turn.started' });
   emitCommands();
   if (step.delayMs) await new Promise((resolve) => setTimeout(resolve, step.delayMs));
   // build mode: the implementer edits files in its working directory, the worktree

@@ -15,7 +15,7 @@ For each issue above, act and answer in `responses`:
 - fixed: make the change in the worktree, verify it, and say what changed and where (path:line).
 - disputed: the issue does not hold or is not worth it. Give evidence (code, command output, the specification); do not repeat an argument the architect has already answered.
 - needs-user: the call belongs to the owner (a product decision, a conflict with the specification). Say exactly what has to be decided.
-An issue marked "Owner decision (final)" is the owner's final ruling: follow it regardless of the reply's language. A reply introduced by "Owner decision", "Решение владельца", or "所有者决定" also conveys that ruling.
+Follow the ruling on the "Owner decision (final)" line for each issue. The architect's later comments can supply further details.
 Also:
 - A request ruling marked "Owner decision (final)" is an accepted amendment to the original request. Follow it without relitigating the settled scope; continue reporting new gaps in request_check and questions, and answer any new "Request: " issues through the normal issue protocol.
 - Answer every issue listed above, exactly once.

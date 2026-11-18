@@ -78,6 +78,8 @@ claude plugin install agent-duet --marketplace VScheglov/agent-duet
 
 **谁来运行命令。** 你只需与 Claude 对话，Claude 通过运行器的子命令推进会话：`start`、`reply`、`review`、`retry`、`verify`、`finish`、`discard` 和 `status`。本文提到这些子命令时，都由 Claude 替你运行：直接提出要求即可，例如“重试中断的那一轮”或“完成 build”。
 
+在源仓库或 build 的 worktree 中运行 `list` 即可找到对应的会话。如果有多个匹配项，请用 `--session <id>` 指定 `status`、`verify` 等命令要操作的会话。
+
 **引擎**在会话开始时用 `--engine codex|agy` 选择。省略时先取 `AGENT_DUET_ENGINE`，再默认为 `codex`。会话会固定使用所选引擎：`reply`、`review` 和 `retry` 都不能更换，要换引擎请新建会话。0.12.0 之前的会话没有引擎字段，仍按 Codex 会话处理。
 
 **两个引擎通用的选项：** `--max-rounds N`（默认 10）、`--model`、`--effort`、`--timeout-min`（每轮时限，默认不限制）和 `--sandbox`（默认 `inherit`）。`reply`、`review` 和 `retry` 可以更换模型或推理级别。各引擎如何理解这些选项，见[引擎差异](#引擎差异)。
@@ -126,6 +128,10 @@ reply ─► 引擎（同一会话，resume）：resolved · withdrawn · open +
 4. Claude 查看本轮 diff，亲自在 worktree 中运行测试，并提出 C1…Cn 等问题。引擎修复或提出异议。[停止策略](#停止策略scriptspolicymjs)与审查模式相同；僵局交给你裁决（也会显示在 `/duet` 面板中）。
 5. 全部达成一致并经你同意后，`finish` 将改动提交到分支并删除 worktree；分支由你自己合并。Conventional Commits 格式的标题（`feat: …`、`fix(scope)!: …`）原样作为提交主题；其他标题会加上 `agent-duet: ` 前缀，已有该前缀时不重复添加。提交正文注明完成实现的引擎以及 Claude 的审查。`discard` 会同时删除 worktree 和分支。
 
+两条命令都会确认注册的 worktree 仍检出 build 分支，且分支指向预期的提交。若本轮中止或失败，待引擎退出后即可选择 `discard` 或 `finish --unreviewed`。对于已经完成或丢弃的 build，`discard` 会拒绝操作。
+
+如果 build 分支已经指向其他提交，`finish`（包括 `--unreviewed`）和 `discard` 都会停止。在 build 的 worktree 中运行提示里的 `git log --oneline <base>..<branch>`，查看该分支上的提交。你可以手动完成该分支的工作。要继续使用运行器，请先用另一条分支保存当前提交，再在 build 的 worktree 中运行 `git reset --soft <base>`，然后重新执行原命令。软重置会保留暂存区和工作区里的内容。
+
 批准之后的改动会作为新一轮审查返回，见[验证与完整性检查](#验证与完整性检查)。给 Claude 的说明在 `references/build.md` 中。
 
 ## audit 模式：引擎只检查，不修改
@@ -148,7 +154,7 @@ reply ─► 引擎（同一会话，resume）：resolved · withdrawn · open +
 
 **时间。** 引擎每轮耗时较长，build 尤其如此，因此 Claude 在后台运行 `start`、`reply`、`review` 和 `retry`，并设置 `timeout: 43200000`（12 小时）。Claude Code 后台命令的上限为 `max(2 小时, BASH_MAX_TIMEOUT_MS)`，超过上限的超时值会被静默截断；如何提高到 12 小时，见[安装](#将后台命令时限设为-12-小时推荐)。未明确设置 `timeout` 时，前台命令可运行 2 分钟，后台命令可运行 30 分钟。除非传入 `--timeout-min N`，运行器自身不限制每轮时间。0.6.0 之前创建的会话保留旧的 60 分钟限制；用 `retry --timeout-min 0`（或 `reply` / `review`）即可取消。
 
-**中断的一轮。** 如果引擎开始工作后这一轮被中断（后台命令超时、点击“停止”或 CLI 崩溃），`retry` 会用简短的“从中断处继续”提示恢复同一段对话，第一轮也一样。只要对话仍可用，引擎已完成的工作和读过的内容就会保留：Codex 需要 `~/.codex/sessions` 中的线程日志；agy 需要其目录中的对话 `.db`，并通过 `--conversation` 恢复。否则这一轮会重新开始。`retry --fresh` 总是重新开始，但不会撤销磁盘上已有的改动。
+**中断的一轮。** 如果引擎尚未确认收到本轮提示，`retry` 会重新发送完整提示及反馈，并尽量沿用原对话。确认送达后，运行器会用简短提示继续本轮。agy 的 `init` 事件提供对话 ID。运行器收到 `user_input` 或后续步骤时才确认提示已送达。恢复代码审查时，批准仍针对最初提交的快照。Codex 可以读取 `~/.codex/sessions` 下的 `.jsonl` 或 `.jsonl.zst` 线程日志。agy 使用 `--conversation` 恢复有 `.db` 文件的对话。如果对话丢失，或你选择 `retry --fresh`，运行器会新建对话。从第二轮起，它会恢复原始任务、问题记录和本轮反馈。已经写入磁盘的文件会保留。
 
 **同时处理多个任务。** 可以同时委派多个任务：每个 build 都有独立的 worktree 和分支。同一台机器最多同时运行十轮引擎任务（`AGENT_DUET_MAX_PARALLEL`），其余任务按顺序在队列中等待（阶段为 `queued`），有空位时自动启动。每个正在运行的一轮都会启动其引擎配置中的所有 MCP 服务器，因此没有队列时，十个任务就可能产生数百个进程。只有引擎工作时才占用名额，Claude 审查期间不占用。排队时间计入后台命令的时限（默认 2 小时，按推荐设置为 12 小时），所以最好一次只安排几个任务，而不是几十个。
 
@@ -158,7 +164,7 @@ reply ─► 引擎（同一会话，resume）：resolved · withdrawn · open +
 
 **你的要求。** 在 `plan`、`code` 和 `file` 审查中，Claude 会传入 Markdown 简报（`start --brief <file|->`），包含三个章节：`## Owner's request`（你的原话，必填）、`## Accepted amendments`（只列你已接受的修改，并注明来源）和 `## Claimed result`（作品作者声称达到的结果）。build 规格本身必须包含要求，可以列出已接受的修改，但不使用单独的 `--brief`。audit 不接受简报。引擎，以及批准 build 之前的 Claude，各自报告 `request_check`：工作是否符合你的要求。引擎在审查中报告的需求缩减，或 build 中双方的分歧，都会交给你裁决。摘要、`status` 和报告都会显示两项检查。
 
-**批准与已审查的目录树绑定。** 在 build 中，`finish` 会核对 worktree 以及钩子运行后的提交；批准后发生变化的内容会作为新一轮审查返回，分支上不保留该提交。只有在你明确要求时，`finish --unreviewed` 才会跳过这些检查，并在提交和报告中记录这一选择。code 审查之后、你提交之前，请让 Claude 运行 `verify`；如果内容与审查过的版本不同，Claude 会用输出中的 `reply` 命令把它交回引擎。路径会标记为 `covered`、`edited-after-review` 或 `never-reviewed`。
+**批准与已审查的目录树绑定。** `finish` 在提交前检查工作区，并在钩子运行后再次检查提交和工作区。只要内容有变，运行器就会撤销本次提交，把改动交回审查，包括钩子留下的新文件。经你明确要求，`finish --unreviewed` 会在提交和报告中记录这一决定，即使改动为空。代码审查后，请在手动提交前运行 `verify`。可以在暂存前检查，也可以只暂存一部分已审查的文件。工作区和每项已暂存的改动都必须与批准的快照一致。尚未暂存的改动标为 `not staged`。如果看到 `unapproved staged content`，请在提交前修正该路径的暂存内容。如果工作文件发生了变化，请使用输出中的 `reply` 命令再次审查。路径标记为 `covered`、`edited-after-review` 或 `never-reviewed`。build 完成后，`verify` 会检查对应分支，若分支已删除则会说明原因。
 
 **问题中的引文。** 每个问题都会引用它所针对的代码行。记录一轮之前，未关闭问题中新增或修改的引文会与已审查的快照核对，并标记为 `ok`、`moved:<L>`（在第 L 行找到）、`other_file:<F>`（在文件 F 中找到）、`MISSING` 或 `unchecked`。关闭问题的回复和未改动的引文保留之前的标记。摘要和提示词会显示引文问题，报告保留这些标记，`/duet` 只在未关闭的问题上标出未找到或位于其他文件的引文。标记不会关闭问题，也不会改变停止决定；`MISSING` 表示需要重新引用，而不是否定该问题。
 

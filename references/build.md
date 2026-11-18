@@ -98,10 +98,13 @@ Use `matches` when the owner settles that the request is met, or `narrowed-accep
 
 After `DONE` (or whenever the user decides to stop), present the result and its verification label, explaining failed or missing checks and gaps when it is not `executed`, then ask. A post-approval round has no receipt; summaries, reports and the pane retain the latest real delegate turn's label.
 
-The choices are:
+Both commands verify the registered worktree, its attached branch and the expected commit before making changes. Once a stopped or failed delegate exits, the owner can choose either to discard its partial work or to finish it unreviewed.
 
-- `finish --session <id>` commits only the approved content on its branch with the spec title as the subject and removes the worktree; the summary prints how to look at, merge or drop the branch. It compares the worktree and the resulting commit tree with the approved snapshot. Drift, including content changed by commit hooks, leaves no commit on the branch and returns the changes as a new review round: continue with the printed `review` command. The paths are labeled `covered`, `edited-after-review`, or `never-reviewed`.
-- Without an approval, finish refuses. Use `finish --unreviewed --session <id>` only on the owner's explicit word to commit the current content anyway; the commit body and report record the round and phase. `verify --session <id>` checks the worktree against the approval without finishing (or checks the branch commit after the worktree is removed).
-- `discard --session <id>` removes the worktree and deletes the branch.
+If the branch has moved, the error identifies the build worktree and prints the `git log` range from the session base to the branch tip. The owner can finish the branch by hand. To continue the session, save the current tip on a backup branch, run the printed `git reset --soft` in the build worktree, and rerun the original command. The soft reset preserves the index and working files.
+
+- `finish --session <id>` compares the worktree with the approved snapshot, commits on the build branch, and checks both the commit and the files left by hooks. A change at either check returns the files as a review round and undoes any finish commit. Continue with the printed `review` command. A successful finish removes the clean worktree and prints the branch and commit.
+- Use `finish --unreviewed --session <id>` only on the owner's explicit word. The commit body and report record the round and phase, including when the tree has no changes to commit.
+- `verify --session <id>` checks the worktree and reports staged differences. If nothing is staged in a build, it reports that `finish` will stage the worktree. A divergent partial staging fails verification. After finish it checks the branch commit and reports if the branch has been deleted.
+- `discard --session <id>` removes the worktree and deletes the session's branch. It refuses a finished or previously discarded build.
 
 Both change the user's repository: run them only after the user agrees.

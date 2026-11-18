@@ -25,6 +25,10 @@ const baseEnv = {
   AGENT_DUET_ENGINE: 'codex',
   AGENT_DUET_HOME: home,
   AGENT_DUET_CODEX_BIN: path.join(HERE, 'fake-codex.mjs'),
+  AGENT_DUET_AGY_BIN: path.join(HERE, 'fake-agy.mjs'),
+  AGENT_DUET_AGY_HOME: path.join(tmp, 'agy-home'),
+  FAKE_AGY_SCRIPT: scriptFile,
+  FAKE_AGY_STATE: fakeState,
   AGENT_DUET_POLICY: path.join(HERE, 'fixture-policy.mjs'),
   FAKE_CODEX_SCRIPT: scriptFile,
   FAKE_CODEX_STATE: fakeState,
@@ -290,9 +294,13 @@ await test('a failed round blocks reply until retry; the owner decision is final
   assert.equal(lockHolderPid(id), '', 'the lock is released');
 });
 
-await test('status finds the session from a subdirectory', () => {
+await test('status asks for a session when a subdirectory belongs to multiple reviews', () => {
   fs.mkdirSync(path.join(repo, 'sub'));
-  const r = duet(['status'], { cwd: path.join(repo, 'sub') });
+  const cwd = path.join(repo, 'sub');
+  const ambiguous = duet(['status'], { cwd });
+  assert.equal(ambiguous.code, 2);
+  assert.match(ambiguous.err, /--session/);
+  const r = duet(['status', '--session', id], { cwd });
   assert.equal(r.code, 0, r.err);
   assert.match(r.out, new RegExp(id));
 });
@@ -940,6 +948,7 @@ await test('approval: code verify and done status detect edits, and the printed 
   const sid = sessionId(start.out);
   const approved = state(sid).approval;
   assert.equal(approved.tree, state(sid).rounds[0].snapshot.tree);
+  git(['add', 'reviewed.txt'], dir);
   const index = git(['ls-files', '--stage'], dir);
   const verify = duet(['verify', '--session', sid], { cwd: dir });
   assert.equal(verify.code, 0, verify.err);
@@ -949,7 +958,7 @@ await test('approval: code verify and done status detect edits, and the printed 
   assert.match(duet(['status', '--session', sid]).out, /matches the approved tree\n$/);
   fs.writeFileSync(path.join(dir, 'reviewed.txt'), 'edited\n');
   fs.writeFileSync(path.join(dir, 'new.txt'), 'new\n');
-  const drift = duet(['verify'], { cwd: dir });
+  const drift = duet(['verify', '--session', sid], { cwd: dir });
   assert.equal(drift.code, 1, drift.err);
   assert.match(drift.out, /edited-after-review.*reviewed\.txt/);
   assert.match(drift.out, /never-reviewed.*new\.txt/);
@@ -969,6 +978,7 @@ await test('approval: code verify and done status detect edits, and the printed 
   assert.equal(calls().length, 2);
   assert.match(calls()[1].prompt, /\+edited/);
   assert.notEqual(state(sid).approval.tree, approved.tree);
+  git(['add', '-A'], dir);
   assert.equal(duet(['verify', '--session', sid]).code, 0);
 });
 
@@ -981,6 +991,7 @@ await test('approval: classification includes deletions, renames by path, mode-o
   fs.chmodSync(path.join(dir, 'mode.sh'), 0o755);
   const strange = 'space\tline\n.txt';
   fs.writeFileSync(path.join(dir, strange), 'approved\n');
+  git(['add', '-A'], dir);
   scriptCodex([turn('approve', [], matchingRequest)]);
   const start = duet(['start', '--kind', 'code'], { cwd: dir, env: realPolicy });
   assert.equal(start.code, 0, start.err);
@@ -1675,7 +1686,7 @@ await test('retry: a first turn cut off after Codex began it goes on in its own 
 });
 
 await test("retry: without Codex's log of the cut-off thread, or with --fresh, the turn starts over", () => {
-  scriptCodex([{ hang: true, started: true }, { hang: true, started: true, tier: 'default' }, turn('approve', [])]);
+  scriptCodex([{ hang: true, started: true, noRollout: true }, { hang: true, started: true, tier: 'default' }, turn('approve', [])]);
   fs.writeFileSync(path.join(tmp, 'over.md'), 'x\n');
   const sid = retrySid(duet(['start', '--kind', 'file', '--subject', 'over.md'], { cwd: tmp, env: cutOff }).err);
   // the first attempt named a thread but left no log of it: nothing to go on with
@@ -1701,6 +1712,564 @@ await test('retry: a build cut off in its first turn goes on in its own thread',
   assert.match(calls()[1].prompt, /<interrupted_turn>/);
   assert.equal(state(sid).phase, 'awaiting-review');
   assert.equal(state(sid).codex.threadId, thread);
+});
+
+// Retry delivery, approval integrity and build finalization through the CLI.
+const buildAnswer = { summary: 'Implemented.', responses: [], questions: [], request_check: matchingRequest, checks: [], gaps: [] };
+const codeAnswer = { verdict: 'approve', summary: 'Reviewed.', issues: [], request_check: matchingRequest, checks: [], gaps: [] };
+
+for (const engine of ['codex', 'agy']) {
+  await test('integrity/' + engine + ' round 1 retries according to prompt delivery', () => {
+    const attempts = engine === 'codex'
+      ? [[{ fail: 'startup failed' }, false], [{ threadOnly: true, interrupt: true }, false], [{ rolloutOnly: true, interrupt: true }, true]]
+      : [
+        [{ fail: 'MCP unavailable' }, false],
+        [{ noUserInput: true, noResult: true, exitCode: 1 }, false],
+        [{ noInit: true, noResult: true, exitCode: 1 }, true],
+        [{ noUserInput: true, noResult: true, exitCode: 1, updates: [{ step_index: 1, step_type: 'agent_response', state: 'ACTIVE' }] }, true],
+      ];
+    for (const [failure, delivered] of attempts) {
+      scriptCodex([failure, { reply: buildAnswer }]);
+      const start = duet(['start', '--kind', 'build', '--engine', engine, '--subject', '-'], { input: requestSpec });
+      assert.equal(start.code, 1, start.err);
+      const sid = retrySid(start.err);
+      const retried = duet(['retry', '--session', sid]);
+      assert.equal(retried.code, 0, retried.err);
+      const call = calls()[1];
+      assert.equal(call.prompt.includes('<interrupted_turn>'), delivered);
+      assert.equal(call.prompt.includes(requestSpec.trim()), !delivered);
+      assert.equal(call.args.includes(engine === 'agy' ? '--conversation' : 'resume'), !failure.fail);
+    }
+  });
+
+  for (const kind of ['code', 'build']) {
+    await test('integrity/' + engine + ' resends undelivered round 2 ' + kind + ' feedback in the original conversation', () => {
+      const cwd = approvalRepo();
+      fs.writeFileSync(path.join(cwd, 'reviewed.txt'), 'first round\n');
+      const first = kind === 'build' ? buildAnswer : { ...codeAnswer, verdict: 'revise', issues: [
+        issue('C1', 'open', 'high', { path: '', line: 0, quote: '' }),
+      ] };
+      scriptCodex([{ reply: first }, { fail: 'startup failed' }, { reply: kind === 'build' ? buildAnswer : codeAnswer }]);
+      const start = duet(['start', '--engine', engine, '--kind', kind, ...(kind === 'build' ? ['--subject', '-'] : [])], { cwd, input: requestSpec });
+      assert.equal(start.code, 0, start.err);
+      const sid = sessionId(start.out);
+      const thread = state(sid).codex.threadId;
+      const feedback = 'Preserve both exports on retry.';
+      const change = kind === 'build'
+        ? duet(['review', '--session', sid, '--issues', '-'], { input: reviewJSON('revise', [reviewIssue('C1', 'open', { body: feedback })]) })
+        : duet(['reply', '--session', sid, '--responses', '-'], { input: responses('feedback', [{ id: 'C1', action: 'fixed', note: feedback }]) });
+      assert.equal(change.code, 1, change.err);
+      const retry = duet(['retry', '--session', sid]);
+      assert.equal(retry.code, 0, retry.err);
+      assert.ok(calls()[2].args.includes(thread));
+      assert.ok(calls()[2].prompt.includes(feedback), 'round 2 feedback must reach the delegate');
+      assert.doesNotMatch(calls()[2].prompt, /<interrupted_turn>/);
+    });
+  }
+}
+
+await test('integrity/agy replays round 2 feedback when init is the only event', () => {
+  const cwd = approvalRepo();
+  scriptCodex([{ reply: buildAnswer }, { noUserInput: true, noResult: true, exitCode: 1 }, { reply: buildAnswer }]);
+  const start = duet(['start', '--kind', 'build', '--engine', 'agy', '--subject', '-'], { cwd, input: requestSpec });
+  assert.equal(start.code, 0, start.err);
+  const sid = sessionId(start.out);
+  const conversation = state(sid).codex.threadId;
+  const feedback = 'Retain the export headers in both formats.';
+  const failed = duet(['review', '--session', sid, '--issues', '-'], {
+    input: reviewJSON('revise', [reviewIssue('C1', 'open', { body: feedback })]),
+  });
+  assert.equal(failed.code, 1, failed.err);
+  const retried = duet(['retry', '--session', sid]);
+  assert.equal(retried.code, 0, retried.err);
+  const retry = calls()[2];
+  assert.equal(retry.args[retry.args.indexOf('--conversation') + 1], conversation);
+  assert.ok(retry.prompt.includes(feedback), 'init alone must replay the round feedback');
+  assert.doesNotMatch(retry.prompt, /<interrupted_turn>/);
+});
+
+await test('integrity/resumed code approval names the submitted snapshot', () => {
+  const cwd = approvalRepo();
+  const file = path.join(cwd, 'reviewed.txt');
+  fs.writeFileSync(file, 'submitted for review\n');
+  scriptCodex([{ interrupt: true }, { reply: codeAnswer }]);
+  const start = duet(['start', '--kind', 'code'], { cwd });
+  assert.equal(start.code, 1, start.err);
+  const sid = retrySid(start.err);
+  const submitted = /snapshot \(git tree object\): (\w+)/.exec(calls()[0].prompt)[1];
+  fs.writeFileSync(file, 'edited after interruption\n');
+  assert.equal(duet(['retry', '--session', sid]).code, 0);
+  assert.match(calls()[1].prompt, /<interrupted_turn>/);
+  assert.equal(state(sid).approval.tree, submitted);
+  assert.equal(duet(['verify', '--session', sid]).code, 1);
+});
+
+for (const recovery of ['missing', 'fresh', 'compressed']) {
+  await test('integrity/Codex round 2 recovery with ' + recovery + ' rollout', () => {
+    const { sid } = approvalBuild({ steps: [{ interrupt: true }, author('picked up feedback'), author('continued')] });
+    const old = state(sid).codex;
+    const feedback = reviewJSON('revise', [reviewIssue('C1', 'open')]);
+    assert.equal(duet(['review', '--session', sid, '--issues', '-'], { input: feedback }).code, 1);
+    if (recovery === 'missing') fs.unlinkSync(old.rollout);
+    if (recovery === 'compressed') fs.renameSync(old.rollout, old.rollout + '.zst');
+    const r = duet(['retry', '--session', sid, ...(recovery === 'fresh' ? ['--fresh'] : [])]);
+    assert.equal(r.code, 0, r.err);
+    const current = state(sid).codex.threadId;
+    const call = calls()[2];
+    if (recovery === 'compressed') {
+      assert.deepEqual(call.args.slice(0, 3), ['exec', 'resume', old.threadId]);
+      assert.match(call.prompt, /<interrupted_turn>/);
+      assert.equal(current, old.threadId);
+    } else {
+      assert.deepEqual(call.args.slice(0, 2), ['exec', '-C']);
+      assert.ok(call.prompt.includes(requestSpec.trim()));
+      assert.match(call.prompt, /Issue C1/);
+      assert.match(call.prompt, /existing_issue_ledger/);
+      assert.notEqual(current, old.threadId);
+      assert.equal(duet(['review', '--session', sid, '--issues', '-'], { input: feedback }).code, 0);
+      assert.ok(calls()[3].args.includes(current));
+    }
+  });
+}
+
+await test('integrity/build refuses revise that leaves no open issues', () => {
+  const { sid } = approvalBuild({ steps: [author('answered')] });
+  const review = (issues) => duet(['review', '--session', sid, '--issues', '-'], { input: reviewJSON('revise', issues), env: realPolicy });
+  for (const issues of [[], [reviewIssue('C1', 'resolved')]]) {
+    const before = state(sid);
+    const r = review(issues);
+    assert.equal(r.code, 2, r.err);
+    assert.match(r.err, /approve.*issue|issue.*approve/i);
+    assert.deepEqual(state(sid), before);
+    if (!issues.length) assert.equal(review([reviewIssue('C1', 'open')]).code, 0);
+  }
+});
+
+await test('integrity/code revise cannot approve through the policy', () => {
+  const cwd = approvalRepo();
+  fs.writeFileSync(path.join(cwd, 'reviewed.txt'), 'review me\n');
+  for (const action of ['done', 'continue', 'escalate']) {
+    scriptCodex([turn('revise', [], matchingRequest)]);
+    const r = duet(['start', '--kind', 'code'], { cwd, env: { FIXTURE_DECISIONS: JSON.stringify({ 1: action }) } });
+    assert.equal(r.code, 0, r.err);
+    const st = state(sessionId(r.out));
+    assert.notEqual(st.phase, 'done');
+    assert.equal(st.approval, undefined);
+  }
+});
+
+for (const change of ['detached', 'switched', 'recreated', 'recreated and moved', 'foreign', 'locked']) {
+  await test('integrity/finish and discard preserve a ' + change + ' worktree', () => {
+    const { dir, sid, branch, worktree } = approvalBuild();
+    approveBuild(sid);
+    if (change === 'detached') git(['checkout', '--detach', '-q'], worktree);
+    if (change === 'switched') git(['checkout', '-qb', 'elsewhere'], worktree);
+    if (change.startsWith('recreated')) {
+      git(['checkout', '-q', '--detach'], worktree);
+      git(['branch', '-D', branch], dir);
+      git(['checkout', '-qb', branch], worktree); // same name, same OID, different branch
+      if (change === 'recreated and moved') {
+        git(['add', 'covered.txt'], worktree);
+        commit('work on the replacement branch', worktree);
+      }
+    }
+    if (change === 'locked') git(['worktree', 'lock', worktree], dir);
+    if (change === 'foreign') {
+      const replacement = approvalRepo();
+      fs.renameSync(worktree, worktree + '-original');
+      fs.renameSync(replacement, worktree);
+      git(['checkout', '-qb', branch], worktree);
+    }
+    const tip = git(['rev-parse', branch], dir);
+    for (const cmd of [['finish', '--unreviewed'], ['discard']]) {
+      const r = duet([...cmd, '--session', sid], { env: gitIdentity });
+      assert.notEqual(r.code, 0, 'unexpected success: ' + r.out);
+      if (change.startsWith('recreated')) {
+        assert.match(r.err, /cannot confirm that this session created/);
+        assert.doesNotMatch(r.err, /git reset --soft/);
+      }
+      assert.equal(git(['rev-parse', branch], dir), tip);
+      assert.ok(fs.existsSync(worktree));
+      assert.equal(state(sid).phase, 'done');
+    }
+  });
+}
+
+await test('integrity/a moved build explains how to preserve its commits and retry', () => {
+  const { dir, sid, branch, worktree, base } = approvalBuild();
+  approveBuild(sid);
+  git(['add', 'reviewed.txt'], worktree);
+  commit('owner work', worktree);
+  const tip = git(['rev-parse', 'HEAD'], worktree).trim();
+  for (const cmd of [['finish'], ['finish', '--unreviewed'], ['discard']]) {
+    const r = duet([...cmd, '--session', sid], { env: gitIdentity });
+    assert.equal(r.code, 2, r.err);
+    assert.ok(r.err.includes(worktree), r.err);
+    assert.ok(r.err.includes(`git log --oneline ${base}..refs/heads/${branch}`), r.err);
+    assert.ok(r.err.includes(`git reset --soft ${base}`), r.err);
+    assert.match(r.err, /finish the branch by hand/i);
+    assert.equal(git(['rev-parse', branch], dir).trim(), tip);
+    assert.equal(state(sid).phase, 'done');
+  }
+  git(['branch', 'saved-build-tip', tip], dir);
+  git(['reset', '--soft', base], worktree);
+  assert.equal(git(['diff', '--cached', '--name-only'], worktree).trim(), 'reviewed.txt');
+  assert.equal(git(['diff', '--name-only'], worktree).trim(), 'covered.txt');
+  const finish = duet(['finish', '--session', sid], { env: gitIdentity });
+  assert.equal(finish.code, 0, finish.err);
+  assert.equal(state(sid).phase, 'finished');
+  assert.equal(git(['rev-parse', 'saved-build-tip'], dir).trim(), tip);
+});
+
+for (const end of ['finish', 'discard']) {
+  await test('integrity/discard refuses a terminal ' + end + ' session', () => {
+    const { dir, sid, branch } = approvalBuild();
+    approveBuild(sid);
+    assert.equal(duet([end, '--session', sid], { env: gitIdentity }).code, 0);
+    if (end === 'discard') git(['branch', branch, 'HEAD'], dir);
+    const tip = git(['rev-parse', branch], dir);
+    const r = duet(['discard', '--session', sid]);
+    assert.notEqual(r.code, 0);
+    assert.match(r.err, /finished|discarded/);
+    assert.equal(git(['rev-parse', branch], dir), tip);
+  });
+}
+
+await test('integrity/discard can retry a refused branch deletion', () => {
+  const { dir, sid, branch } = approvalBuild();
+  const lock = path.join(dir, '.git', 'refs', 'heads', branch + '.lock');
+  fs.writeFileSync(lock, '');
+  const r = duet(['discard', '--session', sid]);
+  assert.notEqual(r.code, 0);
+  assert.notEqual(state(sid).phase, 'discarded');
+  assert.ok(fs.existsSync(state(sid).subject.worktree));
+  assert.ok(git(['rev-parse', branch], dir));
+  fs.unlinkSync(lock);
+  const retry = duet(['discard', '--session', sid]);
+  assert.equal(retry.code, 0, retry.err);
+  assert.equal(git(['branch', '--list', branch], dir), '');
+  assert.equal(state(sid).phase, 'discarded');
+});
+
+await test('integrity/unreviewed finish records the override even on an empty tree change', () => {
+  const { dir, sid, worktree, branch } = approvalBuild();
+  git(['restore', '.'], worktree);
+  const f = duet(['finish', '--session', sid, '--unreviewed'], { env: gitIdentity });
+  assert.equal(f.code, 0, f.err);
+  assert.match(git(['log', '-1', '--format=%b', branch], dir), /owner finished without an approval/i);
+});
+
+await test('integrity/finish preserves unstaged and untracked post-commit edits for review', () => {
+  const { sid, worktree, dir, base, branch } = approvalBuild();
+  approveBuild(sid);
+  const hook = path.join(dir, '.git/hooks/post-commit');
+  fs.writeFileSync(hook, '#!/bin/sh\necho formatter >> reviewed.txt\necho generated > hook.txt\n', { mode: 0o755 });
+  const f = duet(['finish', '--session', sid], { env: gitIdentity });
+  assert.equal(f.code, 0, f.err);
+  assert.equal(state(sid).phase, 'awaiting-review');
+  assert.equal(git(['rev-parse', branch], dir).trim(), base);
+  assert.match(fs.readFileSync(path.join(worktree, 'reviewed.txt'), 'utf8'), /formatter/);
+  assert.match(f.out, /never-reviewed.*hook\.txt/);
+  fs.unlinkSync(hook);
+  approveBuild(sid);
+  assert.equal(duet(['finish', '--session', sid], { env: gitIdentity }).code, 0);
+  assert.equal(git(['show', branch + ':hook.txt'], dir), 'generated\n');
+});
+
+await test('integrity/finish preserves staging in the source checkout with an inherited index', () => {
+  const { dir, sid } = approvalBuild();
+  approveBuild(sid);
+  fs.writeFileSync(path.join(dir, 'source-only'), 'independent staging\n');
+  git(['add', 'source-only'], dir);
+  const staged = git(['ls-files', '--stage'], dir);
+  const r = duet(['finish', '--session', sid], { env: { ...gitIdentity, GIT_INDEX_FILE: path.join(dir, '.git/index') } });
+  assert.equal(r.code, 0, r.err);
+  assert.equal(git(['ls-files', '--stage'], dir), staged);
+  assert.equal(state(sid).phase, 'finished');
+});
+
+for (const engine of ['codex', 'agy']) {
+  await test('integrity/' + engine + ' receives no repository selectors', () => {
+    const keys = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
+      'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_PREFIX', 'GIT_SHALLOW_FILE'];
+    scriptCodex([{ reply: codeAnswer, probeEnv: keys }]);
+    const env = Object.fromEntries(keys.map((key) => [key, path.join(tmp, 'unrelated')]));
+    const r = duet(['start', '--engine', engine, '--kind', 'file', '--subject', 'a.js'], { env });
+    assert.equal(r.code, 0, r.err);
+    assert.deepEqual(calls()[0].gitSelectors, []);
+  });
+}
+
+for (const end of ['finish', 'discard']) {
+  await test('integrity/failed build permits ' + end + ' after delegate exit', () => {
+    scriptCodex([{ fail: 'startup failed' }]);
+    const r = duet(['start', '--kind', 'build', '--subject', '-'], { input: requestSpec });
+    const sid = retrySid(r.err);
+    assert.equal(state(sid).phase, 'codex-failed');
+    const subject = state(sid).subject;
+    fs.writeFileSync(path.join(subject.worktree, 'partial'), 'before the failure\n');
+    const f = duet([end, '--session', sid, ...(end === 'finish' ? ['--unreviewed'] : [])], { env: gitIdentity });
+    assert.equal(f.code, 0, f.err);
+    assert.equal(state(sid).phase, end === 'finish' ? 'finished' : 'discarded');
+    assert.ok(!fs.existsSync(subject.worktree));
+    assert.equal(duet(['retry', '--session', sid]).code, 2);
+    assert.match(duet(['status', '--session', sid]).out, /build (finished|discarded)/);
+    if (end === 'finish') assert.equal(git(['show', subject.branch + ':partial']), 'before the failure\n');
+  });
+}
+
+await test('integrity/code verify accepts unstaged and partially staged approved paths', () => {
+  const cwd = approvalRepo();
+  const newFile = 'new\tfile.txt';
+  fs.writeFileSync(path.join(cwd, 'reviewed.txt'), 'approved\n');
+  fs.writeFileSync(path.join(cwd, newFile), 'also approved\n');
+  fs.unlinkSync(path.join(cwd, 'deleted.txt'));
+  scriptCodex([turn('approve', [])]);
+  const start = duet(['start', '--kind', 'code'], { cwd });
+  assert.equal(start.code, 0, start.err);
+  const verify = () => duet(['verify', '--session', sessionId(start.out)]);
+  const empty = verify();
+  assert.equal(empty.code, 0, empty.out);
+  for (const file of ['reviewed.txt', 'deleted.txt', newFile]) assert.ok(empty.out.includes('not staged: ' + JSON.stringify(file)), empty.out);
+  git(['add', '--', 'reviewed.txt', 'deleted.txt'], cwd);
+  const partial = verify();
+  assert.equal(partial.code, 0, partial.out);
+  assert.ok(partial.out.includes('not staged: ' + JSON.stringify(newFile)), partial.out);
+  assert.doesNotMatch(partial.out, /not staged: "(reviewed|deleted)\.txt"/);
+  git(['add', '--', newFile], cwd);
+  const all = verify();
+  assert.equal(all.code, 0, all.out);
+  assert.match(all.out, /Staged tree matches the approved tree/);
+});
+
+await test('integrity/code verify accepts partial staging before the first commit', () => {
+  const cwd = fs.mkdtempSync(path.join(tmp, 'unborn-'));
+  git(['init', '-q'], cwd);
+  fs.writeFileSync(path.join(cwd, 'included.txt'), 'stage this\n');
+  fs.writeFileSync(path.join(cwd, 'later.txt'), 'stage later\n');
+  git(['add', 'included.txt'], cwd);
+  git(['add', '--intent-to-add', 'later.txt'], cwd);
+  scriptCodex([turn('approve', [])]);
+  const start = duet(['start', '--kind', 'code'], { cwd });
+  assert.equal(start.code, 0, start.err);
+  const v = duet(['verify', '--session', sessionId(start.out)]);
+  assert.equal(v.code, 0, v.out);
+  assert.match(v.out, /not staged: "later\.txt"/);
+  assert.doesNotMatch(v.out, /not staged: "included\.txt"/);
+});
+
+await test('integrity/verify detects an unapproved staged blob under approved working content', () => {
+  const cwd = approvalRepo();
+  const file = path.join(cwd, 'reviewed.txt');
+  fs.writeFileSync(file, 'approved\n');
+  scriptCodex([turn('approve', [])]);
+  const s = duet(['start', '--kind', 'code'], { cwd });
+  const sid = sessionId(s.out);
+  fs.writeFileSync(file, 'staged only\n');
+  git(['add', 'reviewed.txt'], cwd);
+  fs.writeFileSync(file, 'approved\n');
+  const v = duet(['verify', '--session', sid]);
+  assert.equal(v.code, 1);
+  assert.match(v.out, /unapproved staged content: "reviewed\.txt"/);
+  assert.equal(git(['show', ':reviewed.txt'], cwd), 'staged only\n');
+  git(['add', 'reviewed.txt'], cwd);
+  assert.equal(duet(['verify', '--session', sid]).code, 0);
+});
+
+await test('integrity/build feedback keeps owner rulings separate from later architect replies', () => {
+  const { sid } = approvalBuild({ steps: [author('first'), author('second')] });
+  const feedback = (reply, owner) => duet(['review', '--session', sid, '--issues', '-'], {
+    input: reviewJSON('revise', [reviewIssue('C1', 'open', { reply, owner })]),
+  });
+  assert.equal(feedback('Keep CSV.', true).code, 0);
+  assert.match(calls()[1].prompt, /Owner decision \(final\): Keep CSV\./);
+  assert.equal(feedback('Consider XML.', false).code, 0);
+  assert.match(calls()[2].prompt, /Owner decision \(final\): Keep CSV\./);
+  assert.match(calls()[2].prompt, /architect on your last answer: Consider XML\./);
+  assert.doesNotMatch(calls()[2].prompt, /Owner decision \(final\): Consider XML\./);
+});
+
+for (const end of ['finish', 'discard']) {
+  await test('integrity/verify explains an absent branch after ' + end, () => {
+    const { sid, dir, branch } = approvalBuild();
+    approveBuild(sid);
+    assert.equal(duet([end, '--session', sid], { env: gitIdentity }).code, 0);
+    if (end === 'finish') git(['branch', '-D', branch], dir);
+    const v = duet(['verify', '--session', sid]);
+    assert.notEqual(v.code, 0);
+    assert.match(v.err, /discarded|(?:missing|gone|no longer exists|was deleted).*branch|branch.*(?:missing|gone|no longer exists|was deleted)/i);
+    assert.doesNotMatch(v.err, /fatal:|rev-parse/);
+  });
+}
+
+await test('integrity/source repository finds builds and asks which session to use', () => {
+  const cwd = approvalRepo();
+  const env = { AGENT_DUET_HOME: path.join(tmp, 'discovery') };
+  scriptCodex([author('first'), author('second')]);
+  const start = () => duet(['start', '--kind', 'build', '--subject', '-'], { cwd, env, input: requestSpec });
+  const first = sessionId(start().out);
+  const status = duet(['status'], { cwd, env });
+  assert.equal(status.code, 0, status.err);
+  assert.ok(status.out.includes(first));
+  assert.ok(duet(['verify'], { cwd, env }).out.includes('no approval recorded'));
+  const second = sessionId(start().out);
+  const listing = duet(['list'], { cwd, env });
+  for (const id of [first, second]) assert.ok(listing.out.includes(id));
+  assert.ok(listing.out.includes(cwd));
+  for (const cmd of ['status', 'verify']) {
+    const r = duet([cmd], { cwd, env });
+    assert.equal(r.code, 2);
+    assert.match(r.err, /--session/);
+    assert.ok(r.err.includes(first) && r.err.includes(second));
+  }
+  assert.ok(duet(['status', '--session', first], { cwd, env }).out.includes(first));
+});
+
+await test('integrity/build counts a disputed response only in its own round', () => {
+  const { sid } = approvalBuild({ steps: [author('disputed', [{ id: 'C1', action: 'disputed', note: 'allowed' }]), author('no answer'), author('later')] });
+  const review = () => duet(['review', '--session', sid, '--issues', '-'], { input: reviewJSON('revise', [reviewIssue('C1', 'open')]) });
+  assert.equal(review().code, 0);
+  assert.equal(review().code, 0);
+  assert.equal(state(sid).issues.C1.disputes, 1);
+  assert.equal(review().code, 0);
+  assert.equal(state(sid).issues.C1.disputes, 1);
+});
+
+await test('integrity/stop releases the build for cleanup only after the live turn exits', async () => {
+  const localHome = path.join(tmp, 'stopped-build');
+  const env = { AGENT_DUET_HOME: localHome };
+  scriptCodex([{ hang: true, started: true }]);
+  const run = duetAsync(['start', '--kind', 'build', '--subject', '-'], { input: requestSpec, env });
+  await waitFor(() => fs.existsSync(fakeState));
+  const sid = fs.readdirSync(localHome).find((id) => fs.existsSync(path.join(localHome, id, 'state.json')));
+  try {
+    for (const cmd of [['finish', '--unreviewed'], ['discard']]) {
+      const busy = duet([...cmd, '--session', sid], { env });
+      assert.equal(busy.code, 2);
+      assert.match(busy.err, /busy/);
+    }
+  } finally {
+    process.kill(Number(fs.readFileSync(path.join(localHome, sid, 'lock'), 'utf8')), 'SIGTERM');
+    assert.equal((await run).code, 1);
+  }
+  const discarded = duet(['discard', '--session', sid], { env });
+  assert.equal(discarded.code, 0, discarded.err);
+});
+
+await test('integrity/a message hook cannot erase the unreviewed note', () => {
+  const { sid, dir, branch, worktree, base } = approvalBuild();
+  const hook = path.join(dir, '.git/hooks/commit-msg');
+  fs.writeFileSync(hook, '#!/bin/sh\necho replacement > "$1"\n', { mode: 0o755 });
+  const refused = duet(['finish', '--session', sid, '--unreviewed'], { env: gitIdentity });
+  assert.notEqual(refused.code, 0);
+  assert.match(refused.err, /unreviewed.*note/);
+  assert.equal(git(['rev-parse', branch], dir).trim(), base);
+  assert.ok(fs.existsSync(worktree));
+  fs.unlinkSync(hook);
+  assert.equal(duet(['finish', '--session', sid, '--unreviewed'], { env: gitIdentity }).code, 0);
+});
+
+await test('integrity/a build reports an untouched index and fails on divergent staging', () => {
+  const { sid, worktree } = approvalBuild();
+  approveBuild(sid);
+  const untouched = duet(['verify', '--session', sid]);
+  assert.equal(untouched.code, 0, untouched.err);
+  assert.match(untouched.out, /Staged tree differs.*\n[\s\S]*Nothing is staged/);
+  git(['add', 'covered.txt'], worktree);
+  const partial = duet(['verify', '--session', sid]);
+  assert.equal(partial.code, 1);
+  assert.match(partial.out, /Staged tree differs[\s\S]*reviewed\.txt/);
+  git(['add', 'reviewed.txt'], worktree);
+  assert.equal(duet(['verify', '--session', sid]).code, 0);
+});
+
+await test('integrity/legacy pending review replays its full feedback before approving new content', () => {
+  const cwd = approvalRepo();
+  const file = path.join(cwd, 'reviewed.txt');
+  fs.writeFileSync(file, 'first version\n');
+  scriptCodex([turn('revise', [issue('C1', 'open')]), { interrupt: true }, turn('approve', [issue('C1', 'resolved')])]);
+  const start = duet(['start', '--kind', 'code'], { cwd });
+  const sid = sessionId(start.out);
+  assert.equal(duet(['reply', '--session', sid, '--responses', '-'], {
+    input: responses('amended text', [{ id: 'C1', action: 'fixed', note: 'CSV now included' }]),
+  }).code, 1);
+  const old = state(sid);
+  delete old.pending.snapshot;
+  delete old.pending.promptDelivered;
+  fs.writeFileSync(path.join(home, sid, 'state.json'), JSON.stringify(old));
+  fs.writeFileSync(file, 'latest version\n');
+  assert.equal(duet(['retry', '--session', sid]).code, 0);
+  assert.match(calls()[2].prompt, /CSV now included/);
+  assert.match(calls()[2].prompt, /\+latest version/);
+  assert.ok(calls()[2].prompt.includes(state(sid).approval.tree));
+});
+
+await test('integrity/Git refuses a new file that arrives during approved worktree removal', () => {
+  const { sid, dir, worktree, branch, base } = approvalBuild();
+  approveBuild(sid);
+  const bin = path.join(tmp, 'git-at-removal');
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, 'git'), [
+    '#!/bin/sh',
+    'export PATH="$ORIGINAL_TEST_PATH"',
+    'if [ "$1 $2" = "worktree remove" ]; then echo late > "$TEST_WORKTREE/late.txt"; fi',
+    'exec git "$@"',
+  ].join('\n') + '\n', { mode: 0o755 });
+  const f = duet(['finish', '--session', sid], {
+    env: { ...gitIdentity, PATH: bin + path.delimiter + baseEnv.PATH, ORIGINAL_TEST_PATH: baseEnv.PATH, TEST_WORKTREE: worktree },
+  });
+  assert.equal(f.code, 0, f.err);
+  assert.equal(state(sid).phase, 'awaiting-review');
+  assert.equal(git(['rev-parse', branch], dir).trim(), base);
+  assert.equal(fs.readFileSync(path.join(worktree, 'late.txt'), 'utf8'), 'late\n');
+  assert.match(f.out, /never-reviewed.*late\.txt/);
+});
+
+await test('integrity/Codex restores a missing conversation on an ordinary round 2 reply', () => {
+  const cwd = approvalRepo();
+  fs.writeFileSync(path.join(cwd, 'reviewed.txt'), 'reviewed\n');
+  scriptCodex([turn('revise', [issue('C1', 'open')]), turn('approve', [issue('C1', 'resolved')])]);
+  const start = duet(['start', '--kind', 'code', '--brief', '-'], { cwd, input: ownerBrief });
+  const sid = sessionId(start.out);
+  const old = state(sid).codex;
+  fs.unlinkSync(old.rollout);
+  const r = duet(['reply', '--session', sid, '--responses', '-'], {
+    input: responses('changed', [{ id: 'C1', action: 'fixed', note: 'CSV now included' }]),
+  });
+  assert.equal(r.code, 0, r.err);
+  assert.deepEqual(calls()[1].args.slice(0, 2), ['exec', '-C']);
+  assert.ok(calls()[1].prompt.includes(ownerBrief.trim()));
+  assert.match(calls()[1].prompt, /existing_issue_ledger[\s\S]*CSV now included/);
+  assert.notEqual(state(sid).codex.threadId, old.threadId);
+});
+
+await test('integrity/legacy revise approvals need a new review or an explicit owner ruling', () => {
+  const { sid, worktree } = approvalBuild();
+  approveBuild(sid);
+  const legacy = state(sid);
+  delete legacy.subject.branchCreator;
+  legacy.rounds.at(-1).verdict = 'revise';
+  fs.writeFileSync(path.join(home, sid, 'state.json'), JSON.stringify(legacy));
+  assert.equal(duet(['finish', '--session', sid], { env: gitIdentity }).code, 2);
+  assert.equal(duet(['verify', '--session', sid]).code, 1);
+  assert.ok(fs.existsSync(worktree));
+  approveBuild(sid);
+  assert.equal(duet(['finish', '--session', sid], { env: gitIdentity }).code, 0);
+
+  const cwd = approvalRepo();
+  fs.writeFileSync(path.join(cwd, 'reviewed.txt'), 'reviewed\n');
+  git(['add', 'reviewed.txt'], cwd);
+  scriptCodex([turn('revise', [issue('C1', 'open')])]);
+  const start = duet(['start', '--kind', 'code', '--max-rounds', '1'], { cwd });
+  const id = sessionId(start.out);
+  const decision = duet(['reply', '--session', id, '--responses', '-'], {
+    input: responses('owner settled it', [{ id: 'C1', action: 'owner-decided', note: 'Keep the reviewed content.' }]),
+  });
+  assert.equal(decision.code, 0, decision.err);
+  const old = state(id);
+  delete old.approval.by; // older sessions recorded the decision in issue history
+  fs.writeFileSync(path.join(home, id, 'state.json'), JSON.stringify(old));
+  assert.equal(duet(['verify', '--session', id]).code, 0);
 });
 
 // ---- audit: one read-only turn on a task, findings with evidence, nothing to answer

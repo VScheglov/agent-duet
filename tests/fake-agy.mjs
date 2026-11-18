@@ -30,9 +30,15 @@ const script = JSON.parse(fs.readFileSync(process.env.FAKE_AGY_SCRIPT, 'utf8'));
 const statePath = process.env.FAKE_AGY_STATE;
 const state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, 'utf8')) : { calls: [] };
 const step = script[state.calls.length];
-state.calls.push({ args, input, prompt: message.message.content, cwd: process.cwd(), home: process.env.HOME });
+const call = { args, input, prompt: message.message.content, cwd: process.cwd(), home: process.env.HOME };
+if (step?.probeEnv) call.gitSelectors = step.probeEnv.filter((key) => key in process.env);
+state.calls.push(call);
 fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
 if (!step) throw new Error('fake agy: no scripted reply left');
+if (step.fail) {
+  console.error(step.fail);
+  process.exit(1);
+}
 const conversation = args.includes('--conversation') ? args[args.indexOf('--conversation') + 1] : crypto.randomUUID();
 const logs = path.join(duetEnv('AGY_HOME'), 'conversations');
 fs.mkdirSync(logs, { recursive: true });
@@ -40,7 +46,7 @@ fs.writeFileSync(path.join(logs, `${conversation}.db`), 'fake SQLite conversatio
 fs.writeFileSync(path.join(logs, `${conversation}.db-wal`), 'fake write-ahead log');
 const emit = (event) => process.stdout.write(`${JSON.stringify(event)}\n`);
 if (!step.noInit) emit({ event: 'init', conversation_id: conversation, init: { model: step.model ?? 'gemini-3.8-flash-high', cwd: process.cwd(), tools: [], permission_mode: 'always-proceed' } });
-emit({ event: 'step_update', step_update: { conversation_id: conversation, step_index: 0, state: 'DONE', step_type: 'user_input' } });
+if (!step.noUserInput) emit({ event: 'step_update', step_update: { conversation_id: conversation, step_index: 0, state: 'DONE', step_type: 'user_input' } });
 for (const [i, command] of (step.commands ?? []).entries()) {
   const info = { name: 'run_command', parameters: { CommandLine: command.command } };
   const update = { conversation_id: conversation, step_index: i + 1, step_type: 'tool', tool_name: 'run_command', tool_info: info };

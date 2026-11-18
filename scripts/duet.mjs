@@ -9,6 +9,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createInterface } from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { confirmVerification, unknownVerification, verificationClaims, verificationLines } from './verification.mjs';
 import { checkQuotes, quoteCheckLine, recitesQuote } from './quotes.mjs';
@@ -72,7 +73,7 @@ const USAGE = `Usage: duet.mjs <command> [options]
   review  --issues <file>|- [--session <id>] [--max-rounds <n>]        (build sessions)
   finish  [--session <id>] [--unreviewed]   build: commit only approved content and remove the worktree
           --unreviewed: only on the owner's explicit word, commit without an approval check
-  verify  [--session <id>]     code/build: compare current content with the approved tree (foreground)
+  verify  [--session <id>]     code/build: check working and staged content against the approved tree
   discard [--session <id>]     build: remove the worktree and delete its branch
   retry   [--session <id>] [--fresh]   re-run a round that failed; a turn the engine had begun goes on
           in its own thread, with what it did and read; --fresh starts the turn over
@@ -85,7 +86,7 @@ const USAGE = `Usage: duet.mjs <command> [options]
   report  [--session <id>]     print the full report
   list    [--all]              sessions for this directory (or all of them)
 
-Without --session the newest session for the current directory is used.`;
+Without --session a single matching session is used. Use list to see the choices.`;
 
 class UsageError extends Error {}
 
@@ -352,7 +353,21 @@ function saveState(st) {
 function loadState(id) {
   if (!/^[\w-]+$/.test(id)) throw new UsageError(`bad session id: ${id}`);
   if (!fs.existsSync(statePath(id))) throw new UsageError(`session not found: ${id}`);
-  return readJSON(statePath(id));
+  const st = readJSON(statePath(id));
+  const reviewed = st.approval && st.rounds?.find((r) => r.n === st.approval.round);
+  // An old runner could turn an explicit rejection into DONE. Reopen that active
+  // review without rewriting history or revoking an owner's round-limit decision.
+  if (st.phase === 'done' && reviewed?.verdict === 'revise' && ['code', 'build'].includes(st.kind)) {
+    const ownerOverride = st.kind === 'code' && (st.approval.by === 'owner' || reviewed.request_ruling ||
+      Object.values(st.issues).some((i) => i.history.some((h) => h.round === reviewed.n && h.by === 'duet'
+        && h.note?.startsWith('owner decision recorded at the round limit,'))));
+    if (!ownerOverride) {
+      delete st.approval;
+      st.phase = st.kind === 'build' ? 'awaiting-review' : 'escalated';
+      st.decision = st.kind === 'build' ? null : { action: 'escalate', reason: 'the reviewer requested changes', issues: [], enforced: true };
+    }
+  }
+  return st;
 }
 
 function allSessions() {
@@ -361,7 +376,7 @@ function allSessions() {
     .filter((d) => fs.existsSync(statePath(d)))
     .map((d) => {
       try {
-        return readJSON(statePath(d));
+        return loadState(d);
       } catch {
         return null;
       }
@@ -370,19 +385,25 @@ function allSessions() {
     .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
 }
 
-const covers = (st, dir) => {
-  // A migrated build retains its old absolute cwd, now reached through the compatibility link.
-  let root = st.cwd;
-  try { root = fs.realpathSync(root); } catch {}
-  return dir === root || dir.startsWith(root + path.sep);
-};
+// Migrated worktrees can still be named through the old state directory's compatibility link.
+function realPath(file) {
+  try { return fs.realpathSync(file); } catch { return file; }
+}
+
+function covers(st, dir) {
+  return [st.cwd, st.kind === 'build' && st.subject?.repo].filter(Boolean).some((root) => {
+    const rel = path.relative(realPath(root), dir);
+    return rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel);
+  });
+}
 
 function resolveSession(id) {
   if (id) return loadState(id);
   const here = fs.realpathSync(process.cwd());
-  const st = allSessions().find((s) => covers(s, here));
-  if (!st) throw new UsageError('no agent-duet session for this directory; pass --session <id> (see: duet.mjs list --all)');
-  return st;
+  const matches = allSessions().filter((s) => covers(s, here));
+  if (!matches.length) throw new UsageError('no agent-duet session for this directory; pass --session <id> (see: duet.mjs list --all)');
+  if (matches.length > 1) throw new UsageError(`multiple sessions match this directory: ${matches.map((s) => s.id).join(', ')}. Pass --session <id>`);
+  return matches[0];
 }
 
 function isAlive(pid) {
@@ -581,6 +602,12 @@ function git(args, { cwd, env, allowFail = false } = {}) {
 
 const hasHead = (cwd) => git(['rev-parse', '--verify', '-q', 'HEAD'], { cwd, allowFail: true }).status === 0;
 
+function gitChanged(options, cwd) {
+  const r = git(['diff', '--quiet', ...options, '--'], { cwd, allowFail: true });
+  if (r.status === 0 || r.status === 1) return r.status === 1;
+  throw new Error(`cannot compare Git content: ${r.stderr.trim()}`);
+}
+
 // Tree object of the whole working tree (tracked + untracked, minus ignored) without
 // touching the user's index, stash or branches: a throwaway index file does the work.
 // It starts as a copy of the user's index, so force-added ignored files and
@@ -620,15 +647,17 @@ function takeSnapshot(st, round) {
   };
 }
 
-// All comparisons use immutable tree objects, including modes and deletions. Renames
-// count by path; -z keeps tabs, newlines and git's path quoting out of the classifier.
+// Compare entries by path, including modes and deletions. Keep tabs and newlines in filenames.
+function diffPaths(cwd, ...args) {
+  return new Set(git([
+    'diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--ignore-submodules=none', '--name-only', '-z', ...args, '--',
+  ], { cwd }).stdout.split('\0').filter(Boolean));
+}
+
 function pathStates(st, approved, current) {
   const cwd = st.kind === 'build' ? st.subject.repo : st.cwd;
-  const changed = (from, to) => new Set(git([
-    'diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--name-only', '-z', from, to, '--',
-  ], { cwd }).stdout.split('\0').filter(Boolean));
-  const reviewed = changed(st.subject.base, approved);
-  const edited = changed(approved, current);
+  const reviewed = diffPaths(cwd, st.subject.base, approved);
+  const edited = diffPaths(cwd, approved, current);
   return [...new Set([...reviewed, ...edited])].sort().map((file) => ({
     path: file,
     state: reviewed.has(file) ? (edited.has(file) ? 'edited-after-review' : 'covered') : 'never-reviewed',
@@ -643,11 +672,18 @@ function compareApproval(st, tree, approval = st.approval) {
 }
 
 function currentApprovalCheck(st) {
-  const onBranch = st.kind === 'build' && !fs.existsSync(st.subject.worktree);
-  const tree = onBranch
-    ? git(['rev-parse', '--verify', `${st.subject.branch}^{tree}`], { cwd: st.subject.repo }).stdout.trim()
-    : snapshotTree(st, `check-${process.pid}`);
-  return { ...compareApproval(st, tree), source: onBranch ? `Branch commit (${st.subject.branch})` : 'Working tree' };
+  if (st.kind === 'build') {
+    const { branch, repo } = st.subject;
+    if (st.phase === 'discarded') throw new UsageError(`build ${st.id} was discarded; there is no build branch to verify`);
+    if (st.phase === 'finished') {
+      const tip = git(['rev-parse', '--verify', '-q', `refs/heads/${branch}^{tree}`], { cwd: repo, allowFail: true });
+      if (tip.status === 1) throw new UsageError(`build branch ${branch} is missing. The recorded finish commit is ${st.subject.commit}`);
+      if (tip.status !== 0) throw new Error(`cannot verify build branch ${branch}: ${tip.stderr.trim()}`);
+      return { ...compareApproval(st, tip.stdout.trim()), source: `Branch commit (${branch})` };
+    }
+    checkBuildWorktree(st);
+  }
+  return { ...compareApproval(st, snapshotTree(st, `check-${process.pid}`)), source: 'Working tree' };
 }
 
 function approvalVerdict(check) {
@@ -663,13 +699,14 @@ function clearApproval(st) {
   delete st.approval;
 }
 
-function recordApproval(st) {
+function recordApproval(st, ownerOverride = false) {
   if (!['code', 'build'].includes(st.kind)) return;
-  if (st.decision.action !== 'done') {
+  const last = st.rounds.at(-1);
+  if (st.decision.action !== 'done' || (last.verdict !== 'approve' && !ownerOverride)) {
     clearApproval(st);
     return;
   }
-  st.approval = { tree: st.rounds.at(-1).snapshot.tree, round: st.round, at: now() };
+  st.approval = { tree: last.snapshot.tree, round: st.round, at: now(), ...(ownerOverride ? { by: 'owner' } : {}) };
 }
 
 function unifiedDiff(before, after, label) {
@@ -822,7 +859,10 @@ function codexArgs(st, outFile, threadId, schema) {
 // newest day back. The session keeps the path: a resumed thread writes on in the same file.
 function rolloutOf(st, threadId) {
   const known = st.codex.rollout;
-  if (known?.endsWith(`-${threadId}.jsonl`) && fs.existsSync(known)) return known;
+  const plain = `-${threadId}.jsonl`;
+  const matches = (name) => name.endsWith(plain) || name.endsWith(plain + '.zst');
+  const root = path.resolve(CODEX_HOME, 'sessions');
+  if (known && path.resolve(known).startsWith(root + path.sep) && matches(known) && fs.existsSync(known)) return known;
   const list = (dir) => {
     try {
       return fs.readdirSync(dir);
@@ -831,10 +871,10 @@ function rolloutOf(st, threadId) {
     }
   };
   const below = (dir) => list(dir).filter((name) => /^\d+$/.test(name)).sort().reverse().map((name) => path.join(dir, name));
-  for (const year of below(path.join(CODEX_HOME, 'sessions'))) {
+  for (const year of below(root)) {
     for (const month of below(year)) {
       for (const day of below(month)) {
-        const name = list(day).find((n) => n.endsWith(`-${threadId}.jsonl`));
+        const name = list(day).find(matches);
         if (name) return (st.codex.rollout = path.join(day, name));
       }
     }
@@ -849,7 +889,7 @@ function appliedTier(st, threadId, sinceMs) {
   const file = rolloutOf(st, threadId);
   let text = '';
   try {
-    if (file) text = fs.readFileSync(file, 'utf8');
+    if (file?.endsWith('.jsonl')) text = fs.readFileSync(file, 'utf8');
   } catch {}
   let tier = null;
   for (const line of text.split('\n')) {
@@ -974,8 +1014,7 @@ function runCodex(st, round, prompt, threadId, schema = SCHEMA) {
       process.off('SIGINT', cancel);
       process.off('SIGTERM', cancel);
       if (buffer) {
-        if (agy) consumeLine(buffer);
-        else events.write(buffer); // Codex's last line without its newline, as it came
+        consumeLine(buffer);
       }
       // Receipts read the saved events after this promise resolves: wait for both files to flush.
       await Promise.all([events, errors, raw].filter(Boolean).map((stream) => new Promise((done) => stream.end(done))));
@@ -1012,16 +1051,30 @@ function runCodex(st, round, prompt, threadId, schema = SCHEMA) {
         if (!agy) events.write(`${line}\n`);
         return;
       }
-      for (const event of agy ? normalizer.accept(input) : [input]) {
+      const normalized = agy ? normalizer.accept(input) : [input];
+      const step = agy && input.event === 'step_update' && Number.isInteger(input.step_update?.step_index);
+      const reportedId = agy
+        ? (step ? input.step_update.conversation_id : input.event === 'init' && input.conversation_id)
+        : input.type === 'thread.started' && input.thread_id;
+      if (reportedId) result.threadId = reportedId;
+      // Both engines can name the conversation before accepting this turn's input.
+      const delivered = agy ? (normalizer.firstInput !== null || normalizer.beganWork)
+        : ['turn.started', 'item.started', 'item.completed', 'turn.completed'].includes(input.type);
+      if ((reportedId && reportedId !== st.pending.threadId) || (delivered && !st.pending.promptDelivered)) {
+        st.pending.threadId = result.threadId;
+        st.pending.promptDelivered = delivered;
+        saveState(st);
+      }
+      for (const event of normalized) {
         // Preserve type/item/id/type key order: the pane's command count uses it.
         events.write(`${JSON.stringify({ ...event, _at: now() })}\n`);
         if (event.type === 'thread.started' && event.thread_id) {
-          result.threadId = event.thread_id;
           if (agy) {
-            st.pending.threadId = event.thread_id;
             const model = observedAgyModel(st.pending.codexModel, input.init?.model);
-            if (model) st.pending.codexModel = model;
-            saveState(st);
+            if (model) {
+              st.pending.codexModel = model;
+              saveState(st);
+            }
           }
           lookForTier();
         } else if (event.type === 'turn.completed') result.usage = event.usage ?? null;
@@ -1177,6 +1230,8 @@ function mergeReply(st, reply, round) {
   const seen = new Set();
   for (const it of reply.issues) {
     seen.add(it.id);
+    const owner = st.kind === 'build' && it.owner;
+    const ruling = owner ? { round, status: it.status, text: it.reply || it.recommendation || it.body || it.title } : null;
     const issue = st.issues[it.id];
     if (!issue) {
       if (it.status !== 'open') continue; // "closing" something never raised: ignore
@@ -1195,21 +1250,22 @@ function mergeReply(st, reply, round) {
         openedRound: round,
         closedRound: null,
         author: null,
-        codexReply: '',
+        codexReply: it.reply,
+        ...(owner ? { ownerRuled: true, ownerRuling: ruling } : {}),
         path: it.path,
         line: it.line,
         quote: it.quote,
         quoteCheck: it.quoteCheck,
-        history: [{ round, by: reviewerOf(st), status: 'open', quoteCheck: it.quoteCheck }],
+        history: [{ round, by: reviewerOf(st), status: 'open', reply: it.reply, ...(owner ? { owner: true } : {}), quoteCheck: it.quoteCheck }],
       };
       added.push(it.id);
       continue;
     }
     let { status } = it;
     const action = issue.author?.action;
-    if (it.owner) {
+    if (owner) {
       // The reviewer relays the owner's ruling: final, it unparks the issue and ends the dispute.
-      Object.assign(issue, { parked: false, disputes: 0, ownerRuled: true });
+      Object.assign(issue, { parked: false, disputes: 0, ownerRuled: true, ownerRuling: ruling });
       issue.history.push({ round, by: 'duet', note: `owner decision relayed by the reviewer → ${status}` });
     } else {
       if (action === 'owner-decided' && status === 'open') status = 'withdrawn'; // the owner's word is final
@@ -1218,7 +1274,12 @@ function mergeReply(st, reply, round) {
         issue.history.push({ round, by: 'duet', note: `the reviewer marked this parked issue ${status}; kept open for the owner` });
         status = 'open';
       }
-      if (status === 'open' && issue.status === 'open' && action === 'disputed') issue.disputes += 1;
+      const answerRound = st.kind === 'build' ? round : round - 1;
+      if (status === 'open' && issue.status === 'open' && action === 'disputed'
+        && issue.author.round === answerRound && issue.lastDisputeRound !== answerRound) {
+        issue.disputes += 1;
+        issue.lastDisputeRound = answerRound;
+      }
     }
     if (status === 'open' && issue.status !== 'open') {
       issue.reopened += 1;
@@ -1241,7 +1302,7 @@ function mergeReply(st, reply, round) {
       ...(recitesQuote(it, issue) ? { path: it.path, line: it.line, quote: it.quote } : {}),
       quoteCheck: it.quoteCheck,
     });
-    issue.history.push({ round, by: reviewerOf(st), status, reply: it.reply, quoteCheck: it.quoteCheck });
+    issue.history.push({ round, by: reviewerOf(st), status, reply: it.reply, ...(owner ? { owner: true } : {}), quoteCheck: it.quoteCheck });
   }
   for (const issue of Object.values(st.issues)) {
     if (seen.has(issue.id) || issue.status !== 'open' || issue.openedRound >= round) continue;
@@ -1282,7 +1343,7 @@ function buildView(st, reply) {
 }
 
 // The policy decides; the invariants below hold whatever it returns.
-async function decide(st, reply) {
+async function decide(st, reply, ownerOverride = false) {
   const view = buildView(st, reply);
   let d;
   try {
@@ -1306,6 +1367,9 @@ async function decide(st, reply) {
   if (d.action === 'escalate' && !view.open.length && !view.parked.length) {
     d = { action: 'done', reason: `nothing is left for the owner to decide (policy: ${d.reason})`, issues: [], enforced: true };
   }
+  if (d.action === 'done' && reply.verdict === 'revise' && !ownerOverride && ['code', 'build'].includes(st.kind)) {
+    d = { action: 'escalate', reason: 'the reviewer requested changes; an approving verdict or owner decision is needed', issues: [], enforced: true };
+  }
   // Apply request checks last: a policy conversion to DONE must not erase a narrowing.
   if (d.action === 'done' && !st.requestRuling) {
     const last = st.rounds.at(-1);
@@ -1324,7 +1388,7 @@ async function decide(st, reply) {
 // ---------------------------------------------------------------- rounds
 
 // Why a Codex turn produced no usable reply, or null when it did.
-function turnProblem(res, round) {
+function turnProblem(res) {
   if (res.engine === 'agy') {
     const waiting = !res.beganWork ? ' agy waits for all of its MCP servers to connect before a turn (agy mcp list); check the network or VPN.' : '';
     if (res.cancelled) return `cancelled: agent-duet received SIGINT or SIGTERM; retry continues the interrupted agy turn.${waiting}`;
@@ -1343,7 +1407,7 @@ function turnProblem(res, round) {
     if (res.turnFailed) return `agy: ${res.turnFailed}`;
     if (res.code !== 0) return `agy exited with ${res.signal || `code ${res.code}`}`;
     if (res.finished_reason) return `agy turn ended early: ${res.finished_reason}`;
-    if (round === 1 && !res.threadId) return 'agy did not report a conversation id';
+    if (!res.threadId) return 'agy did not report a conversation id';
     if (res.missingAnswer) return 'agy returned no valid structured answer (structured_output or a schema-valid final JSON object)';
     return null;
   }
@@ -1359,7 +1423,7 @@ function turnProblem(res, round) {
   const problem = res.spawnError || res.turnFailed || null;
   if (problem) return problem;
   if (res.code !== 0) return `codex exited with ${res.signal || `code ${res.code}`}${res.lastError ? `: ${res.lastError}` : ''}`;
-  if (round === 1 && !res.threadId) return 'Codex did not report a thread id';
+  if (!res.threadId) return 'Codex did not report a thread id';
   return null;
 }
 
@@ -1368,7 +1432,6 @@ function turnProblem(res, round) {
 function failTurn(st, round, problem, res) {
   st.phase = 'codex-failed';
   st.pending.error = problem;
-  if (res.threadId) st.pending.threadId = res.threadId;
   if (engineOf(st) === 'agy') st.pending.agyResult = { status: res.agyStatus, finished_reason: res.finished_reason, denied_actions: res.denied_actions, error: res.agyError };
   saveState(st);
   const tail = stderrTail(res.errPath, 15, engineOf(st) === 'agy');
@@ -1377,28 +1440,55 @@ function failTurn(st, round, problem, res) {
     + `Fix the cause, then run: node "${SELF}" retry --session ${st.id}`);
 }
 
-// A retried turn that Codex had begun before it was cut off (a time limit, a stop) goes on in that turn's own
-// thread with a short "carry on" prompt, so the work and the context built in it are kept, a first round's
-// too. Only while Codex's log of that thread exists; else, and after `retry --fresh`, the turn starts over.
-function interruptedThread(st) {
-  const id = st.pending?.threadId;
-  if (engineOf(st) === 'agy') {
-    const file = agyConversation(id);
-    return file && fs.existsSync(file) ? id : null;
-  }
-  return id && rolloutOf(st, id) ? id : null;
+// Codex can record the message before its turn.started event reaches stdout.
+// A settings record, an older message, or the mere existence of the log proves nothing.
+async function hasLoggedPrompt(st, pending, file) {
+  if (!pending.startedAt || !file.endsWith('.jsonl')) return false;
+  let input;
+  try {
+    const prompt = fs.readFileSync(path.join(sessionDir(st.id), `round-${pending.round}.prompt.md`), 'utf8').trimEnd();
+    input = fs.createReadStream(file);
+    for await (const line of createInterface({ input, crlfDelay: Infinity })) {
+      if (!line.includes('"user_message"') && !line.includes('"response_item"')) continue;
+      let record;
+      try { record = JSON.parse(line); } catch { continue; }
+      if (!(Date.parse(record.timestamp) >= Date.parse(pending.startedAt))) continue;
+      const p = record.payload;
+      if (record.type === 'event_msg' && p?.type === 'user_message' && p.message?.trimEnd() === prompt) return true;
+      if (record.type === 'response_item' && p?.type === 'message' && p.role === 'user'
+        && p.content?.some((c) => c.type === 'input_text' && c.text?.trimEnd() === prompt)) return true;
+    }
+  } catch {} finally { input?.destroy(); }
+  return false;
 }
 
-function savedThread(st) {
-  if (engineOf(st) !== 'agy') return st.codex.threadId;
-  const file = agyConversation(st.codex.threadId);
-  return file && fs.existsSync(file) ? st.codex.threadId : null;
+async function roundConversation(st, round) {
+  const pending = st.pending?.round === round ? st.pending : null;
+  const id = pending?.threadId ?? (round > 1 ? st.codex.threadId : null);
+  const agy = engineOf(st) === 'agy';
+  const file = id && (agy ? agyConversation(id) : rolloutOf(st, id));
+  if (!file || !fs.existsSync(file)) return { threadId: null, promptDelivered: false };
+  let delivered = false;
+  // Legacy pending.threadId alone may belong to the previous round. Replay the
+  // full feedback for such records, including when an old bare resume was logged.
+  if (pending?.threadId === id && typeof pending.promptDelivered === 'boolean') {
+    delivered = pending.promptDelivered === true || (!agy && await hasLoggedPrompt(st, pending, file));
+  }
+  return { threadId: id, promptDelivered: delivered };
+}
+
+async function beginAttempt(st, round, details) {
+  const release = await takeSlot(st, round, details);
+  st.phase = 'awaiting-codex';
+  st.pending = { round, ...details, startedAt: now(), codexModel: turnModel(st) };
+  saveState(st);
+  return release;
 }
 
 // A later round can lose its conversation (deleted DB or --fresh). Restore the same
 // initial instructions and request before the current-round prompt, without changing
 // the normal resumed path or the shipped prompt templates.
-function restoreAgyContext(st, round, initial, current) {
+function restoreContext(st, round, initial, current) {
   return `This is a new conversation for round ${round}. The initial instructions below restore the task context; the current-round instructions that follow them govern this reply.\n\n`
     + `${initial}\n\n${tag('existing_issue_ledger', '', JSON.stringify(st.issues, null, 2))}\n\n${current}`;
 }
@@ -1415,26 +1505,28 @@ function engineRoundResult(st, res) {
 async function runRound(st, round, payload) {
   clearApproval(st);
   const prev = st.rounds.at(-1)?.snapshot ?? null;
-  const snap = takeSnapshot(st, round);
-  const cutOff = interruptedThread(st);
-  const conversation = cutOff ?? (round === 1 ? null : savedThread(st));
-  let prompt = cutOff ? template('resume.md') : buildPrompt(st, round, snap, prev, payload);
-  if (engineOf(st) === 'agy' && round > 1 && !conversation) {
-    prompt = restoreAgyContext(st, round, buildPrompt(st, 1, snap, null, null, true), prompt);
+  const conversation = await roundConversation(st, round);
+  // A carry-on prompt continues the submitted snapshot, even if the checkout has
+  // changed. Older pending records without a snapshot need the complete prompt.
+  if (!st.pending?.snapshot) conversation.promptDelivered = false;
+  const snap = conversation.promptDelivered ? st.pending.snapshot : takeSnapshot(st, round);
+  let prompt = conversation.promptDelivered ? template('resume.md') : buildPrompt(st, round, snap, prev, payload);
+  if (conversation.promptDelivered && snap.tree) {
+    prompt += `\nYour verdict covers the submitted Git tree ${snap.tree}. Read its files with git show ${snap.tree}:<path>.\n`;
   }
-  const release = await takeSlot(st, round, { payload, threadId: cutOff ?? undefined });
-  const startedAt = now();
-  st.phase = 'awaiting-codex';
-  st.pending = { round, startedAt, payload, codexModel: turnModel(st) };
-  saveState(st);
+  if (round > 1 && !conversation.threadId) {
+    prompt = restoreContext(st, round, buildPrompt(st, 1, snap, null, null, true), prompt);
+  }
+  const release = await beginAttempt(st, round, { ...conversation, payload, snapshot: snap });
+  const { startedAt } = st.pending;
 
   let res;
   try {
-    res = await runCodex(st, round, prompt, conversation);
+    res = await runCodex(st, round, prompt, conversation.threadId);
   } finally {
     release();
   }
-  let problem = turnProblem(res, round);
+  let problem = turnProblem(res);
   let reply = null;
   if (!problem) {
     try {
@@ -1445,7 +1537,7 @@ async function runRound(st, round, payload) {
   }
   if (problem) failTurn(st, round, problem, res);
 
-  if (round === 1 || engineOf(st) === 'agy') st.codex.threadId = res.threadId;
+  st.codex.threadId = res.threadId;
   const quoteChecks = checkQuotes(st, reply, snap, round);
   const delta = mergeReply(st, reply, round);
   st.round = round;
@@ -1472,10 +1564,10 @@ async function runRound(st, round, payload) {
 }
 
 // Decide what comes next, persist it, and print the summary (plus the report when the loop stops).
-async function settle(st, reply) {
-  st.decision = await decide(st, reply);
+async function settle(st, reply, ownerOverride = false) {
+  st.decision = await decide(st, reply, ownerOverride);
   st.phase = PHASE_BY_ACTION[st.decision.action];
-  recordApproval(st);
+  recordApproval(st, ownerOverride);
   saveState(st);
   if (st.phase !== 'awaiting-author') fs.writeFileSync(path.join(sessionDir(st.id), 'report.md'), renderReport(st));
   process.stdout.write(`${renderSummary(st)}\n`);
@@ -1489,7 +1581,7 @@ async function recordOwnerDecisions(st, payload) {
     Object.assign(issue, { status: 'withdrawn', closedRound: st.round, parked: false });
     issue.history.push({ round: st.round, by: 'duet', status: 'withdrawn', note: `owner decision recorded at the round limit, without another ${engineName(st)} round` });
   }
-  await settle(st, { verdict: st.rounds.at(-1).verdict });
+  await settle(st, { verdict: st.rounds.at(-1).verdict }, true);
 }
 
 // ---------------------------------------------------------------- build mode
@@ -1512,24 +1604,112 @@ async function initBuildSubject(st, o, dir) {
   st.brief = path.join(dir, 'spec.md');
   const branch = checkToken(o.branch, 'branch', /^[\w./-]+$/) ?? `agent-duet/${st.id}`;
   const worktree = path.join(dir, 'worktree');
-  const added = git(['worktree', 'add', '-q', '-b', branch, worktree, base.stdout.trim()], { cwd: repo, allowFail: true });
+  const mainDirty = git(['status', '--porcelain'], { cwd: repo }).stdout.trim() !== '';
+  // Give the creation reflog entry a session-specific identity: a branch can be
+  // deleted and recreated at precisely the same commit, even in this worktree.
+  const branchCreator = `agent-duet ${st.id}`;
+  const added = git(['-c', 'core.logAllRefUpdates=true', 'worktree', 'add', '-q', '-b', branch, worktree, base.stdout.trim()], {
+    cwd: repo, env: { GIT_COMMITTER_NAME: branchCreator }, allowFail: true,
+  });
   if (added.status !== 0) throw new UsageError(`cannot create the worktree: ${(added.stderr || '').trim()}`);
   st.subject = {
     repo,
     worktree: fs.realpathSync(worktree),
     branch,
+    branchCreator,
     base: base.stdout.trim(),
     spec: path.join(dir, 'spec.md'),
-    mainDirty: git(['status', '--porcelain'], { cwd: repo }).stdout.trim() !== '',
+    mainDirty,
   };
   st.cwd = st.subject.worktree;
 }
 
-function removeWorktree(st, { deleteBranch }) {
+function registeredWorktrees(repo) {
+  return git(['worktree', 'list', '--porcelain', '-z'], { cwd: repo }).stdout.split('\0\0').filter(Boolean).map((entry) => {
+    const [location, ...fields] = entry.split('\0');
+    return {
+      path: realPath(location.slice('worktree '.length)),
+      ref: fields.find((f) => f.startsWith('branch '))?.slice('branch '.length),
+      locked: fields.some((f) => f === 'locked' || f.startsWith('locked ')),
+    };
+  });
+}
+
+function movedBuildBranchError(st, detail) {
+  const { worktree, branch, base } = st.subject;
+  return new UsageError(`${detail}\nInspect the commits in the build worktree (${worktree}) with\n`
+    + `  git log --oneline ${base}..refs/heads/${branch} --\n`
+    + 'You can finish the branch by hand. To continue with the runner, save the current tip on a backup branch, then run in this worktree\n'
+    + `  git reset --soft ${base}\nThis keeps the index and working files. Rerun the original command.`);
+}
+
+// A build starts with worktree add -b at base. The runner is the only party
+// expected to move that ref, when it makes the finish commit.
+function checkBuildWorktree(st, expectedHead = st.subject.base, removing = false) {
   const { repo, worktree, branch } = st.subject;
-  git(['worktree', 'remove', '--force', worktree], { cwd: repo, allowFail: true });
-  git(['worktree', 'prune'], { cwd: repo, allowFail: true });
-  if (deleteBranch) git(['branch', '-D', branch], { cwd: repo, allowFail: true });
+  const ref = `refs/heads/${branch}`;
+  const entries = registeredWorktrees(repo);
+  const entry = entries.find((e) => e.path === realPath(worktree));
+  if (!entry || !fs.existsSync(worktree) || realPath(st.cwd) !== entry.path) {
+    throw new UsageError(`${worktree} is not the registered build worktree of ${repo}`);
+  }
+  const commonDir = (cwd) => realPath(git(['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd }).stdout.trimEnd());
+  const top = git(['rev-parse', '--show-toplevel'], { cwd: worktree, allowFail: true });
+  if (top.status !== 0 || realPath(top.stdout.trimEnd()) !== entry.path || commonDir(worktree) !== commonDir(repo)
+    || entry.path === realPath(repo)) throw new UsageError(`the build worktree does not belong to ${repo}`);
+  const symbolic = git(['symbolic-ref', '-q', 'HEAD'], { cwd: worktree, allowFail: true });
+  if (entry.ref !== ref || symbolic.stdout.trimEnd() !== ref || symbolic.status !== 0) {
+    throw new UsageError(`the build worktree HEAD must be attached to ${ref}`);
+  }
+  if (removing && (entry.locked || entries.some((e) => e !== entry && e.ref === ref))) {
+    throw new UsageError(`the build worktree is locked or ${branch} is also checked out elsewhere`);
+  }
+  const head = git(['rev-parse', '--verify', ref], { cwd: repo }).stdout.trim();
+  // Check ownership before removing a branch or suggesting a reset of an unexpected tip.
+  if ((removing || head !== expectedHead) && st.subject.branchCreator) {
+    const creators = git(['reflog', 'show', '--format=%gn', ref], { cwd: repo }).stdout.split('\n');
+    if (!creators.includes(st.subject.branchCreator)) throw new UsageError(`cannot confirm that this session created build branch ${branch}`);
+  }
+  if (expectedHead && head !== expectedHead) {
+    throw movedBuildBranchError(st, `build branch ${branch} moved: expected ${expectedHead}, found ${head}`);
+  }
+  return head;
+}
+
+function removeWorktree(st, force) {
+  const { repo, worktree } = st.subject;
+  git(['worktree', 'remove', ...(force ? ['--force'] : []), worktree], { cwd: repo });
+  if (fs.lstatSync(worktree, { throwIfNoEntry: false }) || registeredWorktrees(repo).some((e) => e.path === realPath(worktree))) {
+    throw new Error(`Git did not remove the build worktree ${worktree}`);
+  }
+}
+
+function discardWorktree(st) {
+  const { repo, worktree, branch, base } = st.subject;
+  const ref = `refs/heads/${branch}`;
+  checkBuildWorktree(st, base, true);
+  // Compare-and-delete before touching the files. A ref lock or an unexpected
+  // update leaves the checkout intact. Restore only an absent ref if removal fails.
+  git(['update-ref', '--no-deref', '-d', ref, base], { cwd: repo });
+  try {
+    removeWorktree(st, true);
+  } catch (err) {
+    if (fs.existsSync(worktree)) {
+      const env = st.subject.branchCreator ? { GIT_COMMITTER_NAME: st.subject.branchCreator } : undefined;
+      git(['update-ref', '--no-deref', '--create-reflog', '-m', 'restore build after refused discard', ref, base, ''], { cwd: repo, env });
+    }
+    throw err;
+  }
+  const remaining = git(['show-ref', '--verify', '--quiet', ref], { cwd: repo, allowFail: true });
+  if (remaining.status !== 1) throw new Error(`could not confirm deletion of ${ref}`);
+}
+
+function guardFinalization(st, allowFailed) {
+  if (['finished', 'discarded'].includes(st.phase)) throw new UsageError(`this build was already ${st.phase}`);
+  // A settled failure was saved after the child and its process group were reaped,
+  // or while still queued. The caller holds the same lock as a running turn.
+  if (allowFailed && st.phase === 'codex-failed') return;
+  guardIdle(st);
 }
 
 function normalizeAuthorReply(raw) {
@@ -1582,8 +1762,16 @@ function issuesForAuthor(st) {
     if (i.recommendation) lines.push(`  suggested fix: ${indent(i.recommendation, '  ')}`);
     const quote = quoteCheckLine(i);
     if (quote) lines.push(`  ${quote}`);
-    // codexReply holds the reviewer's latest reply: Claude's, in build mode
-    if (i.codexReply) lines.push(`  ${i.ownerRuled ? 'Owner decision (final)' : 'architect on your last answer'}: ${indent(i.codexReply, '  ')}`);
+    // Older ledgers marked a relayed ruling immediately before its reviewer entry.
+    const legacyRuling = i.ownerRuled && !i.ownerRuling
+      ? i.history.findLastIndex((h) => h.by === 'duet' && h.note?.startsWith('owner decision relayed by the reviewer')) : -1;
+    const relayed = legacyRuling >= 0 ? i.history[legacyRuling + 1] : null;
+    const ruling = i.ownerRuling?.text || (relayed?.by === 'claude' && relayed.reply);
+    if (ruling) lines.push(`  Owner decision (final): ${indent(ruling, '  ')}`);
+    const latest = i.history.findLast((h) => h.by === 'claude');
+    if (i.codexReply && !latest?.owner && latest !== relayed) {
+      lines.push(`  architect on your last answer: ${indent(i.codexReply, '  ')}`);
+    }
   }
   return lines.join('\n') || '(no open issues: check your work against the specification once more)';
 }
@@ -1591,10 +1779,9 @@ function issuesForAuthor(st) {
 // One implementation turn of Codex. The caller holds the session lock.
 async function runBuildTurn(st, round, review) {
   clearApproval(st);
-  const cutOff = interruptedThread(st);
-  const conversation = cutOff ?? (round === 1 ? null : savedThread(st));
+  const conversation = await roundConversation(st, round);
   const initial = () => fill(template('build-round1.md'), { WORKSPACE: workspaceText(st), SPEC: fs.readFileSync(st.subject.spec, 'utf8').trim() });
-  let prompt = cutOff
+  let prompt = conversation.promptDelivered
     ? template('resume.md')
     : round === 1
       ? initial()
@@ -1605,20 +1792,17 @@ async function runBuildTurn(st, round, review) {
         ISSUES: issuesForAuthor(st),
         REQUEST_RULING: requestRulingLine(st),
       });
-  if (engineOf(st) === 'agy' && round > 1 && !conversation) prompt = restoreAgyContext(st, round, initial(), prompt);
-  const release = await takeSlot(st, round, { review, threadId: cutOff ?? undefined });
-  const startedAt = now();
-  st.phase = 'awaiting-codex';
-  st.pending = { round, startedAt, review, codexModel: turnModel(st) };
-  saveState(st);
+  if (round > 1 && !conversation.threadId) prompt = restoreContext(st, round, initial(), prompt);
+  const release = await beginAttempt(st, round, { ...conversation, review });
+  const { startedAt } = st.pending;
 
   let res;
   try {
-    res = await runCodex(st, round, prompt, conversation, BUILD_SCHEMA);
+    res = await runCodex(st, round, prompt, conversation.threadId, BUILD_SCHEMA);
   } finally {
     release();
   }
-  let problem = turnProblem(res, round);
+  let problem = turnProblem(res);
   let reply = null;
   if (!problem) {
     try {
@@ -1629,7 +1813,7 @@ async function runBuildTurn(st, round, review) {
   }
   if (problem) failTurn(st, round, problem, res);
 
-  if (round === 1 || engineOf(st) === 'agy') st.codex.threadId = res.threadId;
+  st.codex.threadId = res.threadId;
   applyAuthorReply(st, reply, round);
   st.round = round;
   st.rounds.push({
@@ -1795,6 +1979,9 @@ async function cmdReview(o) {
     if (review.request_check.owner === true) recordRequestRuling(st, review.request_check);
     const quoteChecks = checkQuotes(st, review, st.rounds.at(-1)?.snapshot, st.round);
     mergeReply(st, review, st.round);
+    if (review.verdict === 'revise' && !Object.values(st.issues).some((i) => i.status === 'open')) {
+      throw new UsageError('revise needs an open issue: approve the build or raise an issue describing the change');
+    }
     Object.assign(st.rounds.at(-1), {
       verdict: review.verdict,
       summary: review.summary,
@@ -1873,9 +2060,9 @@ async function cmdFinish(o) {
   try {
     const st = loadState(id);
     if (st.kind !== 'build') throw new UsageError('finish is for --kind build sessions');
-    guardIdle(st);
+    guardFinalization(st, o.unreviewed);
     const { repo, worktree, branch, base } = st.subject;
-    if (!fs.existsSync(worktree)) throw new UsageError(`the worktree is gone already (phase: ${st.phase})`);
+    const previousHead = checkBuildWorktree(st, base, true);
     if (!st.approval && !o.unreviewed) {
       throw new UsageError('the content was not approved; the owner can finish anyway with finish --unreviewed');
     }
@@ -1886,37 +2073,67 @@ async function cmdFinish(o) {
     }
     const finish = { unreviewed: Boolean(o.unreviewed), round: st.round, phase: st.phase, at: now() };
     const unreviewedNote = `Owner finished without an approval (round ${st.round}, phase ${st.phase}); session ${st.id}.`;
-    const previousHead = git(['rev-parse', 'HEAD'], { cwd: worktree }).stdout.trim();
     // A rejected commit leaves the session and the user's staging as they were.
     const index = path.resolve(worktree, git(['rev-parse', '--git-path', 'index'], { cwd: worktree }).stdout.trim());
     const indexBefore = fs.existsSync(index) ? { data: fs.readFileSync(index), stat: fs.statSync(index) } : null;
+    let madeCommit = false;
     try {
       git(['add', '-A'], { cwd: worktree });
-      if (git(['diff', '--cached', '--quiet'], { cwd: worktree, allowFail: true }).status !== 0) {
-        git(['commit', '-q', '-m', commitSubject(specTitle(st)), '-m', o.unreviewed ? unreviewedNote
+      if (o.unreviewed || gitChanged(['--cached'], worktree)) {
+        checkBuildWorktree(st, previousHead, true);
+        git(['commit', '-q', ...(o.unreviewed ? ['--allow-empty'] : []), '-m', commitSubject(specTitle(st)), '-m', o.unreviewed ? unreviewedNote
           : `Implemented by ${engineName(st)}, reviewed by Claude in ${st.round} round(s); session ${st.id}.`], { cwd: worktree });
+        madeCommit = true;
       }
     } catch (err) {
+      checkBuildWorktree(st, previousHead); // never restore an index over a replacement checkout
       if (indexBefore) {
         fs.writeFileSync(index, indexBefore.data);
         fs.utimesSync(index, indexBefore.stat.atime, indexBefore.stat.mtime);
       } else fs.rmSync(index, { force: true });
       throw err;
     }
-    const head = git(['rev-parse', 'HEAD'], { cwd: worktree }).stdout.trim();
-    const committedTree = git(['rev-parse', 'HEAD^{tree}'], { cwd: worktree }).stdout.trim();
-    if (!o.unreviewed && committedTree !== st.approval.tree) {
-      git(['reset', '--soft', previousHead], { cwd: worktree });
-      postApprovalRound(st, snapshotTree(st, `hooks-${process.pid}`), 'Commit hooks changed the approved content; their commit was undone.');
-      return;
+    const ref = `refs/heads/${branch}`;
+    const head = checkBuildWorktree(st, madeCommit ? null : previousHead);
+    if (madeCommit && git(['rev-parse', `${head}^`], { cwd: repo }).stdout.trim() !== previousHead) {
+      throw movedBuildBranchError(st, `build branch ${branch} moved during commit`);
     }
+    const committedTree = git(['rev-parse', `${head}^{tree}`], { cwd: repo }).stdout.trim();
+    const undoCommit = () => {
+      if (madeCommit) git(['update-ref', '--no-deref', ref, previousHead, head], { cwd: repo });
+    };
+    const dirty = () => git(['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none'], { cwd: worktree }).stdout !== '';
+    const returnChanges = () => {
+      undoCommit(); // move only our ref; keep the index and the working files
+      if (o.unreviewed) throw new UsageError('the commit left edits in the worktree. The files were kept; inspect them before finishing again');
+      postApprovalRound(st, snapshotTree(st, `hooks-${process.pid}`), 'The worktree or commit hooks changed the approved content during finish.');
+    };
+    if (o.unreviewed && !git(['log', '-1', '--format=%B', head], { cwd: repo }).stdout.includes(unreviewedNote)) {
+      undoCommit();
+      throw new UsageError('the commit hook removed the unreviewed finish note; the worktree was kept');
+    }
+    if ((!o.unreviewed && committedTree !== st.approval.tree) || dirty()) return returnChanges();
     if (o.unreviewed) {
       const lastApproval = st.approval ?? st.lastApproval;
       finish.approvedTree = lastApproval?.tree ?? null;
       finish.pathStates = compareApproval(st, committedTree, lastApproval).paths;
     }
-    removeWorktree(st, { deleteBranch: false });
+    try {
+      checkBuildWorktree(st, head, true);
+      removeWorktree(st, false); // Git checks cleanliness again at the point of removal.
+    } catch (err) {
+      if (fs.existsSync(worktree)) {
+        checkBuildWorktree(st, head);
+        if (dirty()) return returnChanges();
+        undoCommit();
+      }
+      throw err;
+    }
+    if (git(['rev-parse', '--verify', ref], { cwd: repo }).stdout.trim() !== head) {
+      throw new UsageError(`branch ${branch} moved during cleanup; the finish commit was ${head}`);
+    }
     Object.assign(st.subject, { commit: head, committedTree });
+    delete st.pending;
     st.finish = finish;
     st.phase = 'finished';
     saveState(st);
@@ -1939,8 +2156,9 @@ async function cmdDiscard(o) {
   try {
     const st = loadState(id);
     if (st.kind !== 'build') throw new UsageError('discard is for --kind build sessions');
-    guardIdle(st);
-    removeWorktree(st, { deleteBranch: true });
+    guardFinalization(st, true);
+    discardWorktree(st);
+    delete st.pending;
     st.phase = 'discarded';
     saveState(st);
     console.log(`agent-duet ${st.id}: the worktree is removed and ${st.subject.branch} is deleted.`);
@@ -2010,23 +2228,20 @@ function normalizeAuditReply(raw) {
 // The one turn of an audit, in the session's directory with a read-only sandbox. The caller holds the lock.
 async function runAuditTurn(st) {
   const round = 1;
-  const cutOff = interruptedThread(st);
-  const prompt = cutOff
+  const conversation = await roundConversation(st, round);
+  const prompt = conversation.promptDelivered
     ? template('resume.md')
     : fill(template('audit.md'), { TASK: fs.readFileSync(st.subject.task, 'utf8').trim(), WORKSPACE: auditWorkspace(st) });
-  const release = await takeSlot(st, round, { threadId: cutOff ?? undefined });
-  const startedAt = now();
-  st.phase = 'awaiting-codex';
-  st.pending = { round, startedAt, codexModel: turnModel(st) };
-  saveState(st);
+  const release = await beginAttempt(st, round, conversation);
+  const { startedAt } = st.pending;
 
   let res;
   try {
-    res = await runCodex(st, round, prompt, cutOff, AUDIT_SCHEMA);
+    res = await runCodex(st, round, prompt, conversation.threadId, AUDIT_SCHEMA);
   } finally {
     release();
   }
-  let problem = turnProblem(res, round);
+  let problem = turnProblem(res);
   let reply = null;
   if (!problem) {
     try {
@@ -2442,7 +2657,7 @@ async function cmdStart(o) {
   } catch (err) {
     // Drop the session only if no Codex round ever ran; a failed round stays for `retry`.
     if (st.round === 0 && st.phase !== 'codex-failed') {
-      if (st.kind === 'build' && st.subject.worktree) removeWorktree(st, { deleteBranch: true });
+      if (st.kind === 'build' && st.subject.worktree) discardWorktree(st);
       fs.rmSync(dir, { recursive: true, force: true });
     }
     throw err;
@@ -2496,10 +2711,11 @@ async function cmdRetry(o) {
   try {
     const st = loadState(id);
     guardEngine(st, o);
-    if (!st.pending) throw new UsageError(`nothing to retry in ${st.id} (phase: ${st.phase})`);
+    if (!st.pending || ['finished', 'discarded'].includes(st.phase)) throw new UsageError(`nothing to retry in ${st.id} (phase: ${st.phase})`);
     if (o.fresh) {
-      delete st.pending.threadId; // start the turn over instead of continuing the cut-off one
-      if (engineOf(st) === 'agy') st.codex.threadId = null;
+      st.pending.threadId = null;
+      st.pending.promptDelivered = false;
+      st.codex.threadId = null;
     }
     switchCodex(st, o);
     saveState(st);
@@ -2513,6 +2729,10 @@ async function cmdRetry(o) {
 
 function cmdStatus(o) {
   const st = resolveSession(o.session);
+  if (st.kind === 'build' && ['finished', 'discarded'].includes(st.phase)) {
+    console.log(`agent-duet ${st.id}: build ${st.phase} (${st.subject.branch}${st.subject.commit ? ` at ${st.subject.commit}` : ''})`);
+    return;
+  }
   if (st.pending) {
     const busy = lockHolder(st);
     const waiting = st.phase === 'queued'
@@ -2541,14 +2761,33 @@ function cmdVerify(o) {
       `${check.source}: ${check.tree}`,
       ...pathStateLines(check.paths),
     ];
+    let indexMismatch = false;
+    if (st.approval && check.source === 'Working tree') {
+      const paths = diffPaths(st.cwd, '--cached', st.approval.tree);
+      if (paths.size) {
+        // Without an explicit tree Git compares the index to HEAD, or to the empty tree on an unborn branch.
+        const staged = diffPaths(st.cwd, '--cached');
+        L.push(st.kind === 'build' ? 'Staged tree differs from the approved tree:' : 'Index compared with the approved tree:');
+        for (const file of paths) {
+          const included = staged.has(file);
+          L.push(`- ${included ? 'unapproved staged content' : 'not staged'}: ${JSON.stringify(file)}`);
+          if (included) indexMismatch = true;
+        }
+        if (st.kind === 'build') {
+          indexMismatch = staged.size > 0;
+          if (!indexMismatch) L.push('Nothing is staged. Build finish will stage the approved worktree.');
+        }
+      } else L.push('Staged tree matches the approved tree.');
+    }
     if (!check.matches && st.kind === 'code') {
       L.push(`Send the changes back to ${engineName(st)}:`, '```bash',
         `node "${SELF}" reply --session ${st.id} --responses - <<'DUET_JSON'`,
         '{"changes": "<what changed after the approval>", "responses": []}', 'DUET_JSON', '```');
     }
-    L.push(approvalVerdict(check));
+    L.push(`${check.source}: ${approvalVerdict(check)}`);
+    if (indexMismatch) L.push('Verification failed: the staged tree differs from the approval.');
     console.log(L.join('\n'));
-    if (!check.matches) process.exitCode = 1;
+    if (!check.matches || indexMismatch) process.exitCode = 1;
   } finally {
     release();
   }
@@ -2575,7 +2814,10 @@ function cmdList(o) {
     console.log(o.all ? 'no sessions' : 'no sessions for this directory (try --all)');
     return;
   }
-  for (const s of rows) console.log(`${s.id}  ${s.kind.padEnd(4)}  round ${s.round}/${s.maxRounds}  ${s.phase.padEnd(15)}  ${s.cwd}${engineOf(s) === 'agy' ? '  agy' : ''}`);
+  for (const s of rows) {
+    const project = s.kind === 'build' ? `${s.subject.repo} (${s.subject.branch})` : s.cwd;
+    console.log(`${s.id}  ${s.kind.padEnd(4)}  round ${s.round}/${s.maxRounds}  ${s.phase.padEnd(15)}  ${project}${engineOf(s) === 'agy' ? '  agy' : ''}`);
+  }
 }
 
 const COMMANDS = {
@@ -2593,6 +2835,16 @@ const COMMANDS = {
 };
 
 async function main() {
+  // A hook or wrapper can export its own repository, index and object store. Clear
+  // Git's repository-local environment once, including for adapters and their children.
+  for (const key of [
+    'GIT_DIR', 'GIT_WORK_TREE', 'GIT_IMPLICIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE',
+    'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_QUARANTINE_PATH',
+    'GIT_NAMESPACE', 'GIT_PREFIX', 'GIT_INTERNAL_SUPER_PREFIX', 'GIT_SHALLOW_FILE', 'GIT_GRAFT_FILE',
+    'GIT_NO_REPLACE_OBJECTS', 'GIT_REPLACE_REF_BASE', 'GIT_CEILING_DIRECTORIES', 'GIT_DISCOVERY_ACROSS_FILESYSTEM',
+    'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT',
+    ...Object.keys(process.env).filter((k) => /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(k)),
+  ]) delete process.env[key];
   STATE_HOME = stateRoot();
   const { cmd, o } = parseArgs(process.argv.slice(2));
   const command = COMMANDS[cmd];
