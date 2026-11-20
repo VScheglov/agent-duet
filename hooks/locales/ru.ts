@@ -53,7 +53,6 @@ export const ru: Locale = {
   browsesFiles: 'осматривает файлы',
   searchesWeb: (query: string) => `ищет в сети «${query}»`,
   audit: 'аудит',
-  statusTasks: (running: number, queued: number) => `agent-duet: идут ${running}${queued ? ` · в очереди ${queued}` : ''}`,
   toastGone: (tag: string, round: number) => `${tag}agent-duet: процесс раунда ${round} пропал — нужен retry`,
   toastStarted: (tag: string, audit: boolean, round: number | null, engine = 'Codex') => `${tag}${engine} начал ${audit ? 'аудит' : `раунд ${round}`}`,
   toastQueued: (tag: string, round: number, engine = 'Codex') => `${tag}раунд ${round} ждёт в очереди к ${engine}`,

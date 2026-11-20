@@ -48,7 +48,6 @@ export const en = {
   browsesFiles: 'browses files',
   searchesWeb: (query: string) => `searches the web for “${query}”`,
   audit: 'audit',
-  statusTasks: (running: number, queued: number) => `agent-duet: ${running} running${queued ? ` · ${queued} queued` : ''}`,
   toastGone: (tag: string, round: number) => `${tag}agent-duet: round ${round} process disappeared — retry needed`,
   toastStarted: (tag: string, audit: boolean, round: number | null, engine = 'Codex') => `${tag}${engine} started ${audit ? 'an audit' : `round ${round}`}`,
   toastQueued: (tag: string, round: number, engine = 'Codex') => `${tag}round ${round} is queued for ${engine}`,

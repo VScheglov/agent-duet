@@ -963,7 +963,8 @@ await test('several tasks: the pane lists them, a row opens its details, footer 
   const detail = lines(await E.render('Pane'));
   assert.ok(detail.some((l) => l.startsWith(`${T.two} · `)) && detail.some((l) => l.startsWith('⏸ ждёт свободного Codex, в очереди 1-я')), detail.join('\n'));
   assert.match((await footer(E))[0], /^\[Duet ×\d+ ⏳1 ⏸1 🙋\]$/);
-  assert.equal(E.statuses.at(-1), 'agent-duet: идут 1 · в очереди 1');
+  // The footer label is the one compact indicator; the host status (prefixed with the plugin's name) only gets cleared.
+  assert.ok(E.statuses.every((s) => s === undefined), E.statuses.join('\n'));
   assert.match(lines(await E.render('AbovePrompt'))[0], / · ещё задач: \d+$/);
 });
 
@@ -1601,7 +1602,8 @@ for (const [language, modelLine] of [
     await engine.tick();
     let pane = lines(await engine.render('Pane')).join('\n');
     assert.ok(pane.includes(modelLine), pane);
-    assert.match(lines(await engine.render('AbovePrompt')).join('\n'), /^⏳ agy gemini-3\.8-flash-low\/low/);
+    // The slug already ends in its level: "gemini-3.8-flash-low", not "gemini-3.8-flash-low/low".
+    assert.match(lines(await engine.render('AbovePrompt')).join('\n'), /^⏳ agy gemini-3\.8-flash-low · r\d+\//);
     write({ engine: 'agy', phase: 'done', rounds: [{ n: 1, codexModel, verdict: 'approve' }] });
     await engine.tick();
     pane = lines(await engine.render('Pane')).join('\n');

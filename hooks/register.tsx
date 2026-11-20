@@ -159,8 +159,11 @@ function modelText(m: DuetModel, engine = 'Codex') {
 }
 
 // "gpt-6.1-sol/max ⚡" for the band, or nothing when the turn runs on unrecorded defaults.
-const modelTag = (m: DuetModel, engine = 'Codex') =>
-  [[m.model, m.effort].filter(Boolean).join('/'), engine !== 'agy' && isFast(m) ? '⚡' : ''].filter(Boolean).join(' ')
+// An agy slug already ends in its level (gemini-4-neon-xhigh): the level is not repeated.
+const modelTag = (m: DuetModel, engine = 'Codex') => {
+  const repeated = Boolean(m.model && m.effort && m.model.toLowerCase().endsWith(`-${m.effort.toLowerCase()}`))
+  return [[m.model, repeated ? '' : m.effort].filter(Boolean).join('/'), engine !== 'agy' && isFast(m) ? '⚡' : ''].filter(Boolean).join(' ')
+}
 
 // "▰▰▰▱▱▱▱▱▱▱": how many of the issues are closed, at a glance
 const progress = (done: number, total: number, cells = 10) =>
@@ -273,7 +276,9 @@ let lastTrace = ''
 let lastView: DuetView | null = null
 // This session's tasks in play, as last published: what the Stop hold, the session note and the cues use.
 let lastList: DuetView[] = []
-let hasStatus = false
+// 0.14.0 and older also set a host status ("agent-duet r1/1 · 9:38"); the footer label shows the same and
+// opens the pane, and the host prefixes a status with the plugin's name, so it read twice. Clear it once.
+let statusCleared = false
 const openedFor = new Set<string>()
 const goneAnnounced = new Set<string>()
 // The cached runner liveness and event digests, keyed by session.
@@ -691,21 +696,13 @@ async function playAll($: EngineInterface) {
 const CUE_RANK: Record<Cue, number> = { decision: 3, error: 2, done: 1 }
 const loudest = (cues: Cue[]) => cues.reduce<Cue | null>((best, c) => (!best || CUE_RANK[c] > CUE_RANK[best] ? c : best), null)
 
-// Status line, auto-opened pane, toasts and sounds for every task this Claude session drives; another
+// Auto-opened pane, toasts and sounds for every task this Claude session drives; another
 // session's reviews stay silent here. With several tasks, each toast names its task.
 async function announce($: EngineInterface, list: DuetView[]) {
   const prefs: DuetPrefs = { ...DEFAULT_PREFS, ...(await read($, prefsAtom)) }
-  const running = list.filter((v) => v.runningRound)
-  const queued = list.filter((v) => v.isQueued)
-  if (prefs.band && (running.length || queued.length)) {
-    const one = running.length === 1 && !queued.length ? running[0] : null
-    $.ui.status(one
-      ? `agent-duet r${one.runningRound}/${one.maxRounds} · ${clock(one.elapsedMs)}`
-      : locale.statusTasks(running.length, queued.length))
-    hasStatus = true
-  } else if (hasStatus) {
+  if (!statusCleared) {
     $.ui.status(undefined)
-    hasStatus = false
+    statusCleared = true
   }
   const isMany = list.filter((v) => v.isActive).length > 1
   const raised: Cue[] = []

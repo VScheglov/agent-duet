@@ -181,7 +181,7 @@ The module reads the session files every 2 seconds and shows the review that bel
 | Surface | Contents |
 |---|---|
 | **Pane** (`/duet`) | Everything about the session; see the list below |
-| **Status band** above the prompt, and the status line | Phase, timer, current delegate action; other modules' bands stay below it |
+| **Status band** above the prompt | Phase, timer, current delegate action; other modules' bands stay below it |
 | **Footer** | A label such as “Duet r3 ⏳ 4:12”; click it to open the pane. Visible even when the band is turned off |
 | **Toasts** | Round start and end, escalation, failure; after a round, a “continue agent-duet” suggestion (Tab) |
 | **Sound** | Escalation (your decision is needed), review completion, round failure, or a missing delegate process; Claude's own turns make no sound. Uses the Claude app's built-in sounds `tool_approval_needed`, `enter_voice_mode` and `disconnected`, played by the app rather than copied into the plugin. Without the app, fallback sounds from `sounds/` play |

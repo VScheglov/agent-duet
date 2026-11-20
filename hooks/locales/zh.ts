@@ -47,7 +47,6 @@ export const zh: Locale = {
   browsesFiles: '浏览文件',
   searchesWeb: (query: string) => `在网上搜索“${query}”`,
   audit: '审计',
-  statusTasks: (running: number, queued: number) => `agent-duet: ${running} 个运行中${queued ? ` · ${queued} 个排队中` : ''}`,
   toastGone: (tag: string, round: number) => `${tag}agent-duet: 第 ${round} 轮进程已消失，请运行 retry`,
   toastStarted: (tag: string, audit: boolean, round: number | null, engine = 'Codex') => `${tag}${engine} 已开始${audit ? '审计' : `第 ${round} 轮`}`,
   toastQueued: (tag: string, round: number, engine = 'Codex') => `${tag}第 ${round} 轮正在排队等待 ${engine}`,
