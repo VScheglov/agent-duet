@@ -2737,6 +2737,32 @@ const changedQuote = 'const newerUnreviewedValue = "after review started";';
 const otherQuote = 'export const otherEvidence = "another file";';
 const otherQuoteFile = 'other\tfile\n数据.js';
 
+await test('quotes: absent paths search the snapshot and short multiline quotes keep their CRLF line numbers', () => {
+  const dir = approvalRepo();
+  const file = path.join(dir, 'lines.txt');
+  const body = 'pad\r\n'.repeat(5) + 'alpha\r\nbeta\r\n';
+  fs.writeFileSync(file, body);
+  git(['-c', 'core.autocrlf=false', 'add', 'lines.txt'], dir);
+  const tree = git(['write-tree'], dir).trim();
+  assert.equal(git(['cat-file', 'blob', `${tree}:lines.txt`], dir), body);
+  const docs = [{ listed: 'lines.txt', path: file, exists: true, snap: file }];
+  const marks = {};
+  for (const kind of ['code', 'build', 'file', 'plan']) {
+    const issues = [
+      quotedIssue('C1', 'alpha\nbeta', { path: 'lines.txt', line: 1 }),
+      quotedIssue('C2', 'alpha\nbeta', { path: 'lines.txt', line: 6 }),
+      quotedIssue('C3', 'alpha\nbeta', { path: 'invented.txt' }),
+      quotedIssue('C4', 'alpha\nabsent', { path: 'invented.txt' }),
+    ];
+    const snapshot = ['code', 'build'].includes(kind) ? { tree } : { docs };
+    const checks = checkQuotes({ kind, cwd: dir, issues: {} }, { issues }, snapshot, 1);
+    marks[kind] = Object.values(checks).map((c) => c.mark);
+    assert.equal(checks.C3.path, 'invented.txt');
+  }
+  const expected = ['moved:6', 'ok', 'other_file:lines.txt', 'MISSING'];
+  assert.deepEqual(marks, { code: expected, build: expected, file: expected, plan: expected });
+});
+
 await test('quotes: code marks ok, moved, other_file, MISSING and unchecked, using the saved tree despite reviewer writes', () => {
   quoteRepo = approvalRepo();
   fs.writeFileSync(path.join(quoteRepo, 'checked.js'), `const a = 1;\n${snapshotQuote}\n`);
@@ -2885,7 +2911,7 @@ await test('quotes: multi-file reviews search only saved subject copies, with no
   const r = duet(['start', '--kind', 'file', '--subject', 'first.md', '--subject', 'second.md'], { cwd: dir });
   assert.equal(r.code, 0, r.err);
   assert.deepEqual(Object.values(state(sessionId(r.out)).issues).map((i) => i.quoteCheck.mark),
-    ['other_file:second.md', 'MISSING', 'unchecked', 'unchecked', 'other_file:second.md', 'MISSING']);
+    ['other_file:second.md', 'MISSING', 'unchecked', 'other_file:first.md', 'other_file:second.md', 'MISSING']);
 });
 
 await test('quotes: build review checks the reviewed tree, sends anomalies to Codex, and accepts legacy Claude reviews', () => {
@@ -2967,12 +2993,25 @@ await test('quotes: unavailable trees/files and binary document copies are unche
   assert.equal(mark('code', undefined), 'unchecked');
   assert.equal(mark('code', { tree: 'f'.repeat(40) }), 'unchecked');
   const tree = state(quoteSession).rounds[0].snapshot.tree;
-  assert.equal(mark('code', { tree }, { path: 'nonexistent.js' }), 'unchecked');
+  assert.equal(mark('code', { tree }, { path: 'nonexistent.js' }), 'other_file:checked.js');
+  const incomplete = spawnSync('git', ['mktree', '--missing'], { cwd: quoteRepo, encoding: 'utf8',
+    input: `100644 blob ${'f'.repeat(tree.length)}\tunreadable.js\n` });
+  assert.equal(incomplete.status, 0, incomplete.stderr);
+  for (const file of ['unreadable.js', 'nonexistent.js']) {
+    assert.equal(mark('code', { tree: incomplete.stdout.trim() }, { path: file }), 'unchecked');
+  }
   assert.equal(mark('file', { docs: [{ path: 'source.md', snap: path.join(tmp, 'missing-copy'), exists: true }] }, { path: '' }), 'unchecked');
   const snap = path.join(tmp, 'legacy-doc-copy');
   fs.writeFileSync(snap, `${snapshotQuote}\n`);
   const oldSnapshot = { docs: [{ path: path.join(quoteRepo, 'source.md'), snap, exists: true }] };
   assert.equal(mark('plan', oldSnapshot, { path: 'source.md', line: 1 }), 'ok');
+  const deletedDoc = { path: path.join(quoteRepo, 'gone.md'), listed: 'gone.md', exists: false };
+  assert.equal(mark('plan', { docs: [...oldSnapshot.docs, deletedDoc] }, { path: 'gone.md' }), `other_file:${oldSnapshot.docs[0].path}`);
+  assert.equal(mark('plan', oldSnapshot, { path: 'typo.md', quote: 'first\r\nsecond' }), 'MISSING');
+  fs.writeFileSync(snap, 'first\nsecond\n');
+  assert.equal(mark('plan', oldSnapshot, { path: 'typo.md', quote: 'first\r\nsecond' }), `other_file:${oldSnapshot.docs[0].path}`);
+  fs.rmSync(snap);
+  assert.equal(mark('plan', oldSnapshot, { path: 'typo.md' }), 'unchecked', 'the only saved copy is unreadable');
   fs.writeFileSync(snap, `binary\0${snapshotQuote}`);
   assert.equal(mark('file', oldSnapshot, { path: '' }), 'unchecked');
 });

@@ -3,14 +3,15 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
-function needlesFor(quote) {
+function needlesFor(rawQuote) {
+  const quote = rawQuote.replaceAll('\r\n', '\n');
   const lines = [...new Set(quote.split('\n').map((line) => line.trim()).filter((line) => line.length >= 12))];
   return lines.length ? lines.sort((a, b) => b.length - a.length).slice(0, 3)
     : quote.trim().length >= 6 ? [quote.trim()] : [];
 }
 
 const variants = (needle) => /^[+\- ]/.test(needle) ? [needle, needle.slice(1).trim()] : [needle];
-const content = (text) => text.includes('\0') ? { binary: true } : { text };
+const content = (text) => text.includes('\0') ? { binary: true } : { text: text.replaceAll('\r\n', '\n') };
 
 // Also handles the short-quote fallback spanning multiple lines. Lines are 1-based.
 function hitLines(text, needle) {
@@ -51,28 +52,21 @@ function quoteSource(st, snapshot) {
       },
       label: (file) => file,
       read: (file) => cached(file, () => {
-        const type = git(['cat-file', '-t', `${tree}:${file}`]);
-        if (type.status !== 0 || type.error || type.stdout.trim() !== 'blob') return {};
-        const r = git(['show', '--no-ext-diff', '--no-textconv', `${tree}:${file}`]);
+        // An empty successful listing proves absence. A failed lookup or an unreadable blob cannot.
+        const entry = git(['--literal-pathspecs', 'ls-tree', '--full-tree', '-z', '--name-only', tree, '--', file]);
+        if (entry.status !== 0 || entry.error) return {};
+        if (!entry.stdout) return { missing: true };
+        if (entry.stdout !== `${file}\0`) return {};
+        const r = git(['cat-file', 'blob', `${tree}:${file}`]);
         return r.status === 0 && !r.error ? content(r.stdout) : {};
       }),
       others(needle) {
         if (!searches.has(needle)) {
-          const r = git(['grep', '--no-color', '--no-textconv', '--full-name', '-F', '-n', '-I', '-z', '-e', needle, tree, '--']);
-          let files = null;
-          if (!r.error && [0, 1].includes(r.status)) {
-            files = new Set();
-            // -z separates filename, line number and content. A filename can itself contain a newline.
-            for (let start = 0; start < r.stdout.length;) {
-              const nameEnd = r.stdout.indexOf('\0', start);
-              const lineEnd = r.stdout.indexOf('\0', nameEnd + 1);
-              if (nameEnd < 0 || lineEnd < 0) { files = null; break; }
-              files.add(r.stdout.slice(start, nameEnd).slice(tree.length + 1));
-              const end = r.stdout.indexOf('\n', lineEnd + 1);
-              start = end < 0 ? r.stdout.length : end + 1;
-            }
-          }
-          searches.set(needle, files ? [...files] : null);
+          const r = git(['grep', '--no-color', '--no-textconv', '--full-name', '-F', '-l', '-I', '-z', '-e', needle, tree, '--']);
+          // -l -z emits only NUL-terminated tree:path names, including those with newlines.
+          const files = (r.stdout ?? '').split('\0').slice(0, -1).map((name) => name.slice(tree.length + 1));
+          // Git can find one blob and report a read error on another in the same search.
+          searches.set(needle, { files, complete: !r.error && [0, 1].includes(r.status) && !r.stderr });
         }
         return searches.get(needle);
       },
@@ -86,7 +80,7 @@ function quoteSource(st, snapshot) {
       if (file.includes('\0')) return null;
       const absolute = path.resolve(st.cwd, file);
       return docs.find((d) => file === d.listed || absolute === d.path
-        || (d.listed && d.listed !== '-' && absolute === path.resolve(st.cwd, d.listed)))?.path ?? null;
+        || (d.listed && d.listed !== '-' && absolute === path.resolve(st.cwd, d.listed)))?.path ?? file;
     },
     label: (file) => {
       const d = docs.find((d) => d.path === file);
@@ -94,20 +88,21 @@ function quoteSource(st, snapshot) {
     },
     read: (file) => cached(file, () => {
       const d = docs.find((d) => d.path === file);
-      return d?.exists && d.snap ? content(fs.readFileSync(d.snap, 'utf8')) : {};
+      if (!d || d.exists === false) return { missing: true };
+      return d.snap ? content(fs.readFileSync(d.snap, 'utf8')) : {};
     }),
-    others: () => docs.filter((d) => d.exists).map((d) => d.path),
+    others: () => ({ files: docs.filter((d) => d.exists !== false).map((d) => d.path), complete: true }),
   };
 }
 
 function checkQuote(source, file, needles, line) {
   if (!source || !file || !needles.length) return 'unchecked';
   const body = source.read(file);
-  if (body.text == null) return 'unchecked';
+  if (!body.missing && body.text == null) return 'unchecked';
   const hits = [];
   for (const needle of needles) {
     for (const variant of variants(needle)) {
-      const found = hitLines(body.text, variant);
+      const found = hitLines(body.text ?? '', variant);
       if (found.length) { hits.push(...found); break; }
     }
   }
@@ -115,9 +110,9 @@ function checkQuote(source, file, needles, line) {
   let unreadable = false;
   for (const needle of needles) {
     for (const variant of variants(needle)) {
-      const others = source.others(variant);
-      if (!others) { unreadable = true; continue; }
-      for (const other of others) {
+      const { files, complete } = source.others(variant);
+      if (!complete) unreadable = true;
+      for (const other of files) {
         if (other === file) continue;
         const body = source.read(other);
         if (body.binary) continue;

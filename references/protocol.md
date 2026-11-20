@@ -27,9 +27,15 @@ Issues whose titles start with `Request: ` identify something dropped, narrowed 
 
 The summary's `Verification:` receipt confirms the delegate's claimed checks against the round's saved command events and lists failures, skips with reasons, unconfirmed or contradicted claims, and gaps. `executed` means all checks confirmed with no skips or gaps (including confirmed failures); `partial` means some confirmed with incomplete coverage; `static-analysis-only` means none confirmed; older replies are `unknown`. The label appears beside DONE, in `report.md` and in `/duet`; it never changes the stop decision. Present it to the owner, and explain the limits whenever it is not `executed`.
 
+Report the command as run. The runner unwraps a literal `-c` script for sh, bash, zsh, dash, ksh and mksh, including login forms such as `-lc`. It compares shell words and control operators, ignoring separator spaces and tabs while preserving argument spelling, quotes, escapes, redirects and here-document bodies. For example, `pytest --collect-only` can confirm only the collection run. Report separately invoked commands as separate checks. A compound check such as `cd pkg && npm test` needs a single event that includes the directory change.
+
+Each event can support one claim. Whole-command matches take priority over segment matches. Within each pass the runner works back from the last listed claim and the latest available run. It accepts a complete segment only when the event establishes that the segment ran and proves its exit. Pipelines, `eval` and masked exits remain unconfirmed, including inside shell wrappers. The receipt and report include the matched command and the event's exit code.
+
 ## Quote checks
 
 Each issue has a separate `path`, `line` and `quote`. Before recording a review, the runner checks new or changed citations on open issues against that round's immutable snapshot: the tree object for code/build, or saved subject-file copies for plan/file. Plan/file paths may be as listed, relative to the session cwd, or absolute; an empty path selects the only subject file. It searches up to three longest distinct trimmed quote lines of at least 12 characters, falling back to the whole trimmed quote at 6 characters. A leading diff marker is stripped once if the original needle is not found.
+
+If a usable path is absent from the snapshot, the runner searches the other snapshot files and records `other_file:<F>` or, after a complete search with no match, `MISSING`. LF and CRLF line endings compare equally. Line numbers refer to the original snapshot.
 
 | Mark | Meaning |
 |---|---|

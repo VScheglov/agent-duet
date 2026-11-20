@@ -168,7 +168,11 @@ The runner checks what both sides claim, so the result does not rest on their wo
 
 **Quotes in issues.** Each issue quotes the lines it is about. Before a round is recorded, new or changed quotes on open issues are checked against the reviewed snapshot and marked `ok`, `moved:<L>` (found at line L), `other_file:<F>` (found in file F), `MISSING` or `unchecked`. Closing replies and unchanged quotes keep their earlier mark. Summaries and prompts show quote problems, the report keeps the marks, and `/duet` flags missing or other-file quotes on open issues only. A mark never closes an issue or changes the stop decision; `MISSING` asks for a fresh quote and does not dismiss the issue.
 
+If a usable path is absent, the runner searches the saved snapshot. A hit gives `other_file:<F>`. A complete search with no hit gives `MISSING`. Multiline quotes match across LF and CRLF line endings and keep their original line numbers.
+
 **Verification receipts.** In reviews and builds, DONE carries a verification label. Behind it is a *verification receipt*: the runner compares the commands the delegate says it ran with the command events saved from its turn, and shows outcomes, skips with reasons, unconfirmed or contradicted claims, and gaps in the summaries, `report.md` and `/duet`. The labels are `executed` (all checks confirmed, no skips or gaps), `partial` (some confirmed, coverage incomplete), `static-analysis-only` (none confirmed) and `unknown` (an older reply without a receipt). A confirmed failure can still be `executed`. The label never changes the stop decision and does not include the checks Claude runs itself when reviewing a build.
+
+Each event can confirm one check. After removing a recognized shell wrapper such as `/bin/zsh -c`, the runner compares the whole command or a complete segment whose exit the event proves. Arguments, quoting and redirects must match. Spaces and tabs between shell words may vary. A compound claim such as `cd pkg && npm test` needs one event for the whole command. Pipelines, `eval` and masked exits stay unconfirmed. The receipt and report show the matched command and its recorded exit.
 
 ## The `/duet` pane and safeguards
 
