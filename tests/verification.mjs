@@ -16,7 +16,24 @@ export async function matchingTests(test, dir) {
     { name: 'pwd inside a filename cannot confirm a check', claim: 'node test_pwd.mjs', events: [['pwd', 0]], want: 'unconfirmed' },
     { name: 'npm test is distinct from npm test:e2e', claim: 'npm test', events: [['npm test:e2e', 0]], want: 'unconfirmed' },
     { name: 'a complete segment after cd confirms a check', claim: 'npm test', events: [['cd pkg && npm test', 0]], want: 'confirmed' },
-    { name: 'a complete segment can add arguments', claim: 'npm test', events: [['cd pkg && npm test -- --runInBand', 0]], want: 'confirmed' },
+    { name: 'extra arguments change even a complete segment', claim: 'npm test', events: [['cd pkg && npm test -- --runInBand', 0]], want: 'unconfirmed' },
+    { name: 'collecting tests does not run pytest', claim: 'pytest', events: [['pytest --collect-only', 0]], want: 'unconfirmed' },
+    { name: 'a git subcommand is not bare git', claim: 'git', events: [['git status', 0]], want: 'unconfirmed' },
+    { name: 'separating spaces and tabs can vary', claim: 'node --test "a  b"', events: [['node  \t--test "a  b"', 0]], want: 'confirmed' },
+    { name: 'argument quoting is matched as written', claim: "node --test 'a b'", events: [['node --test "a b"', 0]], want: 'unconfirmed' },
+    { name: 'spaces inside quoted arguments stay significant', claim: "node --test 'a b'", events: [["node --test 'a  b'", 0]], want: 'unconfirmed' },
+    { name: 'a quoted newline is part of the argument', claim: 'node -e "a b"', events: [['node -e "a\nb"', 0]], want: 'unconfirmed' },
+    { name: 'an escaped space followed by a separator starts another argument', claim: 'verify a\\ b',
+      events: [['verify a\\  b', 0]], want: 'unconfirmed' },
+    { name: 'quoted spaces inside a substitution cannot collapse into another argument', claim: 'verify "$(echo "a b")"',
+      events: [['verify "$(echo "a  b")"', 0]], want: 'unconfirmed' },
+    { name: 'a literal command used to set up the test environment preserves the test exit',
+      claim: 'ESBUILD="$(npm root -g)/esbuild" node tests/mod.mjs',
+      events: [['ESBUILD="$(npm root -g)/esbuild" node tests/mod.mjs', 0]], want: 'confirmed' },
+    { name: 'a shell operator cannot be part of a harness executable path', claim: 'node --test',
+      events: [['/bin/true||/bin/zsh -c "node --test"', 0]], want: 'unconfirmed' },
+    { name: 'a literal inner shell script still exposes a nested check', claim: 'node --test',
+      events: [["bash -c 'node --test'", 0]], want: 'confirmed' },
     { name: 'exact events outrank later compound matches', claim: 'npm test',
       events: [['npm test', 1], ['cd pkg && npm test', 0]], want: 'contradicted', selected: 'npm test' },
     { name: 'the last event at the best match level wins', claim: 'npm test',
@@ -24,12 +41,10 @@ export async function matchingTests(test, dir) {
     { name: 'the last segment match wins when no exact event exists', claim: 'npm test',
       events: [['cd first && npm test', 1], ['cd second && npm test', 0]], want: 'confirmed', selected: 'cd second && npm test' },
     { name: 'a partial compound claim is unconfirmed', claim: 'npm test && npm run lint', events: [['npm test', 0]], want: 'unconfirmed' },
-    { name: 'every segment of a compound claim must run', claim: 'npm test && npm run lint',
-      events: [['npm test', 0], ['npm run lint', 0]], want: 'confirmed' },
-    { name: 'a compound claim with a failed component contradicts passed', claim: 'npm test && npm run lint',
-      events: [['npm test', 0], ['npm run lint', 1]], want: 'contradicted' },
-    { name: 'a failed compound claim retains all its evidence', claim: 'npm test && npm run lint', outcome: 'failed',
-      events: [['npm test', 0], ['npm run lint', 1]], want: 'confirmed' },
+    { name: 'separate events cannot establish a compound invocation', claim: 'npm test && npm run lint',
+      events: [['npm test', 0], ['npm run lint', 0]], want: 'unconfirmed' },
+    { name: 'cd in another shell cannot establish the directory of a test', claim: 'cd pkg && npm test',
+      events: [['cd pkg', 0], ['npm test', 0]], want: 'unconfirmed' },
     { name: 'one event cannot stand for two repeated compound segments', claim: 'npm test && npm test', events: [['npm test', 0]], want: 'unconfirmed' },
     { name: 'operators inside quoted arguments are not segments', claim: 'npm test', events: [["printf '%s' 'npm test && pwd'", 0]], want: 'unconfirmed' },
     { name: 'a command substitution is not a top-level segment', claim: 'npm test', events: [['printf "%s" "$(npm test)"', 0]], want: 'unconfirmed' },
@@ -51,6 +66,17 @@ export async function matchingTests(test, dir) {
     { name: 'a mixed sequence with AND proves its final test on success', claim: 'npm test', events: [['a; cd pkg && npm test', 0]], want: 'confirmed' },
     { name: 'a safe earlier segment event cannot prove a later masked attempt', claim: 'npm test', events: [['cd pkg && npm test', 0], ['npm test || true', 0]], want: 'unconfirmed' },
     { name: 'an exact OR claim cannot prove verification passed', claim: 'npm test || true', events: [['npm test || true', 0]], want: 'unconfirmed' },
+    ...[
+      "bash -c 'npm test || true'", "sh -c 'pytest; echo ok'", "eval 'npm test || true'",
+      "cd pkg && sh -c 'pytest; echo ok'", "env MODE=test bash -c 'npm test || true'",
+      "command eval 'npm test || true'", "CHECK=1 'eval' 'npm test || true'",
+      "sh -c 'npm test || true' arg0", "sh <<< 'npm test || true'",
+      "time bash -c 'npm test || true'", "bash /dev/stdin <<'EOF'\nnpm test || true\nEOF",
+      'echo "$(npm test || true)"', "env '-Ssh -c \"npm test || true\"'",
+    ].map((command) => ({ name: `a masked shell exit stays unconfirmed in ${command}`,
+      claim: command, events: [[command, 0]], want: 'unconfirmed' })),
+    { name: 'an inner eval cannot supply exit evidence for an AND segment', claim: 'npm test',
+      events: [["eval 'exit 0' && npm test", 0]], want: 'unconfirmed' },
     { name: 'an exact pipeline cannot prove verification passed', claim: 'pytest -q | tail -5', events: [['pytest -q | tail -5', 0]], want: 'unconfirmed' },
     { name: 'an exact sequence success can hide an earlier failure', claim: 'make lint; echo done', events: [['make lint; echo done', 0]], want: 'unconfirmed' },
     { name: 'an exact AND success proves verification passed', claim: 'a && b', events: [['a && b', 0]], want: 'confirmed' },
@@ -111,10 +137,6 @@ export async function matchingTests(test, dir) {
       assert.equal(check.confirmation, want);
       assert.equal(receipt.label, want === 'confirmed' ? 'executed' : 'static-analysis-only');
       if (selected) assert.equal(check.event.command, selected);
-      if (claim.includes(' && ') && events.length > 1 && want !== 'unconfirmed') assert.equal(check.events.length, events.length);
-      if (check.events) for (const [command, exit] of events) {
-        assert.ok(verificationLines(receipt).some((line) => line.includes(`${command}: exit ${exit}`)));
-      }
     });
   }
   // One command listed more than once: each entry answers for its own run, in the order they were listed.
@@ -127,6 +149,14 @@ export async function matchingTests(test, dir) {
       events: [['verify', 0], ['verify', 1]], want: ['contradicted', 'contradicted'], exits: [0, 1], label: 'static-analysis-only' },
     { name: 'one run cannot answer for two entries', checks: [['verify', 'passed'], ['verify', 'passed']],
       events: [['verify', 0]], want: ['unconfirmed', 'confirmed'], exits: [undefined, 0], label: 'partial' },
+    { name: 'the whole command owns its event ahead of a later segment claim', checks: [['cd pkg && verify', 'passed'], ['verify', 'passed']],
+      events: [['cd pkg && verify', 0]], want: ['confirmed', 'unconfirmed'], exits: [0, undefined], label: 'partial' },
+    { name: 'the same allocation holds with the claims reversed', checks: [['verify', 'passed'], ['cd pkg && verify', 'passed']],
+      events: [['cd pkg && verify', 0]], want: ['unconfirmed', 'confirmed'], exits: [undefined, 0], label: 'partial' },
+    { name: 'two segment claims need two events', checks: [['verify', 'passed'], ['lint', 'passed']],
+      events: [['verify && lint', 0]], want: ['unconfirmed', 'confirmed'], exits: [undefined, 0], label: 'partial' },
+    { name: 'independent runs can support both claims', checks: [['cd pkg && verify', 'passed'], ['verify', 'passed']],
+      events: [['cd pkg && verify', 0], ['cd next && verify', 0]], want: ['confirmed', 'confirmed'], exits: [0, 0], label: 'executed' },
     { name: 'another command between the runs changes nothing', checks: [['verify', 'failed'], ['lint', 'passed'], ['verify', 'passed']],
       events: [['verify', 1], ['lint', 0], ['verify', 0]], want: ['confirmed', 'confirmed', 'confirmed'], exits: [1, 0, 0], label: 'executed' },
     { name: 'a skipped entry takes no run', checks: [['verify', 'skipped'], ['verify', 'passed']],
@@ -142,6 +172,31 @@ export async function matchingTests(test, dir) {
       assert.equal(receipt.label, label);
     });
   }
+  for (const shell of ['/bin/zsh -c', 'sh -c', '/usr/bin/bash -lc', 'bash --login -c', 'zsh -l -c', '/bin/dash -c']) {
+    await test(`verification matching: the ${shell} harness wrapper exposes the check's own exit`, async () => {
+      const command = "node --test 'two words'";
+      fs.writeFileSync(file, JSON.stringify({ type: 'item.completed', item: { type: 'command_execution',
+        command: `${shell} "${command}"`, exit_code: 2, status: 'failed' } }));
+      const receipt = await confirmVerification({ checks: [{ command, outcome: 'failed', note: '' }] }, file);
+      assert.equal(receipt.checks[0].confirmation, 'confirmed');
+      assert.equal(receipt.checks[0].event.command, command);
+    });
+  }
+  await test('verification report: a segment match shows the full saved command and preserves its quoted argument', async () => {
+    const command = "cd pkg && node --test 'two  spaces'";
+    fs.writeFileSync(file, JSON.stringify({ type: 'item.completed', item: { type: 'command_execution',
+      command, exit_code: 0, status: 'completed' } }));
+    const receipt = await confirmVerification({ checks: [{ command: "node --test 'two  spaces'", outcome: 'passed', note: '' }] }, file);
+    assert.equal(receipt.checks[0].event.command, command);
+    assert.ok(verificationLines(receipt).some((line) => line.includes(command)));
+  });
+  await test('verification report: saved multi-event receipts still render every command and exit', () => {
+    const receipt = { label: 'executed', gaps: [], checks: [{ command: 'verify && lint', outcome: 'failed', confirmation: 'confirmed',
+      events: [{ command: 'verify', exit_code: 0 }, { command: 'lint', exit_code: 1 }] }] };
+    const report = verificationLines(receipt).join('\n');
+    assert.match(report, /verify: exit 0/);
+    assert.match(report, /lint: exit 1/);
+  });
   await test('verification matching: a here-document script in the double-quoted wrapper Codex logs is confirmed', async () => {
     // Codex logs `/bin/zsh -lc "python3 - <<'PY' … PY"`; the check names the script as written.
     const script = "python3 - <<'PY'\nfrom pathlib import Path\nassert Path('a.txt').read_text() == \"x\", 'differs'\nprint('PASS')\nPY";
