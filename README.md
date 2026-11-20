@@ -17,7 +17,7 @@ All five modes work with both engines. Start with `/agent-duet` or a plain-langu
 ### Requirements
 
 - Claude Code 2.1.275 or newer.
-- An installed, signed-in engine: [Codex CLI](https://github.com/openai/codex) with `codex` on your `PATH`, or agy (Antigravity CLI, tested with 1.5.7) with `agy` on your `PATH`. To use another binary, set `AGENT_DUET_CODEX_BIN` or `AGENT_DUET_AGY_BIN`.
+- An installed, signed-in engine: [Codex CLI](https://github.com/openai/codex) with `codex` on your `PATH`, or agy (Antigravity CLI, tested with 1.5.10) with `agy` on your `PATH`. To use another binary, set `AGENT_DUET_CODEX_BIN` or `AGENT_DUET_AGY_BIN`.
 - Node.js 22 or newer: the runner is a Node script.
 - git, for the code and build modes.
 
@@ -144,7 +144,7 @@ Changes made after approval come back as a new review round; see [Verification a
 A one-off report without negotiation: audit code, data, a reference document or a policy, without Claude spending tokens on answering every finding. Review mode fits poorly when Claude may not change the subject on its own, such as a reference document that changes only with your approval: almost every finding would come back to you. Build mode does not fit either, because an audit must not change anything.
 
 1. Claude writes the task: what to examine, which question to answer, the scope, what counts as a finding, and what goes into the notes (a ranking or a table).
-2. The delegate works in the project directory, always in `read-only` mode: the runner refuses any other `--sandbox`. Codex applies its read-only shell sandbox. agy has no enforced read-only mode: it denies `write_file`, and the runner checks the files after the turn and warns about changes without undoing them, but shell commands can still write. MCP writes are forbidden only by the prompt, with either engine; see [Security](#security).
+2. The delegate works in the project directory in `read-only` mode. The runner refuses other `--sandbox` values. Codex applies its read-only shell sandbox. agy denies `write_file`, and its shell commands can still write. The runner checks files after the turn and warns about changes without undoing them. In agy 1.5.10, MCP calls need an Antigravity grant in this mode. An ungranted call is denied and can leave the audit without a usable answer. The prompt forbids writes through granted tools. See [Security](#security).
 3. One turn produces a summary, findings A1…An (severity, location, evidence, recommendation, confidence), and what was and was not checked. Claude's summary gives one line per finding; everything else is in the session's `report.md`.
 4. There is nothing to answer: `reply` and `review` refuse an audit. For another angle, start a new audit with a sharper task. Findings remain the delegate's claims: before relying on one, Claude checks it or tells you it is unverified.
 
@@ -245,7 +245,9 @@ Usually pass a family and a level: `--model gemini-4-carbon --effort high`. agy 
 - **`--effort` alone** applies to the family of the model in agy's `settings.json`.
 - **A model without levels** gets `--effort` passed through as is, with a note: how agy treats it has not been tested.
 
-The runner fetches `agy models` at most once per call, with a 15-second timeout. If the catalog is unavailable, or, for an effort-only choice, the `settings.json` model is missing or unknown, the affected check is skipped with a note; the five level names are still validated. The summary, the round record and the pane show the resolved slug and mark a family taken from `settings.json` separately from a level you chose. For a family alone, agy's start event (`init`) reports the slug it picked. Without a catalog, the display keeps your choice as given rather than inventing a slug.
+The runner fetches `agy models` at start and on an explicit model or effort change, with a 15-second timeout. Changing only `--model` clears the previous effort. Later turns, approvals and display commands reuse the session's saved model information. For a family without an effort, the planner's conversation transcript records the slug agy actually used. If the transcript is unavailable, the display keeps the family. The summary, round record and pane distinguish a configured family from a level you selected.
+
+A network failure skips catalog validation with a note. For an effort-only choice the runner reads `settings.json`, including files with a UTF-8 BOM. The note identifies a missing model, an unknown model or unreadable settings. The five effort names are still checked.
 
 `AGENT_DUET_AGY_HOME` tells the plugin where to read agy's settings and conversation logs (default `~/.gemini/antigravity-cli`). It does not redirect agy itself: set it to the directory agy actually uses. Sign-in keeps your real `HOME`.
 
@@ -283,8 +285,8 @@ Replace `ru` with `en`, `zh` or `auto` as needed. `--values-stdin` reads a JSON 
 - `--sandbox inherit` uses the engine's own permissions. For Codex, an explicit mode applies on every turn: `-s` at start and `-c sandbox_mode=…` on `resume`, because `resume` has no `--sandbox` flag. agy's mappings are in [Engine differences](#engine-differences).
 - **agy's read-only is a promise plus a check after the turn, not an enforced sandbox.** It denies `write_file`, but shell commands can write. Before and after each read-only turn, the runner fingerprints tracked and untracked non-ignored files under the working directory in a Git repository; outside Git, it scans a capped set of files. It records and warns about detected changes without undoing them. Ignored files, paths outside the working directory, files beyond the cap, and changes reverted before the check can go unnoticed. The check cannot make untrusted code safe to run.
 - **The bans on changing files during a review, on committing and on changing external systems are prompt instructions.** For external PRs or downloaded files, choose `--sandbox read-only`: with Codex this gives its shell sandbox; with agy, only the promise and check above.
-- **Do not rely on a shell sandbox to restrict MCP tools.** A delegate may have MCP tools that write to external systems, such as a production database. The prompt forbids changes through any tool, but that is an instruction, not enforcement.
-- **macOS keychain dialogs when a program runs with a temporary `HOME`.** Tests and smoke runs sometimes start a program with `HOME` pointed at a temporary directory, for example `claude -p` started by the Claude session overseeing a build. Programs that sign in through the keychain (`claude`, `gh`, git credential helpers, `security`) cannot find it there, and every attempt opens a “keychain not found” dialog that stays open until dismissed. **Click Cancel:** “Reset to Defaults” creates a new, empty keychain in place of yours. Linking `~/Library/Keychains` into the temporary `HOME` removes the dialogs but hands the program your whole keychain, whose entries can then be changed through `securityd`. That is why the delegate's prompts (build and review) and Claude's rules in `SKILL.md` require credentials through the environment, `CLAUDE_CODE_OAUTH_TOKEN` (created with `claude setup-token`) or `GH_TOKEN`, and tell the agent to ask you when none are available.
+- **MCP permissions are separate from shell permissions.** In agy 1.5.10 read-only mode, a matching Antigravity grant lets the whole MCP tool run. Without a grant, headless agy denies the call, and the turn fails if no usable answer follows. A granted tool uses its configured access, which can include writes to external systems. Only the prompt prohibits those writes. Codex's shell sandbox applies to shell commands. Its MCP tools use their configured access and the prompt forbids writes through them too.
+- **macOS keychain and temporary `HOME`.** Keep the real `HOME` when starting agy, claude, gh, Git credential helpers or `security`. Since 1.5.9 agy stores its OAuth token in the macOS keychain. When it cannot read that token it can open Google sign-in in your browser. For tests, pin `AGENT_DUET_AGY_BIN` to a fake and use a disposable `AGENT_DUET_AGY_HOME`. For claude and gh, supply `CLAUDE_CODE_OAUTH_TOKEN` or `GH_TOKEN` when available. If macOS shows a “keychain not found” dialog, click **Cancel**. “Reset to Defaults” creates a new keychain. Linking `~/Library/Keychains` into a test home gives the process access to your whole keychain.
 
 ## File layout
 
@@ -328,7 +330,7 @@ Use the `AGENT_DUET_*` names below. The old `CODEX_DUET_*` names still work; whe
 
 The plugin was called codex-duet up to 0.12.0. Everything carries over without manual steps:
 
-- **Sessions.** On the first runner call, the old default state directory (`…/codex-duet`, usually `~/.local/state/codex-duet`) moves to the new default (`…/agent-duet`), and a symlink at the old path keeps old absolute paths working, such as those of running processes and of old builds' worktrees. If both directories exist, only the new one is used. A home set explicitly with `AGENT_DUET_HOME` or `CODEX_DUET_HOME` is never moved. The module only reads these paths, and its debug trace (`.ui-trace.json`) stays beside the sessions.
+- **Sessions.** On the first runner call, the old default state directory (`…/codex-duet`, usually `~/.local/state/codex-duet`) moves to the new default (`…/agent-duet`), and a symlink at the old path keeps old absolute paths working, such as those of running processes and of old builds' worktrees. If both directories exist, only the new one is used. A home set explicitly with `AGENT_DUET_HOME` or `CODEX_DUET_HOME` is never moved. The module only reads these paths, and its debug trace (`.ui-trace.json`) stays beside the sessions. The next invocation repairs a missing compatibility link after an interrupted move.
 - **Environment variables.** The `CODEX_DUET_*` names still work; see [Environment variables](#environment-variables).
 - **Branches.** Build branches named `codex-duet/<id>` are still recognized; new ones are named `agent-duet/<id>`.
 - **Pane state.** Claude Code keeps the module's state across hot reloads. Your preferences, the selected task, decisions picked on the pane and expanded issues are imported from codex-duet once; agent-duet's own preferences take precedence.
@@ -336,12 +338,14 @@ The plugin was called codex-duet up to 0.12.0. Everything carries over without m
 
 ## Troubleshooting
 
-### agy (tested with 1.5.7)
+### agy (tested with 1.5.10)
 
 - **No output while starting.** agy waits for all configured MCP servers to connect before working. Check VPN and network access, and run `agy mcp list` with the same agy configuration: one unreachable server can hold up the turn. The queue and the background timeout still apply.
-- **A tool is denied.** A headless turn cannot ask you for permission. Configure the needed allow rules in agy, or explicitly choose `--sandbox danger-full-access` (`--dangerously-skip-permissions`). `workspace-write` uses `--sandbox` with proceed-in-sandbox settings; it does not override every tool rule.
+- **Sign-in or credential manager error.** The runner blocks automatic browser sign-in during agy startup and stops on a credential failure. Unlock your keychain and sign in to agy from a terminal with your real `HOME` before retrying.
+- **A tool is denied.** A successful turn keeps its answer and lists the denied action. If an MCP denial ends a read-only turn, choose **Always Allow** for the named tool in the Antigravity app or add its `mcp(<server>/<tool>)` entry to `userSettings.globalPermissionGrants.allow` in `~/.gemini/config/config.json`. To avoid the denied call, forbid MCP in the task and start a new audit, or start a new audit with `--engine codex`. For other tool denials, check the allowed tools in agy's settings.
+- **A long command is unconfirmed.** The runner recovers clipped commands from the full conversation transcript. If a command cannot be recovered, the receipt gives truncation as the reason. A cancelled command or output without agy's exit header also leaves the exit unconfirmed.
 - **Retry starts over.** Check that the saved conversation `.db` is still in `AGENT_DUET_AGY_HOME` (default `~/.gemini/antigravity-cli`). `retry` uses `--conversation` only when it is there; `--fresh` restarts on purpose.
-- **Read-only violation.** Inspect the recorded paths and the files before going on. The check warns after the turn and never rolls changes back. It cannot catch every write; see [Security](#security).
+- **Read-only violation.** Inspect the recorded paths before going on. The comparison excludes the active runner's event logs, state and answer even when session storage is inside the project. It records changes to subject files without undoing them. See [Security](#security).
 
 ### Codex CLI pitfalls (0.159)
 

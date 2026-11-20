@@ -17,7 +17,7 @@ Claude 与受委托的引擎（默认 **Codex**，也可以是 **agy**，即 Ant
 ### 要求
 
 - Claude Code 2.1.275 或更新版本。
-- 已安装并登录的引擎：[Codex CLI](https://github.com/openai/codex)，且 `codex` 在 `PATH` 中；或 agy（Antigravity CLI，已用 1.5.7 测试），且 `agy` 在 `PATH` 中。如需使用其他可执行文件，设置 `AGENT_DUET_CODEX_BIN` 或 `AGENT_DUET_AGY_BIN`。
+- 已安装并登录的引擎：[Codex CLI](https://github.com/openai/codex)，且 `codex` 在 `PATH` 中；或 agy（Antigravity CLI，已用 1.5.10 测试），且 `agy` 在 `PATH` 中。如需使用其他可执行文件，设置 `AGENT_DUET_CODEX_BIN` 或 `AGENT_DUET_AGY_BIN`。
 - Node.js 22 或更新版本：运行器是一个 Node 脚本。
 - code 和 build 模式需要 git。
 
@@ -144,7 +144,7 @@ reply ─► 引擎（同一会话，resume）：resolved · withdrawn · open +
 这是一次性报告，不进行协商：审计代码、数据、参考文档或策略，而 Claude 不必花 token 逐条回复发现。如果 Claude 不能自行修改被检查的对象，例如只有经你批准才能修改的参考文档，审查模式就不合适：几乎每个发现都要交给你。build 模式也不合适，因为审计不能修改任何内容。
 
 1. Claude 编写任务：检查什么、回答什么问题、范围、哪些内容算发现，以及哪些内容放入备注（评分、表格）。
-2. 引擎直接在项目目录中工作，始终使用 `read-only` 模式：运行器会拒绝其他 `--sandbox` 值。Codex 应用其只读 shell 沙箱。agy 没有强制只读模式：它拒绝 `write_file`，运行器在本轮结束后检查文件并对改动发出警告，但不会撤销，shell 命令仍可写入。无论哪个引擎，通过 MCP 写入都只由提示词禁止，见[安全](#安全)。
+2. 引擎在项目目录中以 `read-only` 模式工作。运行器会拒绝其他 `--sandbox` 值。Codex 应用只读 shell 沙箱。agy 会拒绝 `write_file`，但 shell 命令仍可写入。运行器在本轮结束后检查文件，对改动发出警告并保留现场。agy 1.5.10 在此模式下调用 MCP 工具需要 Antigravity 授权。未授权的调用会被拒绝，审计可能因此得不到可用答复。提示词禁止通过已授权的工具写入。参见[安全](#安全)。
 3. 只执行一轮。输出包括结论、A1…An 等发现（严重程度、位置、证据、建议、置信度），以及检查过和未检查的内容。Claude 的摘要中每个发现占一行，其余内容保存在会话的 `report.md` 中。
 4. 无需回复：audit 模式不接受 `reply` 和 `review`。如需换个角度，请用更明确的任务新建审计。发现仍只是引擎的判断：采用某个发现前，Claude 会先核实，或告诉你它尚未核实。
 
@@ -245,7 +245,9 @@ reply ─► 引擎（同一会话，resume）：resolved · withdrawn · open +
 - **只指定 `--effort`** 时，它作用于 agy `settings.json` 中模型所属的系列。
 - **没有级别的模型**会原样收到 `--effort`，并附上说明：agy 如何处理它尚未测试。
 
-运行器每次调用最多查询一次 `agy models`，超时 15 秒。如果目录不可用，或在只指定级别时 `settings.json` 中的模型缺失或未知，就会跳过相应检查并附上说明；五个级别名仍会校验。摘要、轮次记录和面板显示解析后的 slug，并把来自 `settings.json` 的系列与你选择的级别分别标出。只指定系列时，由 agy 的启动事件（`init`）报告它选定的 slug。目录不可用时，按你的原始选择显示，不编造 slug。
+运行器在启动时或显式更改模型、推理级别时查询 `agy models`，超时为 15 秒。只传 `--model` 会清除之前的级别。后续轮次、批准操作和查看命令都会复用会话保存的模型信息。只指定系列时，运行器从本轮规划器的会话记录读取 agy 实际使用的 slug。若记录不可用，则显示系列名称。摘要、轮次记录和面板会分别标明配置中的系列和显式选择的级别。
+
+若网络故障导致无法查询目录，运行器会跳过目录校验并说明原因。只指定级别时，运行器会读取 `settings.json`，也支持带 UTF-8 BOM 的文件。提示会区分模型缺失、模型未知和设置无法读取。五个级别名称仍会校验。
 
 `AGENT_DUET_AGY_HOME` 指定插件读取 agy 设置和对话日志的目录（默认 `~/.gemini/antigravity-cli`）。它不会重定向 agy 本身：请设为 agy 实际使用的目录。登录仍使用你真实的 `HOME`。
 
@@ -283,8 +285,8 @@ echo '{"language":"ru"}' | claude plugin configure agent-duet --values-stdin
 - `--sandbox inherit` 使用引擎自己的权限。对于 Codex，明确指定的模式会应用于每一轮：启动时用 `-s`，`resume` 时用 `-c sandbox_mode=…`，因为 `resume` 没有 `--sandbox` 参数。agy 的映射见[引擎差异](#引擎差异)。
 - **agy 的 read-only 是承诺加上本轮结束后的检查，不是强制沙箱。** 它拒绝 `write_file`，但 shell 命令仍可写入。每个只读轮次前后，运行器会对 Git 仓库工作目录下已跟踪和未跟踪的非忽略文件计算指纹；在 Git 之外，只扫描有数量上限的文件。检测到的改动会被记录并警告，但不会撤销。被忽略的文件、工作目录之外的路径、超出上限的文件，以及检查前已还原的改动，都可能漏检。这种检查无法让运行不可信代码变得安全。
 - **审查期间不得修改文件、不得提交、不得更改外部系统，这些都是提示词中的指令。** 对于外部 PR 或下载的文件，请选择 `--sandbox read-only`：Codex 会应用其 shell 沙箱；agy 只有上面所说的承诺和检查。
-- **不要依赖 shell 沙箱来限制 MCP 工具。** 引擎可能拥有能写入外部系统（例如生产数据库）的 MCP 工具。提示词禁止通过任何工具做修改，但这只是指令，并非强制限制。
-- **程序在临时 `HOME` 下运行时的 macOS 钥匙串弹窗。** 测试和冒烟运行有时会在 `HOME` 指向临时目录时启动程序，例如负责 build 的 Claude 会话启动的 `claude -p`。通过钥匙串登录的程序（`claude`、`gh`、git 凭证助手、`security`）在那里找不到钥匙串，每次尝试都会弹出“找不到钥匙串”对话框，直到被关闭才会消失。**请点击“取消”：**“重设为默认设置”会创建一个新的空钥匙串来替代你的钥匙串。把 `~/Library/Keychains` 链接到临时 `HOME` 虽然能消除弹窗，却会把整个钥匙串交给该程序，其中的条目随后可以通过 `securityd` 修改。因此，引擎的提示词（build 和审查）以及 `SKILL.md` 中给 Claude 的规则都要求通过环境变量提供凭证，即 `CLAUDE_CODE_OAUTH_TOKEN`（由 `claude setup-token` 创建）或 `GH_TOKEN`，并要求代理在没有凭证时询问你。
+- **MCP 权限与 shell 权限分别控制。** 在 agy 1.5.10 的只读模式下，匹配的 Antigravity 授权允许调用整个 MCP 工具。没有授权时，无界面的 agy 会拒绝调用。如果随后没有可用答复，本轮就会失败。已授权的工具按其配置的权限运行，可能有权写入外部系统。这类写入只由提示词禁止。Codex 的沙箱适用于 shell 命令。它的 MCP 工具按配置的权限运行，提示词也禁止通过这些工具写入。
+- **macOS 钥匙串与临时 `HOME`。** 启动 agy、claude、gh、Git 凭证助手或 `security` 时使用真实的 `HOME`。从 1.5.9 起，agy 将 OAuth 令牌存储在 macOS 钥匙串中。如果读不到令牌，agy 可能会在浏览器中打开 Google 登录页。测试时将 `AGENT_DUET_AGY_BIN` 指向模拟程序，并为 `AGENT_DUET_AGY_HOME` 设置临时目录。claude 和 gh 可分别通过 `CLAUDE_CODE_OAUTH_TOKEN` 和 `GH_TOKEN` 获取凭证。如果 macOS 提示找不到钥匙串，请点击**取消**。「重设为默认设置」会创建新的钥匙串。将 `~/Library/Keychains` 链接到测试目录会让进程访问整个钥匙串。
 
 ## 文件布局
 
@@ -328,7 +330,7 @@ echo '{"language":"ru"}' | claude plugin configure agent-duet --values-stdin
 
 本插件在 0.12.0 及更早版本中名为 codex-duet。所有内容都会自动沿用，无需手动操作：
 
-- **会话。** 运行器首次调用时，会把旧的默认状态目录（`…/codex-duet`，通常是 `~/.local/state/codex-duet`）移到新的默认位置（`…/agent-duet`），并在旧位置留下符号链接，让旧的绝对路径继续有效，例如正在运行的进程和旧 build 的 worktree 所用的路径。如果两个目录都存在，只使用新目录。通过 `AGENT_DUET_HOME` 或 `CODEX_DUET_HOME` 显式指定的目录永远不会被移动。模块只读取这些路径，它的调试跟踪文件（`.ui-trace.json`）与会话放在一起。
+- **会话。** 运行器首次调用时，会把旧的默认状态目录（`…/codex-duet`，通常是 `~/.local/state/codex-duet`）移到新的默认位置（`…/agent-duet`），并在旧位置留下符号链接，让旧的绝对路径继续有效，例如正在运行的进程和旧 build 的 worktree 所用的路径。如果两个目录都存在，只使用新目录。通过 `AGENT_DUET_HOME` 或 `CODEX_DUET_HOME` 显式指定的目录永远不会被移动。模块只读取这些路径，它的调试跟踪文件（`.ui-trace.json`）与会话放在一起。如果迁移中断，下次调用会修复缺失的兼容符号链接。
 - **环境变量。** `CODEX_DUET_*` 名称仍然有效，见[环境变量](#环境变量)。
 - **分支。** 名为 `codex-duet/<id>` 的 build 分支仍能识别；新分支名为 `agent-duet/<id>`。
 - **面板状态。** Claude Code 会在热重载之间保留模块的状态。你的偏好、选中的任务、在面板上选好的决定以及展开的问题，会从 codex-duet 导入一次；agent-duet 自己的偏好优先。
@@ -336,12 +338,14 @@ echo '{"language":"ru"}' | claude plugin configure agent-duet --values-stdin
 
 ## 故障排查
 
-### agy（已用 1.5.7 测试）
+### agy（已用 1.5.10 测试）
 
 - **启动时没有输出。** agy 会等所有已配置的 MCP 服务器连接后才开始工作。请检查 VPN 和网络，并用相同的 agy 配置运行 `agy mcp list`：一个无法连接的服务器就可能拖住这一轮。排队和后台超时仍然有效。
-- **工具被拒绝。** 无界面运行的一轮无法向你询问权限。请在 agy 中配置所需的 allow rules，或明确选择 `--sandbox danger-full-access`（`--dangerously-skip-permissions`）。`workspace-write` 使用 `--sandbox` 加 proceed-in-sandbox 设置，并不会覆盖所有工具规则。
+- **登录或凭证管理器出错。** 运行器会在 agy 启动期间阻止自动打开浏览器登录，并在凭证访问失败时停止。请解锁钥匙串，在使用真实 `HOME` 的终端中登录 agy 后重试。
+- **工具被拒绝。** 如果本轮成功，运行器会保留答复并列出被拒绝的操作。如果 MCP 调用被拒绝并导致只读轮次失败，请在 Antigravity 应用中为指定工具选择 **Always Allow**，或将对应的 `mcp(<server>/<tool>)` 条目加入 `~/.gemini/config/config.json` 的 `userSettings.globalPermissionGrants.allow`。也可以在任务中明确禁止 MCP 后启动新审计，或使用 `--engine codex` 启动新审计。其他工具被拒绝时，请检查 agy 设置中允许使用的工具。
+- **长命令未获确认。** 运行器会从完整会话记录中恢复被截断的命令。无法恢复时，核验记录会注明原因。命令被取消或输出缺少 agy 的退出状态标头时，退出结果也无法确认。
 - **Retry 重新开始。** 检查保存的对话 `.db` 是否仍在 `AGENT_DUET_AGY_HOME`（默认 `~/.gemini/antigravity-cli`）中。只有文件存在时，`retry` 才会使用 `--conversation`；`--fresh` 则是有意重新开始。
-- **Read-only 违规。** 继续之前，先检查记录下来的路径和文件。该检查在本轮结束后发出警告，从不回滚改动，也无法发现每一次写入；见[安全](#安全)。
+- **违反只读约定。** 请先检查记录中列出的文件。即使会话存放在项目内，比较时也会排除当前运行器的事件日志、状态和答复文件。运行器会记录项目文件的变更，保留现场供你检查。参见[安全](#安全)。
 
 ### Codex CLI 的注意事项（0.159）
 

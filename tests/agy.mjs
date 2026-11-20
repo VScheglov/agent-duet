@@ -53,6 +53,217 @@ export async function agyTests(test, parent) {
     return { cwd, home, agyHome, env, run, state, calls, modelCalls, ids, callsFile, git };
   }
   const start = (kind, extra = []) => ['start', '--engine', 'agy', '--kind', kind, ...(kind === 'plan' || kind === 'file' ? ['--subject', 'plan.md'] : kind === 'audit' || kind === 'build' ? ['--subject', '-'] : []), ...extra];
+  const feedback = JSON.stringify({ responses: [{ id: 'C1', action: 'fixed', note: 'fixed' }] });
+  const eventsOf = (x, file, round = 1) => fs.readFileSync(path.join(x.home, x.state().id, `round-${round}.${file}.jsonl`), 'utf8').trim().split('\n').map(JSON.parse);
+
+  await test('agy: truncated command parameters recover by planner and tool index, or explain an unconfirmed check', () => {
+    const prefix = "node -e '/*" + '検'.repeat(515);
+    const commands = [prefix + "*/process.exit(1)'", prefix + "*/process.exit(0)'", 'echo …'];
+    const checks = commands.map((command, i) => ({ command, outcome: i === 0 ? 'failed' : 'passed', note: 'from the delegate' }));
+    for (const missing of [false, true]) {
+      const x = setup([{ reply: review({ checks }), commands: commands.map((command, i) => ({ command, exit_code: i === 0 ? 1 : 0 })), noFullTranscript: missing }]);
+      const r = x.run(start('code'));
+      assert.equal(r.code, 0, r.err);
+      const clipped = [...prefix].slice(0, 512).join('') + '…';
+      assert.ok(eventsOf(x, 'agy').some((e) => e.step_update?.tool_info?.parameters?.CommandLine === clipped));
+      const items = eventsOf(x, 'events').filter((e) => e.item?.type === 'command_execution').map((e) => e.item);
+      assert.deepEqual(items.map((item) => item.command), commands.flatMap((cmd, i) => Array(2).fill(missing && i < 2 ? clipped : cmd)));
+      const receipt = x.state().rounds[0].verification;
+      assert.deepEqual(receipt.checks.map((c) => c.command), commands);
+      assert.deepEqual(receipt.checks.map((c) => c.confirmation), missing ? ['unconfirmed', 'unconfirmed', 'confirmed'] : ['confirmed', 'confirmed', 'confirmed']);
+      assert.equal(receipt.label, missing ? 'partial' : 'executed');
+      if (missing) {
+        assert.equal(items[1].command_truncated, true);
+        for (const c of receipt.checks.slice(0, 2)) assert.match(c.note, /from the delegate.*truncat/i);
+        assert.match(r.out, /unconfirmed.*truncat/i);
+      }
+    }
+  });
+
+  await test('agy: killed and cancelled commands cannot claim an exit from their output', () => {
+    const preview = "The tool's output was truncated due to being too long. You can find the full output in a file at file:///tmp/output.txt.\n\nHere is a preview with the middle of the output truncated:\n";
+    const commands = [
+      { command: 'killed', rawOutput: 'Command was killed.\n\nCommand output:\nCommand exited with code 0.' },
+      { command: 'cancelled', state: 'CANCELLED', rawOutput: 'Command exited with code 0.' },
+      { command: 'no-header', rawOutput: 'Created At: now\nCommand output:\nCommand exited with code 0.' },
+      { command: 'failure', rawOutput: preview + 'Created At: now\nCompleted At: now\nCommand exited with code 3.\n\nCommand output:\nCommand exited with code 0.' },
+      { command: 'success', rawOutput: 'Command exited with code 0.\n\nCommand output:\nok' },
+    ];
+    const checks = commands.map(({ command }) => ({ command, outcome: command === 'failure' ? 'failed' : 'passed', note: '' }));
+    const x = setup([{ commands, reply: review({ checks }) }]);
+    assert.equal(x.run(start('code')).code, 0);
+    const items = eventsOf(x, 'events').filter((e) => e.type === 'item.completed' && e.item?.type === 'command_execution').map((e) => e.item);
+    assert.deepEqual(items.map((item) => item.exit_code), [null, null, null, 3, 0]);
+    assert.ok(items.slice(0, 3).every((item) => item.status !== 'completed'));
+    assert.deepEqual(x.state().rounds[0].verification.checks.map((c) => c.confirmation), ['unconfirmed', 'unconfirmed', 'unconfirmed', 'confirmed', 'confirmed']);
+  });
+
+  await test('agy: a successful audit keeps its answer and reports soft denials', () => {
+    const denial = [{ action: 'command', display_name: 'Optional lookup' }];
+    const x = setup([{ reply: audit, denied_actions: denial }]);
+    const r = x.run(start('audit'), 'Inspect');
+    assert.equal(r.code, 0, r.err);
+    const s = x.state();
+    assert.equal(s.audit.summary, audit.summary);
+    assert.deepEqual(s.rounds[0].agyResult.denied_actions, denial);
+    for (const out of [r.out, x.run(['status', '--session', s.id]).out, x.run(['report', '--session', s.id]).out]) assert.match(out, /denied.*Optional lookup/i);
+    const y = setup([{ reply: audit, status: 'ERROR', denied_actions: denial }]);
+    const failure = y.run(start('audit'), 'Inspect');
+    assert.equal(failure.code, 1);
+    assert.match(failure.err, /Optional lookup/);
+    assert.match(failure.err, /Check the allowed tools in agy's settings/);
+    assert.doesNotMatch(failure.err, /danger-full-access|globalPermissionGrants/);
+  });
+
+  await test('agy: a read-only MCP denial names the last failed call and offers valid ways to start again', () => {
+    const call = (step_index, server, tool) => ({
+      step_index, step_type: 'tool', state: 'ACTIVE', tool_name: 'call_mcp_tool',
+      tool_info: { parameters: { ServerName: server, ToolName: tool } },
+    });
+    for (const kind of ['audit', 'plan']) {
+      const x = setup([{
+        updates: [
+          call(50, 'other-server', 'older-error'), { step_index: 50, state: 'ERROR' },
+          call(63, 'audit-server', 'read-records'), { step_index: 63, state: 'ERROR' },
+          call(64, 'other-server', 'successful-call'), { step_index: 64, state: 'DONE' },
+        ],
+        denied_actions: [{ action: 'mcp', display_name: 'McpTool' }],
+        response: '', stderr: 'jetski: no output produced\n', exitCode: 1,
+      }]);
+      const r = x.run(start(kind, kind === 'plan' ? ['--sandbox', 'read-only'] : []), 'Inspect');
+      assert.equal(r.code, 1, r.err);
+      const state = x.state();
+      assert.equal(state.phase, 'codex-failed');
+      const problem = state.pending.error;
+      assert.match(problem, /agy denied mcp\(audit-server\/read-records\)/);
+      assert.match(problem, kind === 'audit' ? /read-only audit.*could not ask for approval/ : /read-only turn.*could not ask for approval/);
+      assert.match(problem, /Always Allow.*Antigravity/);
+      assert.match(problem, /userSettings\.globalPermissionGrants\.allow in ~\/\.gemini\/config\/config\.json/);
+      assert.match(problem, /forbid MCP in the task/);
+      assert.match(problem, kind === 'audit' ? /start a new audit with --engine codex/i : /start a new session with --engine codex/i);
+      assert.doesNotMatch(problem, /older-error|successful-call|McpTool|danger-full-access|agy's settings/);
+      assert.ok(r.err.includes(problem));
+    }
+    const x = setup([{
+      updates: [call(63, 'audit-server', 'clipped…'), { step_index: 63, state: 'ERROR' }],
+      denied_actions: [{ action: 'mcp', display_name: 'McpTool' }],
+      response: '',
+    }]);
+    assert.equal(x.run(start('audit'), 'Inspect').code, 1);
+    const problem = x.state().pending.error;
+    assert.match(problem, /agy denied an MCP tool.*mcp\(<server>\/<tool>\)/);
+    assert.doesNotMatch(problem, /clipped…/);
+  });
+
+  await test('agy: malformed receipt fields leave build and review decisions intact', () => {
+    const valid = { command: 'node --test', outcome: 'passed', note: '' };
+    const x = setup([{ reply: { ...build, checks: [valid, {}], gaps: [false, 'external service'] }, commands: [{ command: valid.command }] }]);
+    const r = x.run(start('build'), "# Implement\n## Owner's request\n> Keep this feature.\n");
+    assert.equal(r.code, 0, r.err);
+    const s = x.state();
+    assert.equal(s.phase, 'awaiting-review');
+    assert.equal(s.rounds[0].verification.checks[0].confirmation, 'confirmed');
+    assert.deepEqual(s.rounds[0].verification.gaps, ['(1 malformed check dropped)', 'external service', '(1 malformed gap dropped)']);
+    assert.equal(x.run(['discard', '--session', s.id]).code, 0);
+    const y = setup([{ response: JSON.stringify(review({ checks: 'bad', gaps: {} })) }]);
+    const reviewed = y.run(start('plan'));
+    assert.equal(reviewed.code, 0, reviewed.err);
+    assert.deepEqual(y.state().rounds[0].verification.gaps, ['(malformed checks ignored: expected an array)', '(malformed gaps ignored: expected an array)']);
+  });
+
+  await test('agy: nested session artifacts are excluded while neighboring subject files stay covered', () => {
+    for (const git of [false, true]) {
+      const x = setup([{ reply: audit, write: git ? { 'session-data/subject.txt': 'changed' } : {} }]);
+      if (!git) fs.rmSync(path.join(x.cwd, '.git'), { recursive: true });
+      const nested = path.join(x.cwd, 'session-data');
+      fs.mkdirSync(nested);
+      fs.symlinkSync(nested, x.home, 'dir');
+      fs.writeFileSync(path.join(nested, 'subject.txt'), 'original');
+      const r = x.run(start('audit'), 'Inspect');
+      assert.equal(r.code, 0, r.err);
+      assert.deepEqual(x.state().rounds[0].readOnlyViolations, git ? [{ path: 'session-data/subject.txt', change: 'changed' }] : []);
+    }
+  });
+
+  await test('agy: running audits refuse report and failed audit metadata names the engine once', () => {
+    const x = setup([{ response: 'incomplete' }]);
+    assert.equal(x.run(start('audit'), 'Inspect').code, 1);
+    const s = x.state();
+    const dir = path.join(x.home, s.id);
+    for (const phase of ['queued', 'awaiting-codex', 'codex-failed']) {
+      fs.writeFileSync(path.join(dir, 'state.json'), JSON.stringify({ ...s, phase }));
+      const report = x.run(['report', '--session', s.id]);
+      if (phase === 'codex-failed') {
+        assert.equal(report.code, 0, report.err);
+        assert.equal(report.out.match(/Engine: agy/g)?.length, 1);
+      } else {
+        assert.equal(report.code, 2, report.out);
+        assert.match(report.err, /has no report yet/);
+        assert.equal(fs.existsSync(path.join(dir, 'report.md')), false);
+      }
+    }
+  });
+
+  await test('agy auth: credential errors from the catalog stop before a turn and stale log entries are ignored', () => {
+    for (const [where, diagnostic] of [['LOG', 'OS credential manager unavailable (keyring locked); falling back to file-based secret storage'], ['STDERR', 'Print mode: auth timed out']]) {
+      const x = setup([{ reply: review() }]);
+      const r = x.run(start('plan'), '', { FAKE_AGY_MODELS_FAIL: '1', [`FAKE_AGY_MODELS_${where}`]: diagnostic });
+      assert.notEqual(r.code, 0);
+      assert.match(r.err, /agy.*(?:credential|authentication).*HOME/i);
+      assert.doesNotMatch(r.err, /check the network or VPN/);
+      assert.equal(fs.existsSync(x.callsFile), false, 'a failed credential probe must not launch the turn');
+      assert.equal(x.modelCalls(), 1);
+    }
+    const x = setup([{ reply: review() }]);
+    fs.writeFileSync(path.join(x.agyHome, 'cli.log'), 'Print mode: auth timed out\n');
+    const r = x.run(start('plan'), '', { FAKE_AGY_MODELS_FAIL: '1' });
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /agy models unavailable/);
+  });
+
+  await test('agy auth: turn errors distinguish credential access from an MCP wait or generic exit', () => {
+    for (const detail of [{ cliLog: 'OS credential manager is unavailable' }, { stderr: 'Error: authentication timed out.' }]) {
+      const x = setup([{ ...detail, exitCode: 1, noResult: true }]);
+      const r = x.run(start('plan'));
+      assert.equal(r.code, 1, r.err);
+      assert.match(x.state().pending.error, /agy.*(?:credential|authentication).*HOME/i);
+      assert.doesNotMatch(x.state().pending.error, /MCP servers|VPN/);
+      assert.equal(x.calls().length, 1);
+    }
+  });
+
+  await test('agy auth: a catalog probe or turn needing browser login never reaches the desktop opener', () => {
+    for (const probe of [true, false]) {
+      const x = setup([{ login: true }]);
+      const bin = path.join(x.agyHome, 'bin');
+      fs.mkdirSync(bin);
+      const marker = path.join(x.agyHome, 'desktop-opener-called');
+      fs.writeFileSync(path.join(bin, process.platform === 'darwin' ? 'open' : 'xdg-open'), '#!/bin/sh\n: > "$FAKE_DESKTOP_MARKER"\n', { mode: 0o700 });
+      const r = x.run(start('plan'), '', { FAKE_AGY_MODELS_LOGIN: probe ? '1' : '', FAKE_DESKTOP_MARKER: marker, PATH: bin + path.delimiter + x.env.PATH });
+      assert.notEqual(r.code, 0);
+      assert.equal(fs.existsSync(marker), false);
+      assert.match(r.err, /agy authentication failed.*real HOME/i);
+      assert.equal(fs.existsSync(x.callsFile), !probe);
+    }
+  });
+
+  await test('agy settings: a UTF-8 BOM preserves validation and unreadable settings have a distinct note', () => {
+    const x = setup([]);
+    const settings = path.join(x.agyHome, 'settings.json');
+    fs.writeFileSync(settings, '\uFEFF{"model":"gemini-4-carbon-high"}');
+    const r = x.run(start('plan', ['--effort', 'low']));
+    assert.equal(r.code, 2, r.err);
+    assert.match(r.err, /gemini-4-carbon.*no "low"/);
+    for (const missing of [false, true]) {
+      const y = setup([{ reply: review() }]);
+      const file = path.join(y.agyHome, 'settings.json');
+      if (missing) fs.unlinkSync(file);
+      else fs.writeFileSync(file, '{ invalid');
+      const bypass = y.run(start('plan', ['--effort', 'low']));
+      assert.equal(bypass.code, 0, bypass.err);
+      assert.match(y.state().codex.modelCheckNote, missing ? /missing/ : /unreadable|cannot read/);
+    }
+  });
 
   await test('agy: finish preserves a conventional subject and credits the implementing engine', () => {
     const x = setup([{ reply: build, write: { 'implemented.txt': 'agy wrote this\n' } }]);
@@ -110,7 +321,7 @@ export async function agyTests(test, parent) {
     assert.equal(fs.existsSync(unavailable.home), false);
   });
 
-  await test('agy models: config family and explicit level keep separate sources; family-only waits for init', () => {
+  await test('agy models: config family and explicit level keep separate sources and family-only uses this turn’s transcript', () => {
     for (const configured of ['Gemini 3.8 Flash (High)', 'gemini-3.8-flash-high']) {
       const x = setup([{ reply: review(), model: 'gemini-3.8-flash-low' }]);
       fs.writeFileSync(path.join(x.agyHome, 'settings.json'), JSON.stringify({ model: configured }));
@@ -122,10 +333,11 @@ export async function agyTests(test, parent) {
       assert.deepEqual(m.fromConfig, ['family']);
       assert.match(r.out, /Model: gemini-3\.8-flash-low · family gemini-3\.8-flash \(config\) · low/);
       assert.equal(x.modelCalls(), 1);
+      assert.equal(Object.hasOwn(eventsOf(x, 'agy')[0].init, 'model'), false);
       for (const cmd of ['status', 'report', 'list']) assert.equal(x.run([cmd, '--session', x.state().id]).code, 0);
       assert.equal(x.modelCalls(), 1, 'read-only session commands must not fetch the catalog');
     }
-    const x = setup([{ reply: review(), model: 'gemini-4-hydrogen-medium' }]);
+    const x = setup([{ reply: review(), model: 'gemini-4-hydrogen-medium' }, { reply: review(), noFullTranscript: true, noTranscript: true }]);
     const r = x.run(start('plan', ['--model', 'gemini-4-hydrogen']));
     assert.equal(r.code, 0, r.err);
     assert.match(r.out, /Model: gemini-4-hydrogen-medium/);
@@ -133,6 +345,42 @@ export async function agyTests(test, parent) {
     assert.equal(x.calls()[0].args.includes('--effort'), false);
     const args = x.calls()[0].args;
     assert.equal(args[args.indexOf('--model') + 1], 'gemini-4-hydrogen');
+    assert.equal(eventsOf(x, 'agy')[0].init.model, 'gemini-4-hydrogen');
+    const next = x.run(['reply', '--session', x.state().id, '--responses', '-'], feedback);
+    assert.equal(next.code, 0, next.err);
+    assert.equal(x.state().rounds[1].codexModel.model, 'gemini-4-hydrogen', 'a previous planner response is not an observation of this turn');
+  });
+
+  await test('agy models: switching model alone drops the previous effort for slugs and families', () => {
+    for (const [model, actual] of [['gemini-3.8-flash-low', 'gemini-3.8-flash-low'], ['gemini-4-hydrogen', 'gemini-4-hydrogen-medium']]) {
+      const x = setup([{ reply: review() }, { reply: review(), model: actual }]);
+      assert.equal(x.run(start('plan', ['--model', 'gemini-4-carbon', '--effort', 'high'])).code, 0);
+      const r = x.run(['reply', '--session', x.state().id, '--responses', '-', '--model', model], feedback);
+      assert.equal(r.code, 0, r.err);
+      assert.equal(x.calls()[1].args.includes('--effort'), false);
+      assert.equal(x.state().codex.effort, null);
+      assert.equal(x.state().rounds[1].codexModel.model, actual);
+    }
+  });
+
+  await test('agy models: plain reply, review and retry reuse the session catalog and resolved choice', () => {
+    for (const cmd of ['reply', 'review', 'retry']) {
+      const answer = cmd === 'review' ? build : review();
+      const x = setup([cmd === 'retry' ? { noResult: true, exitCode: 1 } : { reply: answer }, { reply: answer }]);
+      const r = x.run(start(cmd === 'review' ? 'build' : 'plan', ['--model', 'gemini-3.8-flash', '--effort', 'high']), "# Implement\n## Owner's request\n> Keep the input\n");
+      assert.equal(r.code, cmd === 'retry' ? 1 : 0, r.err);
+      const args = cmd === 'review' ? ['--issues', '-'] : cmd === 'reply' ? ['--responses', '-'] : [];
+      const s = x.state();
+      const next = x.run([cmd, '--session', s.id, ...args], cmd === 'review' ? JSON.stringify(review()) : feedback, { FAKE_AGY_MODELS_FAIL: '1' });
+      assert.equal(next.code, 0, next.err);
+      assert.equal(x.modelCalls(), 1);
+      assert.equal(x.state().rounds.at(-1).codexModel.model, 'gemini-3.8-flash-high');
+      assert.doesNotMatch(next.out, /catalog unavailable|models unavailable/);
+      if (cmd === 'review') {
+        assert.equal(x.run(['discard', '--session', s.id]).code, 0);
+        assert.equal(x.modelCalls(), 1);
+      }
+    }
   });
 
   await test('agy models: standalone levels and unresolved defaults are passed through with an honest note', () => {
@@ -221,6 +469,7 @@ export async function agyTests(test, parent) {
       assert.match(r.out, kind === 'audit' ? /A1.*Audit finding/ : kind === 'build' ? /agy implemented/ : /C1.*Check input/);
       if (['code', 'build'].includes(kind)) assert.equal(s.rounds[0].verification.label, 'executed');
       const c = x.calls()[0];
+      assert.match(c.prompt, /agy 1\.5\.9\+.*keychain.*Google sign-in/is);
       assert.equal(c.home, process.env.HOME);
       assert.equal(c.cwd, kind === 'build' ? s.subject.worktree : x.cwd);
       assert.deepEqual(c.args.slice(0, 6), ['--input-format', 'stream-json', '--output-format', 'stream-json', '--json-schema', path.join(HERE, '..', 'schemas', `${kind === 'build' || kind === 'audit' ? kind : 'review'}.schema.json`)]);
@@ -229,7 +478,7 @@ export async function agyTests(test, parent) {
       assert.equal(c.input.trim().split('\n').length, 1);
       assert.deepEqual(JSON.parse(c.input), { event: 'user', message: { role: 'user', content: c.prompt } });
       const events = fs.readFileSync(path.join(x.home, s.id, 'round-1.events.jsonl'), 'utf8');
-      assert.match(events, /"type":"item.completed","item":\{"id":"step_1","type":"command_execution"/);
+      assert.match(events, /"type":"item.completed","item":\{"id":"step_2","type":"command_execution"/);
       const command = events.split('\n').filter(Boolean).map(JSON.parse).find((e) => e.type === 'item.completed' && e.item?.type === 'command_execution');
       assert.equal(command.item.exit_code, 0);
       assert.ok(command._at);
@@ -307,7 +556,7 @@ export async function agyTests(test, parent) {
       [{ exitCode: 3, noResult: true, stderr: 'I1114 01:07:22.04 noise\nAGY_ERROR: {"short_error":"deadline hit","retryable":false,"reason":"print_timeout"}\n' }, /deadline hit.*retryable.*false/],
       [{ status: 'ERROR', error: 'API unavailable' }, /API unavailable/],
       [{ response: 'No answer' }, /structured.*(?:answer|output)/],
-      [{ response: 'Denied', denied_actions: [{ action: 'command', display_name: 'Bash' }] }, /Bash.*headless.*cannot ask.*danger-full-access/],
+      [{ response: 'Denied', denied_actions: [{ action: 'command', display_name: 'Bash' }] }, /Bash.*headless.*cannot ask/],
       [{ reply: review(), finished_reason: 'print_timeout' }, /print_timeout/],
     ];
     for (const [failure, message] of failures) {
@@ -331,7 +580,7 @@ export async function agyTests(test, parent) {
     const x = setup([{ response: `Some prose\n${JSON.stringify(reply)}`, commands: [{ command: 'node --test', exit_code: 7 }, { command: 'denied', state: 'ERROR', noOutput: true }], updates: [
       { step_index: 8, step_type: 'agent_response', state: 'ACTIVE', text_delta: 'A streamed ' },
       { step_index: 8, step_type: 'agent_response', state: 'DONE', text_delta: 'message' },
-      { step_index: 9, step_type: 'tool', state: 'ACTIVE', tool_name: 'call_mcp_tool', tool_info: { parameters: { server_name: 'server', tool_name: 'lookup' } } },
+      { step_index: 9, step_type: 'tool', state: 'ACTIVE', tool_name: 'call_mcp_tool', tool_info: { parameters: { ServerName: 'server', ToolName: 'lookup' } } },
       { step_index: 9, step_type: 'tool', state: 'DONE' },
       { step_index: 10, step_type: 'tool', state: 'DONE', tool_name: 'search_web', tool_info: { parameters: { query: 'a query' } } },
     ] }]);
@@ -400,6 +649,8 @@ export async function agyTests(test, parent) {
     assert.equal(finish.code, 0, finish.err);
     assert.equal(x.state().phase, 'finished');
     assert.match(x.git('show', '-s', '--format=%B', x.state().subject.branch), /Implemented by agy/);
+    assert.equal(x.modelCalls(), 1, 'review, verify, list, report and finish reuse saved model information');
+    assert.equal(x.calls().length, 2, 'an approving review needs no agy process');
   });
 
   await test('agy: later-round fresh retry creates and keeps a new conversation', () => {

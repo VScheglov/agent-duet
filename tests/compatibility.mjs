@@ -18,6 +18,9 @@ export async function compatibilityTests(test, parent) {
   const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(?:AGENT|CODEX)_DUET_/.test(key)));
   const env = {
     ...cleanEnv, CODEX_HOME: path.join(root, 'codex'), CLAUDE_CODE_SESSION_ID: '',
+    XDG_STATE_HOME: path.join(root, 'xdg-state'),
+    AGENT_DUET_AGY_BIN: path.join(HERE, 'fake-agy.mjs'), AGENT_DUET_AGY_HOME: path.join(root, 'agy-home'),
+    FAKE_AGY_SCRIPT: path.join(root, 'script.json'), FAKE_AGY_STATE: path.join(root, 'calls.json'),
     FAKE_CODEX_SCRIPT: path.join(root, 'script.json'), FAKE_CODEX_STATE: path.join(root, 'calls.json'),
     FIXTURE_DECISIONS: '{"1":"done"}',
     GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t',
@@ -69,6 +72,8 @@ export async function compatibilityTests(test, parent) {
       const more = Object.fromEntries(Object.entries(values).flatMap(([key, value]) => useNew
         ? [[`CODEX_DUET_${key}`, path.join(root, 'invalid-agy')], [`AGENT_DUET_${key}`, value]]
         : [[`CODEX_DUET_${key}`, value]]));
+      // Only this legacy-prefix fixture omits the new defaults. Its legacy binary is the same fake.
+      if (!useNew) Object.assign(more, { AGENT_DUET_AGY_HOME: undefined, AGENT_DUET_AGY_BIN: undefined });
       script([{ reply: reviewAnswer }]);
       const r = run(['start', '--kind', 'plan', '--subject', '-'], { ...more, FAKE_AGY_SCRIPT: env.FAKE_CODEX_SCRIPT, FAKE_AGY_STATE: env.FAKE_CODEX_STATE }, root, '# Plan');
       assert.equal(r.code, 0, r.err);
@@ -84,12 +89,15 @@ export async function compatibilityTests(test, parent) {
       AGENT_DUET_HOME: path.join(root, 'empty-values'), AGENT_DUET_CODEX_BIN: fakeEngine,
       CODEX_DUET_MODEL: 'invalid model', CODEX_DUET_EFFORT: 'invalid effort',
       AGENT_DUET_MODEL: '', AGENT_DUET_EFFORT: '',
+      CODEX_DUET_ENGINE: 'agy', CODEX_DUET_SANDBOX: 'read-only',
+      AGENT_DUET_ENGINE: '', AGENT_DUET_SANDBOX: '',
     };
     script([{ reply: reviewAnswer }]);
     const cleared = run(['start', '--kind', 'plan', '--subject', '-'], more, root, '# Plan');
     assert.equal(cleared.code, 0, cleared.err);
     const st = JSON.parse(fs.readFileSync(path.join(more.AGENT_DUET_HOME, idOf(cleared.out), 'state.json'), 'utf8'));
     assert.deepEqual([st.codex.model, st.codex.effort], [null, null]);
+    assert.deepEqual([st.engine, st.codex.sandbox], ['codex', 'inherit']);
     for (const useNew of [false, true]) {
       script([{ hang: true, ignoreTerm: true }]);
       const timing = { ...more, AGENT_DUET_HOME: path.join(root, useNew ? 'new-timeout' : 'old-timeout'), CODEX_DUET_TIMEOUT_MS: '250', CODEX_DUET_KILL_GRACE_MS: '100' };
@@ -100,6 +108,23 @@ export async function compatibilityTests(test, parent) {
       assert.match(r.err, /did not finish within 250 ms/);
       assert.ok(Date.now() - began < 4000, 'the chosen timeout and kill grace must stop a stubborn fake promptly');
     }
+  });
+
+  await test('rename: the next call repairs a missing compatibility link after the directory move', () => {
+    const xdg = path.join(root, 'interrupted');
+    const legacy = path.join(xdg, 'codex-duet');
+    const current = path.join(xdg, 'agent-duet');
+    listState(legacy, 'migrated');
+    fs.renameSync(legacy, current); // a previous runner died before symlink()
+    const listed = run(['list', '--all'], { XDG_STATE_HOME: xdg });
+    assert.equal(listed.code, 0, listed.err);
+    assert.match(listed.out, /migrated/);
+    assert.equal(fs.realpathSync(legacy), current);
+    fs.unlinkSync(legacy);
+    const unrelated = path.join(xdg, 'absent-target');
+    fs.symlinkSync(unrelated, legacy);
+    assert.equal(run(['list', '--all'], { XDG_STATE_HOME: xdg }).code, 0);
+    assert.equal(fs.readlinkSync(legacy), unrelated, 'an existing dangling link is also an independent entry');
   });
 
   await test('rename: the default state directory moves once, retaining old build paths and branches through a symlink', () => {

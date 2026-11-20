@@ -1,14 +1,30 @@
 #!/usr/bin/env node
-// Boundary fake for the measured agy 1.5.7 protocol. Never executes scripted commands.
-import { spawn } from 'node:child_process';
+// Boundary fake for the agy 1.5.10 stream and conversation transcripts.
+import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { duetEnv } from '../scripts/config.mjs';
 
 const args = process.argv.slice(2);
+const home = duetEnv('AGY_HOME');
+function cliLog(line) {
+  if (!line) return;
+  fs.mkdirSync(home, { recursive: true });
+  fs.appendFileSync(path.join(home, 'cli.log'), line + '\n');
+}
+function tryLogin() {
+  // Used only with a recording fake opener first on the fixture's PATH.
+  const opener = process.platform === 'darwin' ? 'open' : 'xdg-open';
+  if (!process.env.FAKE_DESKTOP_MARKER) throw new Error('fake login requires the recording opener fixture');
+  spawnSync(opener, ['https://accounts.google.invalid/test-login']);
+  process.exit(1);
+}
 if (args[0] === 'models') {
   fs.appendFileSync(`${process.env.FAKE_AGY_STATE}.models`, 'models\n');
+  cliLog(process.env.FAKE_AGY_MODELS_LOG);
+  if (process.env.FAKE_AGY_MODELS_LOGIN) tryLogin();
+  if (process.env.FAKE_AGY_MODELS_STDERR) console.error(process.env.FAKE_AGY_MODELS_STDERR);
   if (process.env.FAKE_AGY_MODELS_FAIL) process.exit(1);
   console.log('Fetching available models...');
   console.log('gemini-3.8-flash-low\tGemini 3.8 Flash (Low)');
@@ -35,24 +51,42 @@ if (step?.probeEnv) call.gitSelectors = step.probeEnv.filter((key) => key in pro
 state.calls.push(call);
 fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
 if (!step) throw new Error('fake agy: no scripted reply left');
+cliLog(step.cliLog);
+if (step.login) tryLogin();
 if (step.fail) {
   console.error(step.fail);
   process.exit(1);
 }
 const conversation = args.includes('--conversation') ? args[args.indexOf('--conversation') + 1] : crypto.randomUUID();
-const logs = path.join(duetEnv('AGY_HOME'), 'conversations');
+const logs = path.join(home, 'conversations');
 fs.mkdirSync(logs, { recursive: true });
 fs.writeFileSync(path.join(logs, `${conversation}.db`), 'fake SQLite conversation');
 fs.writeFileSync(path.join(logs, `${conversation}.db-wal`), 'fake write-ahead log');
 const emit = (event) => process.stdout.write(`${JSON.stringify(event)}\n`);
-if (!step.noInit) emit({ event: 'init', conversation_id: conversation, init: { model: step.model ?? 'gemini-3.8-flash-high', cwd: process.cwd(), tools: [], permission_mode: 'always-proceed' } });
-if (!step.noUserInput) emit({ event: 'step_update', step_update: { conversation_id: conversation, step_index: 0, state: 'DONE', step_type: 'user_input' } });
-for (const [i, command] of (step.commands ?? []).entries()) {
-  const info = { name: 'run_command', parameters: { CommandLine: command.command } };
-  const update = { conversation_id: conversation, step_index: i + 1, step_type: 'tool', tool_name: 'run_command', tool_info: info };
+const requested = args.includes('--model') ? args[args.indexOf('--model') + 1] : undefined;
+if (!step.noInit) emit({ event: 'init', conversation_id: conversation, init: { model: requested, cwd: process.cwd(), tools: [], permission_mode: 'always-proceed' } });
+const brain = path.join(home, 'brain', conversation, '.system_generated', 'logs');
+fs.mkdirSync(brain, { recursive: true });
+const transcript = path.join(brain, 'transcript.jsonl');
+const previous = fs.existsSync(transcript) ? fs.readFileSync(transcript, 'utf8').trim().split('\n').map(JSON.parse) : [];
+const first = previous.length ? previous.at(-1).step_index + 1 : 0;
+const commands = step.commands ?? [];
+const planner = { step_index: first + 1, type: 'PLANNER_RESPONSE', model: step.model ?? requested, tool_calls: commands.map((c) => ({ name: 'run_command', args: { CommandLine: c.command } })) };
+if (!step.noUserInput) emit({ event: 'step_update', step_update: { conversation_id: conversation, step_index: first, state: 'DONE', step_type: 'user_input' } });
+if (commands.length || step.reply || step.response) {
+  emit({ event: 'step_update', step_update: { conversation_id: conversation, step_index: planner.step_index, state: 'DONE', step_type: 'agent_response' } });
+  const records = [{ step_index: first, type: 'USER_INPUT' }, planner, ...commands.map((_, i) => ({ step_index: first + 2 + i, type: 'GENERIC' }))];
+  const append = (file, rows) => fs.appendFileSync(file, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+  if (!step.noTranscript) append(transcript, records.map((r) => r === planner ? { ...r, tool_calls: [] } : r));
+  if (!step.noFullTranscript) append(path.join(brain, 'transcript_full.jsonl'), records);
+}
+for (const [i, command] of commands.entries()) {
+  const chars = [...command.command];
+  const info = { name: 'run_command', parameters: { CommandLine: chars.length > 512 ? chars.slice(0, 512).join('') + '…' : command.command } };
+  const update = { conversation_id: conversation, step_index: first + 2 + i, step_type: 'tool', tool_name: 'run_command', tool_info: info };
   emit({ event: 'step_update', step_update: { ...update, state: 'ACTIVE' } });
   if (command.completed === false) continue;
-  const output = command.noOutput ? undefined : `Created At: now\nCompleted At: now\nCommand exited with code ${command.exit_code ?? 0}.\n\nCommand output:\n${command.output ?? 'ok'}`;
+  const output = command.noOutput ? undefined : command.rawOutput ?? `Created At: now\nCompleted At: now\nCommand exited with code ${command.exit_code ?? 0}.\n\nCommand output:\n${command.output ?? 'ok'}`;
   emit({ event: 'step_update', step_update: { ...update, state: command.state ?? 'DONE', tool_info: { ...info, output } } });
 }
 for (const update of step.updates ?? []) emit({ event: 'step_update', step_update: { conversation_id: conversation, ...update } });

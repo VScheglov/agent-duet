@@ -4,7 +4,9 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createInterface } from 'node:readline';
 import { duetEnv } from './config.mjs';
+import { confirmVerification } from './verification.mjs';
 
 export const AGY_BIN = duetEnv('AGY_BIN') || 'agy';
 export const AGY_HOME = duetEnv('AGY_HOME') || path.join(os.homedir(), '.gemini', 'antigravity-cli');
@@ -15,14 +17,72 @@ let catalog; // undefined: not fetched; null: unavailable. One fetch per runner 
 
 export function agyDefaults() {
   try {
-    const settings = JSON.parse(fs.readFileSync(path.join(AGY_HOME, 'settings.json'), 'utf8'));
+    const settings = JSON.parse(fs.readFileSync(path.join(AGY_HOME, 'settings.json'), 'utf8').replace(/^\uFEFF/, ''));
+    if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return { model: null, unreadable: true };
     return { model: typeof settings.model === 'string' ? settings.model : null };
-  } catch { return { model: null }; }
+  } catch (err) { return { model: null, unreadable: err.code !== 'ENOENT' }; }
+}
+
+const AUTH_ERROR = 'agy authentication failed. Use your real HOME, unlock the OS credential manager and sign in to agy from your own terminal before retrying.';
+const AUTH_DIAGNOSTIC = /OS credential manager (?:is )?unavailable|(?:auth(?:entication|orization)? (?:timed out|timeout)|timed out waiting for (?:auth|sign-in))/i;
+const cliLog = path.join(AGY_HOME, 'cli.log');
+
+function logStat() {
+  try { return fs.statSync(cliLog); } catch { return null; }
+}
+
+// agy 1.5.10 invokes the platform opener through PATH during OAuth startup.
+// Prevent an unattended browser launch, even on the first catalog probe. Restore
+// normal tool lookup as soon as agy starts the conversation, or on any exit.
+export function agyStartup() {
+  const before = logStat();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-duet-agy-'));
+  const attempted = path.join(dir, 'attempted');
+  const openers = process.platform === 'darwin' ? ['open'] : ['xdg-open', 'termux-open-url'];
+  const close = () => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    process.off('exit', close);
+  };
+  process.once('exit', close);
+  for (const opener of openers) {
+    fs.writeFileSync(path.join(dir, opener), '#!/bin/sh\n: > "${0%/*}/attempted"\nexit 1\n', { mode: 0o700 });
+  }
+  return {
+    env: { ...process.env, PATH: dir + path.delimiter + (process.env.PATH ?? '/usr/bin:/bin') },
+    close,
+    allowTools() {
+      // Keep ownership of the private PATH directory until the child exits.
+      for (const opener of openers) fs.rmSync(path.join(dir, opener), { force: true });
+    },
+    authError(stderr) {
+      if (fs.existsSync(attempted) || AUTH_DIAGNOSTIC.test(stderr)) return AUTH_ERROR;
+      const after = logStat();
+      if (!after?.isFile()) return null;
+      const appended = before && before.dev === after.dev && before.ino === after.ino && before.size <= after.size;
+      const start = Math.max(appended ? before.size : 0, after.size - 65536);
+      let fd;
+      try {
+        fd = fs.openSync(cliLog, 'r');
+        const buffer = Buffer.alloc(after.size - start);
+        const n = fs.readSync(fd, buffer, 0, buffer.length, start);
+        return AUTH_DIAGNOSTIC.test(buffer.toString('utf8', 0, n)) ? AUTH_ERROR : null;
+      } catch { return null; }
+      finally { if (fd !== undefined) fs.closeSync(fd); }
+    },
+  };
 }
 
 function agyCatalog() {
   if (catalog !== undefined) return catalog;
-  const r = spawnSync(AGY_BIN, ['models'], { encoding: 'utf8', timeout: 15_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024 });
+  const startup = agyStartup();
+  let r;
+  try {
+    r = spawnSync(AGY_BIN, ['models'], { env: startup.env, encoding: 'utf8', timeout: 15_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024 });
+    if (r.error || r.status !== 0 || !r.stdout?.includes('\t')) {
+      const problem = startup.authError(r.stderr);
+      if (problem) throw new Error(problem);
+    }
+  } finally { startup.close(); }
   const models = (r.stdout || '').split(/\r?\n/).flatMap((line) => {
     const match = /^([^\s]+)\t(.+)$/.exec(line.trim());
     if (!match) return [];
@@ -54,8 +114,14 @@ function catalogModel(available, name) {
 // fixes its default level, but an explicit --effort overrides that level within its family.
 export function checkAgyChoice(model, effort, { switchEffort = false } = {}) {
   if (effort && !EFFORTS.includes(effort)) throw new Error(`unknown agy effort: ${effort}; known: ${EFFORTS.join(', ')}`);
-  const defaults = agyDefaults();
   const available = agyCatalog();
+  const choice = resolveAgyChoice(model, effort, agyDefaults(), available, switchEffort);
+  // Keep the catalog with the session. Subsequent processes can display observed
+  // slugs without a network or keychain operation, even after settings change.
+  return available ? { ...choice, modelCatalog: available.models } : choice;
+}
+
+function resolveAgyChoice(model, effort, defaults, available, switchEffort) {
   const configured = !model;
   let selected = available ? catalogModel(available, model || defaults.model) : null;
   // An effort-only switch replaces a previously selected slug's fixed level. With
@@ -79,7 +145,8 @@ export function checkAgyChoice(model, effort, { switchEffort = false } = {}) {
   });
   if (!available) return unchecked(CATALOG_UNAVAILABLE);
   if (!selected) {
-    if (configured) return unchecked(`agy settings model ${defaults.model ? `"${defaults.model}" is unknown` : 'is missing'}; model check skipped`);
+    if (configured) return unchecked(defaults.unreadable ? 'agy settings.json is unreadable; model check skipped'
+      : `agy settings model ${defaults.model ? `"${defaults.model}" is unknown` : 'is missing'}; model check skipped`);
     throw new Error(`unknown agy model: ${model}; available: ${available.models.map((m) => m.slug).join(', ')}; families: ${[...available.families.values()].map((f) => f.slug).join(', ')}`);
   }
   if (!selected.family) {
@@ -105,13 +172,14 @@ export function checkAgyChoice(model, effort, { switchEffort = false } = {}) {
   };
 }
 
-// A family without a level is intentionally left to agy. Only its init event can
-// resolve that choice; do not guess a default or invent a slug without a catalog.
-export function observedAgyModel(info, actual) {
-  if (!catalog || !info?.family || info.effort || info.model !== info.family || typeof actual !== 'string') return null;
-  const selected = catalogModel(catalog, actual);
-  if (!selected?.level || selected.family !== info.family) return null;
-  return { ...info, model: selected.slug, effort: selected.level };
+// init usually echoes the requested family. The planner transcript names the slug.
+export function observedAgyModel(info, actual, models) {
+  if (!info || info.effort || typeof actual !== 'string') return null;
+  const suffix = LEVEL_SUFFIX.exec(actual);
+  const family = info.family ?? info.model;
+  if (!suffix || actual.slice(0, -suffix[0].length).toLowerCase() !== family?.toLowerCase()) return null;
+  const selected = models?.find((m) => m.slug.toLowerCase() === actual.toLowerCase());
+  return { ...info, family, model: selected?.slug ?? actual, effort: suffix[1].toLowerCase() };
 }
 
 export function agyArgs(st, conversation, schema) {
@@ -137,9 +205,17 @@ export function agyArgs(st, conversation, schema) {
 export const agyConversation = (id) => typeof id === 'string' && /^[\w-]+$/.test(id)
   ? path.join(AGY_HOME, 'conversations', `${id}.db`) : null;
 
+// Large tool output can have an agy preview wrapper before the ordinary header.
+// Everything after "Command output:" belongs to the subprocess.
+const PREVIEW = /^The tool's output was truncated due to being too long\. You can find the full output in a file at file:\/\/[^\r\n]+\.\r?\n\r?\nHere is a preview with the middle of the output truncated:\r?\n/;
+const EXIT_HEADER = /^(?:Created At: [^\r\n]*\r?\n)?(?:Completed At: [^\r\n]*\r?\n)?Command exited with code (-?\d+)\.(?:\r?\n|$)/;
+
 // Each step may send partial updates; DONE can omit the tool name and parameters.
 export class AgyEvents {
   steps = new Map();
+  truncated = new Map();
+  commandAttempts = [];
+  failedMcpCall = null;
   result = null;
   beganWork = false;
   firstInput = null;
@@ -160,7 +236,8 @@ export class AgyEvents {
     this.steps.set(index, step);
     if (step.step_type === 'user_input' && this.firstInput === null) this.firstInput = index;
     if (step.step_type && (step.step_type !== 'user_input' || index !== this.firstInput)) this.beganWork = true;
-    const complete = step.state === 'DONE' || step.state === 'ERROR';
+    const cancelled = ['CANCELLED', 'CANCELED', 'KILLED', 'ABORTED'].includes(step.state);
+    const complete = step.state === 'DONE' || step.state === 'ERROR' || cancelled;
     if (prev.completed) return [];
     if (step.step_type === 'agent_response') {
       if (!complete) return [];
@@ -173,12 +250,25 @@ export class AgyEvents {
     const tool = step.tool_name ?? info.name;
     let item;
     if (tool === 'run_command') {
-      const match = /Command exited with code (-?\d+)\./.exec(String(info.output ?? ''));
-      const exit = complete && match ? Number(match[1]) : null;
-      item = { id: `step_${index}`, type: 'command_execution', command: parameters.CommandLine ?? '', exit_code: exit, status: complete ? (step.state === 'ERROR' && !info.output ? 'declined' : step.state === 'ERROR' || (exit !== null && exit !== 0) ? 'failed' : 'completed') : 'in_progress' };
+      const command = parameters.CommandLine ?? '';
+      const match = complete && !cancelled && EXIT_HEADER.exec(String(info.output ?? '').replace(PREVIEW, ''));
+      const exit = match && !(step.state === 'ERROR' && Number(match[1]) === 0) ? Number(match[1]) : null;
+      let status = 'in_progress';
+      if (step.state === 'ERROR') status = info.output ? 'failed' : 'declined';
+      else if (complete) status = exit === null ? 'incomplete' : exit === 0 ? 'completed' : 'failed';
+      item = { id: `step_${index}`, type: 'command_execution', command, exit_code: exit, status };
+      if (typeof command === 'string' && command.endsWith('…') && command.length >= 500) {
+        this.truncated.set(index, { command, exit });
+        item.command_truncated = true;
+        item.exit_code = null; // a clipped prefix cannot prove a check's exit
+      }
+      if (complete) this.commandAttempts.push({ index, command });
       if (complete && typeof info.output === 'string') item.aggregated_output = info.output;
     } else if (tool === 'call_mcp_tool') {
-      item = { id: `step_${index}`, type: 'mcp_tool_call', server: parameters.server_name ?? parameters.serverName ?? parameters.server ?? '', tool: parameters.tool_name ?? parameters.toolName ?? parameters.tool ?? '', status: complete ? (step.state === 'ERROR' ? 'failed' : 'completed') : 'in_progress' };
+      item = { id: `step_${index}`, type: 'mcp_tool_call', server: parameters.ServerName ?? parameters.server_name ?? parameters.serverName ?? parameters.server ?? '', tool: parameters.ToolName ?? parameters.tool_name ?? parameters.toolName ?? parameters.tool ?? '', status: complete ? (step.state === 'ERROR' ? 'failed' : 'completed') : 'in_progress' };
+      // A result's MCP denial is generic. Keep the last failed call before the
+      // result, even when subsequent calls succeeded.
+      if (step.state === 'ERROR' && !this.result) this.failedMcpCall = { server: item.server, tool: item.tool };
     } else if (tool === 'search_web') {
       item = { id: `step_${index}`, type: 'web_search', query: parameters.query ?? parameters.Query ?? '', status: complete ? (step.state === 'ERROR' ? 'failed' : 'completed') : 'in_progress' };
     } else return [];
@@ -187,6 +277,101 @@ export class AgyEvents {
     else step.started = true;
     return [{ type: complete ? 'item.completed' : 'item.started', item }];
   }
+
+  // Transcript indices span the whole conversation. Bind model observations to
+  // this turn's planner steps and commands to their exact slot in a tool batch.
+  async reconcile(id, info, models, eventsFile) {
+    const observe = info?.model && !info.effort && (info.family || !models);
+    if (!observe && !this.truncated.size) return {};
+    const logs = agyConversation(id) ? path.join(AGY_HOME, 'brain', id, '.system_generated', 'logs') : null;
+    let model = null;
+    const read = async (name, full) => {
+      if (!logs) return;
+      const input = fs.createReadStream(path.join(logs, name), { encoding: 'utf8' });
+      try {
+        for await (const line of createInterface({ input, crlfDelay: Infinity })) {
+          let row;
+          try { row = JSON.parse(line); } catch { continue; }
+          if (row?.type !== 'PLANNER_RESPONSE' || !Number.isInteger(row.step_index)) continue;
+          if (observe && this.steps.get(row.step_index)?.step_type === 'agent_response') {
+            model = observedAgyModel(info, row.model, models) ?? model;
+          }
+          if (!full || !Array.isArray(row.tool_calls)) continue;
+          for (const [k, call] of row.tool_calls.entries()) {
+            const clipped = this.truncated.get(row.step_index + 1 + k);
+            const cmd = call?.args?.CommandLine;
+            if (clipped && call?.name === 'run_command' && typeof cmd === 'string'
+              && cmd.length >= clipped.command.length && cmd.startsWith(clipped.command.slice(0, -1))) clipped.full = cmd;
+          }
+        }
+      } catch (err) {
+        if (!err.code) throw err;
+        // Transcripts are optional. Leave the wire evidence intact when unavailable.
+      } finally { input.destroy(); }
+    };
+    if (this.truncated.size) await read('transcript_full.jsonl', true);
+    if (observe && !model) await read('transcript.jsonl', false);
+    if (observe && !model && !this.truncated.size) await read('transcript_full.jsonl', false);
+    const recovered = new Map([...this.truncated].filter(([, c]) => c.full).map(([i, c]) => [`step_${i}`, c]));
+    if (recovered.size) await restoreCommands(eventsFile, recovered);
+    // Only the fallback path needs to disambiguate clipped attempts in a receipt.
+    const attempts = this.truncated.size > recovered.size ? this.commandAttempts.map(({ index, command }) => {
+      const c = this.truncated.get(index);
+      return { command: c?.full ?? command, truncated: !!c && !c.full };
+    }) : null;
+    return { model, attempts };
+  }
+}
+
+async function restoreCommands(file, recovered) {
+  const tmp = file + '.tmp';
+  const fd = fs.openSync(tmp, 'w');
+  try {
+    const input = fs.createReadStream(file, { encoding: 'utf8' });
+    for await (const line of createInterface({ input, crlfDelay: Infinity })) {
+      const event = JSON.parse(line);
+      const c = event.item?.command_truncated && recovered.get(event.item.id);
+      if (c) {
+        event.item.command = c.full;
+        event.item.exit_code = event.type === 'item.completed' ? c.exit : null;
+        delete event.item.command_truncated;
+      }
+      fs.writeFileSync(fd, (c ? JSON.stringify(event) : line) + '\n');
+    }
+    fs.renameSync(tmp, file);
+  } finally { fs.closeSync(fd); fs.rmSync(tmp, { force: true }); }
+}
+
+// A clipped attempt is evidence of neither success nor failure. Set it aside
+// before the common matcher so it cannot borrow or consume an earlier full run.
+export async function confirmAgyVerification(reply, file, attempts) {
+  const before = new Map();
+  const uncertain = new Map();
+  for (let n = reply.checks.length - 1; n >= 0; n--) {
+    const check = reply.checks[n];
+    if (check.outcome === 'skipped') continue;
+    const command = check.command.trim();
+    const end = before.get(command) ?? attempts.length;
+    for (let i = end - 1; i >= 0; i--) {
+      const a = attempts[i];
+      if (!(a.command === command || (a.truncated && command.startsWith(a.command.slice(0, -1))))) continue;
+      before.set(command, i);
+      if (a.truncated) {
+        uncertain.set(n, {
+          ...check, confirmation: 'unconfirmed',
+          event: { command: a.command, exit_code: null, status: 'truncated' },
+          note: [check.note, 'agy truncated the command and its full text could not be recovered'].filter(Boolean).join(' — '),
+        });
+      }
+      break;
+    }
+  }
+  const checks = reply.checks.filter((_, n) => !uncertain.has(n));
+  const receipt = await confirmVerification({ ...reply, checks }, file);
+  let next = 0;
+  receipt.checks = reply.checks.map((_, n) => uncertain.get(n) ?? receipt.checks[next++]);
+  if (uncertain.size && receipt.label === 'executed') receipt.label = 'partial';
+  return receipt;
 }
 
 // Only the JSON Schema features used by the three shipped round schemas, with no coercion.
@@ -209,14 +394,17 @@ function accepts(value, schema) {
 
 export function agyAnswer(result, schemaFile) {
   const schema = JSON.parse(fs.readFileSync(schemaFile, 'utf8'));
-  if (result?.structured_output != null) return accepts(result.structured_output, schema) ? result.structured_output : null;
+  // The common verificationClaims path handles absent/invalid receipt fields.
+  // Validate every other field against the same schema supplied to the CLI.
+  const valid = (v) => accepts(schema.properties.checks ? { ...v, checks: [], gaps: [] } : v, schema);
+  if (result?.structured_output != null) return valid(result.structured_output) ? result.structured_output : null;
   // agy's prose can precede the final object. A fenced final JSON block is accepted too.
   const text = String(result?.response ?? '').trim().replace(/\s*```\s*$/, '').trim();
   if (!text.endsWith('}')) return null;
   for (let i = text.indexOf('{'); i >= 0; i = text.indexOf('{', i + 1)) {
     try {
       const value = JSON.parse(text.slice(i));
-      if (accepts(value, schema)) return value;
+      if (valid(value)) return value;
     } catch {}
   }
   return null;
@@ -235,12 +423,13 @@ export const AGY_READ_ONLY = 'Read-only is a promise plus a before/after tree ch
 
 // Git scopes the list to cwd, includes tracked + untracked, and respects ignores. Outside
 // Git, cap traversal at 20,000 entries; lstat never follows symlinks outside the workspace.
-export function fingerprint(cwd) {
+export function fingerprint(cwd, ignored = new Set()) {
   const files = new Map();
   const warnings = new Set();
   const git = (args) => spawnSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
   const inGit = git(['rev-parse', '--is-inside-work-tree']).stdout?.trim() === 'true';
   const note = (file) => {
+    if (ignored.has(file)) return;
     try {
       const full = path.join(cwd, file);
       const stat = fs.lstatSync(full, { bigint: true });

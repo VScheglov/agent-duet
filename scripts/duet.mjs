@@ -14,7 +14,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { confirmVerification, unknownVerification, verificationClaims, verificationLines } from './verification.mjs';
 import { checkQuotes, quoteCheckLine, recitesQuote } from './quotes.mjs';
 import { duetEnv, stateRoot } from './config.mjs';
-import { AGY_BIN, AGY_READ_ONLY, AgyEvents, agyAnswer, agyArgs, agyConversation, agyDefaults, agyError, checkAgyChoice, fingerprint, observedAgyModel, readOnlyChanges } from './agy.mjs';
+import { AGY_BIN, AGY_READ_ONLY, AgyEvents, agyAnswer, agyArgs, agyConversation, agyDefaults, agyError, agyStartup, checkAgyChoice, confirmAgyVerification, fingerprint, observedAgyModel, readOnlyChanges } from './agy.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const ROOT = path.resolve(path.dirname(SELF), '..');
@@ -200,7 +200,7 @@ function codexChoice(o, base, engine = 'codex', switching = false) {
   const model = engine === 'agy'
     ? checkToken(typeof requested === 'string' ? requested.trim() : requested, 'model', /^[^\x00-\x1f\x7f]+$/u)
     : checkToken(requested, 'model', MODEL_RE);
-  const effort = o.effort ?? base.effort;
+  const effort = o.effort ?? (engine === 'agy' && switching && o.model != null ? null : base.effort);
   const level = checkToken(effort == null ? effort : String(effort).toLowerCase(), 'effort', EFFORT_RE);
   if (engine === 'agy') {
     try { return checkAgyChoice(model, level, { switchEffort: switching && o.model == null && o.effort != null }); }
@@ -214,12 +214,8 @@ function codexChoice(o, base, engine = 'codex', switching = false) {
 function switchCodex(st, o) {
   guardEngine(st, o);
   if (o['timeout-min'] != null) st.codex.timeoutMin = toCount(o['timeout-min'], 'timeout-min');
-  if (engineOf(st) === 'agy') {
-    Object.assign(st.codex, codexChoice(o, st.codex, 'agy', true));
-    return;
-  }
   if (o.model == null && o.effort == null) return;
-  Object.assign(st.codex, codexChoice(o, st.codex, engineOf(st)));
+  Object.assign(st.codex, codexChoice(o, st.codex, engineOf(st), true));
 }
 
 // What a Codex turn runs on: the session's choice, else config.toml's default at this moment. A turn
@@ -261,6 +257,9 @@ function engineWarnings(st) {
   if (engineOf(st) === 'agy') {
     L.push('Engine: agy');
     if (st.codex.modelCheckNote) L.push(`Model check: ${st.codex.modelCheckNote}`);
+    for (const round of st.rounds) {
+      if (round.agyResult?.denied_actions?.length) L.push(`Round ${round.n}: agy denied ${deniedNames(round.agyResult.denied_actions)}.`);
+    }
   }
   if (st.readOnlyViolations?.length) L.push(`WARNING: read-only violations: ${st.readOnlyViolations.map((v) => `${v.path} (${v.change})`).join(', ')}. Changes were not undone.`);
   if (st.readOnlyCheckWarnings?.length) L.push(`WARNING: read-only tree check incomplete: ${st.readOnlyCheckWarnings.join('; ')}`);
@@ -792,16 +791,17 @@ const oneLine = (text) => String(text ?? '').replace(/\s+/g, ' ').trim();
 
 // What the reviewer may run, told to it in round 1; sessions from before --sandbox ran read-only.
 function toolingNote(st) {
+  const keychain = 'Never start real agy, claude, gh, git credential helpers or `security` with HOME pointed at a '
+    + 'temporary directory. agy 1.5.9+ stores its OAuth token in the macOS keychain and opens Google sign-in '
+    + 'when it cannot reach it. Pin AGENT_DUET_AGY_BIN to a fake for tests. For claude and gh, pass credentials '
+    + 'through CLAUDE_CODE_OAUTH_TOKEN or GH_TOKEN, or leave that check out and say so.';
   if ((st.codex.sandbox ?? 'read-only') === 'read-only') {
-    if (engineOf(st) === 'agy') return AGY_READ_ONLY;
-    return 'The shell sandbox is read-only: read and run read-only commands, nothing that writes files.';
+    const scope = engineOf(st) === 'agy' ? AGY_READ_ONLY : 'The shell sandbox is read-only: read and run read-only commands, nothing that writes files.';
+    return `${scope} ${keychain}`;
   }
   return 'You may run whatever helps to verify the subject: tests, builds, linters, scripts. Temporary files, '
     + 'caches and build output are fine; for anything heavier (installing dependencies, generating code) use a '
-    + 'throwaway copy, e.g. `git worktree add "$TMPDIR/review-copy"`. This runs on the owner\'s desktop: never start a '
-    + 'program that signs in through the macOS keychain (claude, gh, git credential helpers, `security`) with HOME '
-    + 'pointed at a temporary directory, as each try opens a system dialog on the owner\'s screen. Pass its credentials '
-    + 'through the environment (claude: `CLAUDE_CODE_OAUTH_TOKEN`, gh: `GH_TOKEN`), or leave that check out and say so.';
+    + `throwaway copy, e.g. \`git worktree add "$TMPDIR/review-copy"\`. ${keychain}`;
 }
 
 function buildPrompt(st, round, snap, prev, payload, contextOnly = false) {
@@ -926,12 +926,18 @@ function runCodex(st, round, prompt, threadId, schema = SCHEMA) {
   const errPath = path.join(dir, `round-${round}.stderr.txt`);
   fs.writeFileSync(path.join(dir, `round-${round}.prompt.md`), prompt);
   fs.rmSync(out, { force: true });
-  const events = fs.createWriteStream(path.join(dir, `round-${round}.events.jsonl`));
+  const eventsFile = path.join(dir, `round-${round}.events.jsonl`);
+  const events = fs.createWriteStream(eventsFile);
   const errors = fs.createWriteStream(errPath);
   const raw = agy ? fs.createWriteStream(path.join(dir, `round-${round}.agy.jsonl`)) : null;
-  const before = agy && st.codex.sandbox === 'read-only' ? fingerprint(st.cwd) : null;
+  let ignored, before;
+  if (agy && st.codex.sandbox === 'read-only') {
+    const relativeDir = path.relative(fs.realpathSync(st.cwd), fs.realpathSync(dir));
+    ignored = new Set([out, errPath, eventsFile, raw.path, statePath(st.id)].map((file) => path.join(relativeDir, path.basename(file))));
+    before = fingerprint(st.cwd, ignored);
+  }
 
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const result = { threadId, out, errPath, usage: null, turnFailed: null, lastError: null, timedOut: false, cancelled: false, ...(agy ? { engine: 'agy' } : {}) };
     // The tier the turn got shows only in Codex's log, once the turn has begun: looked for as soon as Codex
     // names the thread, then every few seconds for a minute, and once more when the turn is over.
@@ -953,8 +959,11 @@ function runCodex(st, round, prompt, threadId, schema = SCHEMA) {
     // A process group of its own: timeout and cancel take down the whole tree (the codex
     // wrapper, its native binary, MCP servers, shell commands), not only the wrapper.
     const bin = agy ? AGY_BIN : CODEX_BIN;
+    const startup = agy ? agyStartup() : null;
+    let waitingForAgy = agy;
     const child = spawn(bin, agy ? agyArgs(st, threadId, schema) : codexArgs(st, out, threadId, schema), {
       cwd: st.cwd,
+      env: startup?.env,
       stdio: ['pipe', 'pipe', 'pipe'],
       detached: true,
     });
@@ -1019,16 +1028,26 @@ function runCodex(st, round, prompt, threadId, schema = SCHEMA) {
       // Receipts read the saved events after this promise resolves: wait for both files to flush.
       await Promise.all([events, errors, raw].filter(Boolean).map((stream) => new Promise((done) => stream.end(done))));
       if (agy) {
-        result.agyError = agyError(fs.readFileSync(errPath, 'utf8'));
+        const stderr = fs.readFileSync(errPath, 'utf8');
+        result.agyError = agyError(stderr);
         result.agyStatus = normalizer.result?.status ?? null;
         result.finished_reason = normalizer.result?.finished_reason ?? null;
-        result.denied_actions = normalizer.result?.denied_actions ?? [];
+        const actions = normalizer.result?.denied_actions;
+        result.denied_actions = Array.isArray(actions) ? actions : [];
+        result.failedMcpCall = normalizer.failedMcpCall;
         result.beganWork = normalizer.beganWork;
         const answer = agyAnswer(normalizer.result, schema);
         if (answer) writeJSON(out, answer);
         else result.missingAnswer = true;
+        if (!answer || extra.code !== 0 || result.agyStatus !== 'SUCCESS' || result.finished_reason) {
+          result.authError = startup.authError(stderr + '\n' + (result.turnFailed ?? ''));
+        }
+        startup.close();
+        const { model, attempts } = await normalizer.reconcile(result.threadId, st.pending.codexModel, st.codex.modelCatalog, eventsFile);
+        if (model) st.pending.codexModel = model;
+        result.commandAttempts = attempts;
         if (before) {
-          const after = fingerprint(st.cwd);
+          const after = fingerprint(st.cwd, ignored);
           result.readOnlyViolations = readOnlyChanges(before, after);
           result.readOnlyCheckWarnings = [...new Set([...before.warnings, ...after.warnings])];
           st.pending.readOnlyViolations = result.readOnlyViolations;
@@ -1053,6 +1072,10 @@ function runCodex(st, round, prompt, threadId, schema = SCHEMA) {
       }
       const normalized = agy ? normalizer.accept(input) : [input];
       const step = agy && input.event === 'step_update' && Number.isInteger(input.step_update?.step_index);
+      if (waitingForAgy && step) {
+        startup.allowTools();
+        waitingForAgy = false;
+      }
       const reportedId = agy
         ? (step ? input.step_update.conversation_id : input.event === 'init' && input.conversation_id)
         : input.type === 'thread.started' && input.thread_id;
@@ -1070,7 +1093,7 @@ function runCodex(st, round, prompt, threadId, schema = SCHEMA) {
         events.write(`${JSON.stringify({ ...event, _at: now() })}\n`);
         if (event.type === 'thread.started' && event.thread_id) {
           if (agy) {
-            const model = observedAgyModel(st.pending.codexModel, input.init?.model);
+            const model = observedAgyModel(st.pending.codexModel, input.init?.model, st.codex.modelCatalog);
             if (model) {
               st.pending.codexModel = model;
               saveState(st);
@@ -1095,13 +1118,13 @@ function runCodex(st, round, prompt, threadId, schema = SCHEMA) {
       }
     });
     child.stderr.on('data', (chunk) => errors.write(chunk));
-    child.on('error', (err) => { void finish({ code: null, spawnError: `cannot run ${bin}: ${err.message}` }); });
+    child.on('error', (err) => { finish({ code: null, spawnError: `cannot run ${bin}: ${err.message}` }).catch(reject); });
     // 'close' waits for the pipes, and a leftover descendant can hold them open forever: after
     // the exit, wait a grace period for them, then finish anyway (reap clears out the group).
     child.on('exit', (code, signal) => {
-      drain = setTimeout(() => { void finish({ code, signal }); }, KILL_GRACE_MS);
+      drain = setTimeout(() => { finish({ code, signal }).catch(reject); }, KILL_GRACE_MS);
     });
-    child.on('close', (code, signal) => { void finish({ code, signal }); });
+    child.on('close', (code, signal) => { finish({ code, signal }).catch(reject); });
     child.stdin.on('error', () => {});
     child.stdin.end(agy ? `${JSON.stringify({ event: 'user', message: { role: 'user', content: prompt } })}\n` : prompt);
   });
@@ -1387,18 +1410,42 @@ async function decide(st, reply, ownerOverride = false) {
 
 // ---------------------------------------------------------------- rounds
 
+const deniedNames = (actions) => actions.map((a) => a?.display_name || a?.action || 'action').join(', ');
+
+function agyDenialProblem(st, res) {
+  const otherActions = res.denied_actions.filter((action) => action?.action !== 'mcp');
+  if (otherActions.length === res.denied_actions.length) {
+    return `agy denied ${deniedNames(otherActions)}. A headless turn cannot ask for approval. Check the allowed tools in agy's settings.`;
+  }
+
+  const { server, tool } = res.failedMcpCall ?? {};
+  // Offer a copyable grant only for literal identifiers. An agy parameter may be clipped.
+  const literal = [server, tool].every((name) => typeof name === 'string' && /^[\w.-]+$/.test(name));
+  const rule = literal ? `mcp(${server}/${tool})` : null;
+  const names = [rule ?? 'an MCP tool', deniedNames(otherActions)].filter(Boolean).join(', ');
+  const grant = `Choose Always Allow for ${rule ?? 'the tool'} in the Antigravity app or add ${rule ?? 'mcp(<server>/<tool>)'} to userSettings.globalPermissionGrants.allow in ~/.gemini/config/config.json.`;
+  const isAudit = st.kind === 'audit';
+  if (isAudit || st.codex.sandbox === 'read-only') {
+    const mode = isAudit ? 'audit' : 'turn';
+    const next = isAudit ? 'audit' : 'session';
+    return `agy denied ${names}. The read-only ${mode} ended because headless agy could not ask for approval. ${grant} You can also forbid MCP in the task and start a new ${next}, or start a new ${next} with --engine codex.`;
+  }
+  return `agy denied ${names}. A headless turn cannot ask for approval. ${grant}`;
+}
+
 // Why a Codex turn produced no usable reply, or null when it did.
-function turnProblem(res) {
+function turnProblem(st, res) {
   if (res.engine === 'agy') {
     const waiting = !res.beganWork ? ' agy waits for all of its MCP servers to connect before a turn (agy mcp list); check the network or VPN.' : '';
     if (res.cancelled) return `cancelled: agent-duet received SIGINT or SIGTERM; retry continues the interrupted agy turn.${waiting}`;
+    if (res.authError) return res.authError;
     if (res.timedOut) {
       const limit = res.timeoutMs >= 60_000 ? `${Math.round(res.timeoutMs / 60_000)} min` : `${res.timeoutMs} ms`;
       return `agy did not finish within ${limit}.${waiting}`;
     }
     if (res.spawnError) return res.spawnError;
-    if (res.denied_actions?.length) {
-      return `agy denied ${res.denied_actions.map((a) => a.display_name || a.action || 'action').join(', ')}; headless agy cannot ask for approval: use --sandbox danger-full-access or allow rules in agy's settings`;
+    if (res.denied_actions?.length && (res.missingAnswer || res.agyStatus !== 'SUCCESS' || res.code !== 0 || res.finished_reason || res.agyError)) {
+      return agyDenialProblem(st, res);
     }
     if (res.agyError) {
       const e = res.agyError;
@@ -1434,7 +1481,7 @@ function failTurn(st, round, problem, res) {
   st.pending.error = problem;
   if (engineOf(st) === 'agy') st.pending.agyResult = { status: res.agyStatus, finished_reason: res.finished_reason, denied_actions: res.denied_actions, error: res.agyError };
   saveState(st);
-  const tail = stderrTail(res.errPath, 15, engineOf(st) === 'agy');
+  const tail = res.authError ? '' : stderrTail(res.errPath, 15, engineOf(st) === 'agy');
   throw new Error(`round ${round} failed: ${problem}${tail ? `\n--- ${engineOf(st)} stderr (tail) ---\n${tail}` : ''}\n`
     + `${engineWarnings(st).join('\n')}${engineWarnings(st).length ? '\n' : ''}`
     + `Fix the cause, then run: node "${SELF}" retry --session ${st.id}`);
@@ -1501,6 +1548,12 @@ function engineRoundResult(st, res) {
   } : {};
 }
 
+async function roundVerification(st, round, reply, res) {
+  const file = path.join(sessionDir(st.id), `round-${round}.events.jsonl`);
+  if (!res.commandAttempts || !reply.checks?.length) return confirmVerification(reply, file);
+  return confirmAgyVerification(reply, file, res.commandAttempts);
+}
+
 // The caller holds the session lock for the whole round.
 async function runRound(st, round, payload) {
   clearApproval(st);
@@ -1526,7 +1579,7 @@ async function runRound(st, round, payload) {
   } finally {
     release();
   }
-  let problem = turnProblem(res);
+  let problem = turnProblem(st, res);
   let reply = null;
   if (!problem) {
     try {
@@ -1546,7 +1599,7 @@ async function runRound(st, round, payload) {
     verdict: reply.verdict,
     summary: reply.summary,
     request_check: reply.request_check,
-    verification: await confirmVerification(reply, path.join(sessionDir(st.id), `round-${round}.events.jsonl`)),
+    verification: await roundVerification(st, round, reply, res),
     snapshot: snap,
     startedAt,
     finishedAt: now(),
@@ -1802,7 +1855,7 @@ async function runBuildTurn(st, round, review) {
   } finally {
     release();
   }
-  let problem = turnProblem(res);
+  let problem = turnProblem(st, res);
   let reply = null;
   if (!problem) {
     try {
@@ -1819,7 +1872,7 @@ async function runBuildTurn(st, round, review) {
   st.rounds.push({
     n: round,
     author: { summary: reply.summary, tests: reply.tests, questions: reply.questions, request_check: reply.request_check },
-    verification: await confirmVerification(reply, path.join(sessionDir(st.id), `round-${round}.events.jsonl`)),
+    verification: await roundVerification(st, round, reply, res),
     snapshot: takeSnapshot(st, round),
     startedAt,
     finishedAt: now(),
@@ -2241,7 +2294,7 @@ async function runAuditTurn(st) {
   } finally {
     release();
   }
-  let problem = turnProblem(res);
+  let problem = turnProblem(st, res);
   let reply = null;
   if (!problem) {
     try {
@@ -2313,7 +2366,7 @@ function renderAuditReport(st) {
     `- Directory: ${st.cwd}`,
     `- ${engineName(st)}: ${[last.codexModel?.model, last.codexModel?.effort].filter(Boolean).join(' · ') || 'its config'}, ${duration(last.startedAt, last.finishedAt)}`,
     `- ${threadLine(st)}`,
-    ...engineWarnings(st),
+    ...engineWarnings(st).map((line) => `- ${line}`),
     '',
     '## Result',
     '',
@@ -2473,7 +2526,7 @@ function renderReport(st) {
     `- Rounds: ${st.round}/${st.maxRounds}`,
     `- Outcome: ${st.decision?.action ?? st.phase} — ${st.decision?.reason ?? ''}`,
     `- ${threadLine(st)}`,
-    ...engineWarnings(st),
+    ...engineWarnings(st).map((line) => `- ${line}`),
     ...approvalReportLines(st).map((line) => line.startsWith('- ') ? line : `- ${line}`),
     '',
     "## Owner's request",
@@ -2593,7 +2646,7 @@ function initCodeSubject(st, o) {
 }
 
 async function cmdStart(o) {
-  const engine = checkEngine(o.engine ?? duetEnv('ENGINE') ?? 'codex');
+  const engine = checkEngine(o.engine ?? (duetEnv('ENGINE') || 'codex'));
   if (!KINDS.includes(o.kind)) throw new UsageError(`--kind must be one of: ${KINDS.join(', ')}`);
   let brief = null;
   if (o.brief != null) {
@@ -2615,7 +2668,7 @@ async function cmdStart(o) {
   if (o.kind === 'audit' && o.sandbox && o.sandbox !== 'read-only') {
     throw new UsageError(`an audit runs read-only: ${engine === 'agy' ? 'agy is told not to write and checked afterwards' : 'Codex examines and reports, it changes nothing'} (leave --sandbox out)`);
   }
-  const sandbox = o.kind === 'audit' ? 'read-only' : checkSandbox(o.sandbox ?? duetEnv('SANDBOX') ?? 'inherit');
+  const sandbox = o.kind === 'audit' ? 'read-only' : checkSandbox(o.sandbox ?? (duetEnv('SANDBOX') || 'inherit'));
   // Every option is checked before the session's directory exists: a refusal leaves nothing behind.
   const maxRounds = o.kind === 'audit' ? 1 : o['max-rounds'] ? toInt(o['max-rounds'], 'max-rounds') : 10;
   const timeoutMin = toCount(o['timeout-min'] ?? duetEnv('TIMEOUT_MIN') ?? 0, 'timeout-min');
@@ -2795,8 +2848,8 @@ function cmdVerify(o) {
 
 function cmdReport(o) {
   const st = resolveSession(o.session);
-  if (engineOf(st) === 'agy' && st.kind === 'audit' && !st.audit) {
-    const report = [`# agent-duet audit — ${st.subject.title}`, `Engine: agy`, `Phase: ${st.phase}`, st.pending?.error ?? '', ...engineWarnings(st)].join('\n');
+  if (engineOf(st) === 'agy' && st.kind === 'audit' && !st.audit && st.phase === 'codex-failed') {
+    const report = [`# agent-duet audit — ${st.subject.title}`, `Phase: ${st.phase}`, st.pending?.error ?? '', ...engineWarnings(st)].join('\n');
     fs.writeFileSync(path.join(sessionDir(st.id), 'report.md'), `${report}\n`);
     console.log(report);
     return;

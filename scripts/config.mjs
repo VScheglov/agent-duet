@@ -19,15 +19,20 @@ export function stateRoot() {
   if (explicit) return explicit;
   const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state');
   const current = path.join(base, 'agent-duet');
-  // When both exist, the new directory is authoritative: do not even inspect the old one.
-  if (entry(current)) return current;
   const legacy = path.join(base, 'codex-duet');
-  if (!entry(legacy)?.isDirectory()) return current; // never rename a symlink
-  try {
-    fs.renameSync(legacy, current);
-  } catch (err) {
-    // A peer may have moved it between our lstat and rename. Do not hide other errors.
-    if (!['EEXIST', 'ENOENT', 'ENOTEMPTY'].includes(err.code) || !entry(current)?.isDirectory()) throw err;
+  const destination = entry(current);
+  if (destination) {
+    // A previous invocation may have stopped after rename. An independent old
+    // root (including a dangling link) wins its own name and is never replaced.
+    if (!destination.isDirectory() || entry(legacy)) return current;
+  } else {
+    if (!entry(legacy)?.isDirectory()) return current; // never rename a symlink
+    try {
+      fs.renameSync(legacy, current);
+    } catch (err) {
+      // A peer may have moved it between our lstat and rename. Do not hide other errors.
+      if (!['EEXIST', 'ENOENT', 'ENOTEMPTY'].includes(err.code) || !entry(current)?.isDirectory()) throw err;
+    }
   }
   try {
     // Old processes, saved paths and Git's worktree metadata still name this directory.

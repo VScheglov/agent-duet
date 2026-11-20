@@ -242,7 +242,7 @@ function digestEvents(text: string): Omit<Digest, 'fileAt'> {
       if (isStart) {
         const what = item.type === 'command_execution'
           ? describeCommand(String(item.command ?? ''))
-          : `MCP ${item.server ?? '?'} · ${item.tool ?? '?'}`
+          : `MCP ${item.server || '?'} · ${item.tool || '?'}`
         running.set(item.id, what)
         activity.push(what)
         if (item.type === 'command_execution') commands += 1
