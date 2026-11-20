@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "agent-duet",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "description": "agent-duet: Claude ↔ Codex or agy review, build and audit loop with per-issue negotiation and a live pane",
   "types": "./types/index.d.ts",
   "author": {
