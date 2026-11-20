@@ -137,7 +137,17 @@ export async function boot(file, { env, cwd, options = {}, settings = {}, initia
     process: {
       run: async (argv, options) => {
         seen.procs.push(argv.join(' '));
-        onProcess?.(argv);
+        const result = onProcess?.(argv, options);
+        if (result) return result;
+        if (argv[0] === 'node') {
+          if (argv[1] !== `${root}/scripts/duet.mjs` || argv[2] !== 'discard' || argv[3] !== '--session'
+            || argv.length !== 5 || !env.AGENT_DUET_HOME || options?.env?.AGENT_DUET_HOME !== env.AGENT_DUET_HOME) {
+            throw new Error('unexpected runner call from the mod');
+          }
+          const r = spawnSync(process.execPath, argv.slice(1), { cwd: sessionCwd, encoding: 'utf8', env: { ...env, ...options.env } });
+          if (r.error) throw r.error;
+          return { exitCode: r.status ?? 1, stdout: r.stdout, stderr: r.stderr };
+        }
         if (argv[0] === 'ps') {
           const r = spawnSync('ps', argv.slice(1), { encoding: 'utf8', env: { ...process.env, ...options?.env } });
           return { exitCode: r.status ?? 1, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };

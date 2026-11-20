@@ -74,7 +74,8 @@ const USAGE = `Usage: duet.mjs <command> [options]
   finish  [--session <id>] [--unreviewed]   build: commit only approved content and remove the worktree
           --unreviewed: only on the owner's explicit word, commit without an approval check
   verify  [--session <id>]     code/build: check working and staged content against the approved tree
-  discard [--session <id>]     build: remove the worktree and delete its branch
+  discard [--session <id>]     close an audit or review and keep its files
+          For a build, discard removes its worktree and branch
   retry   [--session <id>] [--fresh]   re-run a round that failed; a turn the engine had begun goes on
           in its own thread, with what it did and read; --fresh starts the turn over
           reply, review and retry also take --model, --effort and --timeout-min; --engine must match
@@ -1758,11 +1759,16 @@ function discardWorktree(st) {
 }
 
 function guardFinalization(st, allowFailed) {
-  if (['finished', 'discarded'].includes(st.phase)) throw new UsageError(`this build was already ${st.phase}`);
+  if (st.kind === 'build' && ['finished', 'discarded'].includes(st.phase)) throw new UsageError(`this build was already ${st.phase}`);
+  guardDiscarded(st);
   // A settled failure was saved after the child and its process group were reaped,
   // or while still queued. The caller holds the same lock as a running turn.
   if (allowFailed && st.phase === 'codex-failed') return;
   guardIdle(st);
+}
+
+function guardDiscarded(st) {
+  if (st.phase === 'discarded') throw new UsageError(`session ${st.id} was already discarded`);
 }
 
 function normalizeAuthorReply(raw) {
@@ -2023,6 +2029,7 @@ async function cmdReview(o) {
   try {
     const st = loadState(id);
     guardEngine(st, o);
+    guardDiscarded(st);
     if (st.kind === 'audit') throw new UsageError(AUDIT_HAS_NO_ROUNDS);
     if (st.kind !== 'build') throw new UsageError(`review is for --kind build sessions; answer a ${engineName(st)} review with reply`);
     guardIdle(st);
@@ -2208,8 +2215,16 @@ async function cmdDiscard(o) {
   const release = acquireLock(id);
   try {
     const st = loadState(id);
-    if (st.kind !== 'build') throw new UsageError('discard is for --kind build sessions');
     guardFinalization(st, true);
+    if (st.kind !== 'build') {
+      st.discard = { at: now(), phase: st.phase, round: st.round, by: discardActor() };
+      st.phase = 'discarded';
+      const report = renderSessionReport(st);
+      fs.writeFileSync(path.join(sessionDir(st.id), 'report.md'), report);
+      saveState(st);
+      console.log(`agent-duet ${st.id}: ${st.kind} ${phaseDescription(st)}.`);
+      return;
+    }
     discardWorktree(st);
     delete st.pending;
     st.phase = 'discarded';
@@ -2220,7 +2235,25 @@ async function cmdDiscard(o) {
   }
 }
 
+function discardActor() {
+  if (CLAUDE_SESSION) return { claudeSession: CLAUDE_SESSION };
+  try { return { user: os.userInfo().username }; } catch {
+    return { uid: process.getuid?.() ?? null };
+  }
+}
+
 // ---------------------------------------------------------------- output
+
+const phaseDescription = (st) => st.phase === 'discarded' && st.discard
+  ? `discarded (from ${st.discard.phase})` : st.phase;
+
+function discardOutcome(st) {
+  if (st.phase !== 'discarded' || !st.discard) return phaseDescription(st);
+  const { at, round, by } = st.discard;
+  const actor = by?.user ?? (by?.uid != null ? `UID ${by.uid}` : '');
+  const source = by?.claudeSession ? `by Claude session ${by.claudeSession}` : `${actor ? `by ${actor} ` : ''}from the command line`;
+  return `${phaseDescription(st)} at ${at}, round ${round}, ${source}`;
+}
 
 // ---- audit: one read-only Codex turn on a task, findings with evidence, no negotiation
 
@@ -2364,16 +2397,18 @@ function renderAuditReport(st) {
     '',
     `- Session: ${st.id}`,
     `- Directory: ${st.cwd}`,
-    `- ${engineName(st)}: ${[last.codexModel?.model, last.codexModel?.effort].filter(Boolean).join(' · ') || 'its config'}, ${duration(last.startedAt, last.finishedAt)}`,
-    `- ${threadLine(st)}`,
+    ...(st.phase === 'discarded' ? [`- Outcome: ${discardOutcome(st)}`] : []),
+    last ? `- ${engineName(st)}: ${[last.codexModel?.model, last.codexModel?.effort].filter(Boolean).join(' · ') || 'its config'}, ${duration(last.startedAt, last.finishedAt)}`
+      : `- ${modelLine(st)}`,
+    ...(st.audit || st.pending?.threadId || st.codex.threadId ? [`- ${threadLine(st)}`] : []),
     ...engineWarnings(st).map((line) => `- ${line}`),
-    '',
-    '## Result',
-    '',
-    st.audit.summary || '(no summary)',
-    '',
-    `## Findings (${countBySeverity(findings) || 'none'})`,
   ];
+  if (!st.audit) {
+    if (st.pending?.error) L.push('', '## Last turn', '', st.pending.error);
+    L.push('', `Task: ${st.subject.task}`, '');
+    return L.join('\n');
+  }
+  L.push('', '## Result', '', st.audit.summary || '(no summary)', '', `## Findings (${countBySeverity(findings) || 'none'})`);
   for (const f of findings) {
     L.push('', `### ${f.id} [${f.severity}] ${f.title}`);
     if (f.location) L.push(`Location: ${f.location}`);
@@ -2518,13 +2553,17 @@ function outcome(issue, st) {
 function renderReport(st) {
   const all = Object.values(st.issues).sort(byPriority);
   const cell = (s) => String(s).replace(/\|/g, '\\|').replace(/\n/g, ' ');
+  const discarded = st.kind !== 'build' && st.phase === 'discarded';
+  const decision = `${st.decision?.action ?? st.phase} — ${st.decision?.reason ?? ''}`;
   const L = [
     `# agent-duet report — ${st.id}`,
     '',
     `- Kind: ${st.kind}`,
     `- Subject: ${subjectLine(st)}`,
     `- Rounds: ${st.round}/${st.maxRounds}`,
-    `- Outcome: ${st.decision?.action ?? st.phase} — ${st.decision?.reason ?? ''}`,
+    `- Outcome: ${discarded ? discardOutcome(st) : decision}`,
+    ...(discarded && st.decision ? [`- Last decision: ${decision}`] : []),
+    ...(discarded && st.pending?.error ? [`- Last turn: ${indent(st.pending.error)}`] : []),
     `- ${threadLine(st)}`,
     ...engineWarnings(st).map((line) => `- ${line}`),
     ...approvalReportLines(st).map((line) => line.startsWith('- ') ? line : `- ${line}`),
@@ -2737,6 +2776,7 @@ async function cmdReply(o) {
   try {
     const st = loadState(id); // read again under the lock: another call may have moved the session on
     guardEngine(st, o);
+    guardDiscarded(st);
     if (st.kind === 'build') throw new UsageError('a build session is answered with: review --issues -');
     if (st.kind === 'audit') throw new UsageError(AUDIT_HAS_NO_ROUNDS);
     guardIdle(st);
@@ -2764,7 +2804,8 @@ async function cmdRetry(o) {
   try {
     const st = loadState(id);
     guardEngine(st, o);
-    if (!st.pending || ['finished', 'discarded'].includes(st.phase)) throw new UsageError(`nothing to retry in ${st.id} (phase: ${st.phase})`);
+    guardDiscarded(st);
+    if (!st.pending || st.phase === 'finished') throw new UsageError(`nothing to retry in ${st.id} (phase: ${st.phase})`);
     if (o.fresh) {
       st.pending.threadId = null;
       st.pending.promptDelivered = false;
@@ -2784,6 +2825,10 @@ function cmdStatus(o) {
   const st = resolveSession(o.session);
   if (st.kind === 'build' && ['finished', 'discarded'].includes(st.phase)) {
     console.log(`agent-duet ${st.id}: build ${st.phase} (${st.subject.branch}${st.subject.commit ? ` at ${st.subject.commit}` : ''})`);
+    return;
+  }
+  if (st.phase === 'discarded') {
+    console.log(`agent-duet ${st.id}: ${st.kind} ${discardOutcome(st)}.\nReport: ${path.join(sessionDir(st.id), 'report.md')}`);
     return;
   }
   if (st.pending) {
@@ -2846,18 +2891,31 @@ function cmdVerify(o) {
   }
 }
 
-function cmdReport(o) {
-  const st = resolveSession(o.session);
+function renderSessionReport(st) {
   if (engineOf(st) === 'agy' && st.kind === 'audit' && !st.audit && st.phase === 'codex-failed') {
-    const report = [`# agent-duet audit — ${st.subject.title}`, `Phase: ${st.phase}`, st.pending?.error ?? '', ...engineWarnings(st)].join('\n');
-    fs.writeFileSync(path.join(sessionDir(st.id), 'report.md'), `${report}\n`);
-    console.log(report);
-    return;
+    return [`# agent-duet audit — ${st.subject.title}`, `Phase: ${st.phase}`, st.pending?.error ?? '', ...engineWarnings(st), ''].join('\n');
   }
-  if (st.kind === 'audit' && !st.audit) throw new UsageError(`the audit ${st.id} has no report yet (phase: ${st.phase})`);
-  const report = st.kind === 'audit' ? renderAuditReport(st) : renderReport(st);
-  fs.writeFileSync(path.join(sessionDir(st.id), 'report.md'), report);
-  process.stdout.write(report);
+  if (st.kind === 'audit' && !st.audit && st.phase !== 'discarded') throw new UsageError(`the audit ${st.id} has no report yet (phase: ${st.phase})`);
+  return st.kind === 'audit' ? renderAuditReport(st) : renderReport(st);
+}
+
+function cmdReport(o) {
+  const { id, kind } = resolveSession(o.session);
+  let release;
+  if (kind !== 'build') {
+    // A report can still be printed while the runner holds the lock, but saving it must not
+    // overwrite a discard report with a snapshot from before the session was closed.
+    try { release = acquireLock(id); } catch (err) {
+      if (!(err instanceof UsageError)) throw err;
+    }
+  }
+  try {
+    const report = renderSessionReport(loadState(id));
+    if (release || kind === 'build') fs.writeFileSync(path.join(sessionDir(id), 'report.md'), report);
+    process.stdout.write(report);
+  } finally {
+    release?.();
+  }
 }
 
 function cmdList(o) {
@@ -2869,7 +2927,7 @@ function cmdList(o) {
   }
   for (const s of rows) {
     const project = s.kind === 'build' ? `${s.subject.repo} (${s.subject.branch})` : s.cwd;
-    console.log(`${s.id}  ${s.kind.padEnd(4)}  round ${s.round}/${s.maxRounds}  ${s.phase.padEnd(15)}  ${project}${engineOf(s) === 'agy' ? '  agy' : ''}`);
+    console.log(`${s.id}  ${s.kind.padEnd(4)}  round ${s.round}/${s.maxRounds}  ${phaseDescription(s).padEnd(15)}  ${project}${engineOf(s) === 'agy' ? '  agy' : ''}`);
   }
 }
 

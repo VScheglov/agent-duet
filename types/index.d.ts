@@ -74,6 +74,7 @@ export type DuetView = {
   elapsedMs: number
   pid: number
   isProcessGone: boolean
+  canDismiss: boolean // a failed turn whose runner has exited, in this Claude session or without an owner
   failure: string
   decision: { action: string; reason: string; issues: string[] } | null
   requestChecks: { who: string; status: string; notes: string }[]

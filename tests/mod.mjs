@@ -1087,6 +1087,102 @@ async function languageEngine(options, localeEnv = {}, defaultsResult) {
   return { engine, sid, write, stateHome };
 }
 
+await test('discard releases a code review from pane focus, commit guard, Stop hold and context', async () => {
+  const { engine, sid, write, stateHome } = await languageEngine({ language: 'en' });
+  const rerun = '20991231-123457-abcd';
+  const state = (id) => path.join(stateHome, id, 'state.json');
+  write({ issues: { C1: { ...issue('C1', 'open'), openedRound: 1, history: [] } } });
+  fs.mkdirSync(path.dirname(state(rerun)));
+  fs.writeFileSync(state(rerun), JSON.stringify({
+    ...JSON.parse(fs.readFileSync(state(sid), 'utf8')), id: rerun, kind: 'audit', phase: 'done',
+    subject: { title: 'Successful rerun' }, findings: [], audit: { summary: 'Complete' },
+  }));
+  await engine.tick();
+  const detail = async (id) => lines(await engine.render('Pane')).some((line) => line.startsWith(`${id} · `));
+  assert.ok(await detail(sid), 'the active review gets default focus');
+  await engine.press(await engine.render('Pane'), `task-${sid}`);
+  await engine.bash(`${RUNNER} status --session ${sid}`);
+  assert.ok((await engine.bash('git commit')).deny?.includes(sid));
+  assert.ok((await engine.stop()).block?.includes(sid));
+  assert.ok((await engine.prompt('Progress?')).context?.join('').includes(sid));
+  await engine.bash(`${RUNNER} status --session ${sid}`); // mark the person's prompt answered
+
+  const closed = duet(['discard', '--session', sid], '', { AGENT_DUET_HOME: stateHome });
+  assert.equal(closed.code, 0, closed.err);
+  await engine.tick();
+  assert.equal(engine.atoms.get('agent-duet:focus'), '');
+  assert.ok(await detail(rerun), 'the completed task takes focus');
+  assert.equal((await engine.bash('git commit')).result, 'core reached');
+  assert.equal((await engine.stop()).block, undefined);
+  assert.equal((await engine.prompt('Progress?')).context, undefined);
+  const pane = await engine.render('Pane');
+  const closedRow = nodes(pane).find((n) => n.props.key === `task-${sid}`);
+  assert.match(closedRow?.props.label ?? '', /discarded/);
+  await engine.press(pane, `task-${sid}`);
+  await engine.tick();
+  assert.ok(await detail(sid), 'the closed task can still be inspected');
+  assert.match(lines(await engine.render('Pane')).join('\n'), /🗑 discarded/);
+});
+
+await test('Dismiss needs an idle, owned or ownerless failure, and toasts the runner result', async () => {
+  const stateHome = path.join(tmp, 'dismiss-runners');
+  const pluginRoot = path.join(tmp, 'installed Dismiss plugin');
+  fs.symlinkSync(path.dirname(path.dirname(DUET)), pluginRoot);
+  const env = { ...baseEnv, AGENT_DUET_HOME: stateHome };
+  scriptCodex([{ fail: 'delegate interrupted' }]);
+  const start = duet(['start', '--kind', 'audit', '--subject', '-'], '# Failed audit\n', env);
+  assert.equal(start.code, 1, start.err);
+  const sid = /retry --session (\S+)/.exec(start.err)?.[1];
+  const ledger = path.join(stateHome, sid, 'state.json');
+  const failed = JSON.parse(fs.readFileSync(ledger, 'utf8'));
+  const lock = path.join(stateHome, sid, 'lock');
+  const write = (fields) => fs.writeFileSync(ledger, JSON.stringify({ ...failed, ...fields }));
+  const command = ['node', `${pluginRoot}/scripts/duet.mjs`, 'discard', '--session', sid];
+  const refusal = `agent-duet: session ${sid} is busy: another agent-duet call is running; wait for it to finish`;
+  let calls = 0;
+  const engine = await boot(compiled, { env, cwd: repo, root: pluginRoot, options: { language: 'en' }, onProcess: (argv) => {
+    if (argv[2] !== 'discard') return;
+    assert.deepEqual(argv, command);
+    if (++calls === 1) return { exitCode: 2, stdout: '', stderr: `${refusal}\n` };
+  } });
+  const dismiss = async () => nodes(await engine.render('Pane')).find((n) => n.props.key === 'dismiss');
+  assert.equal((await dismiss())?.props.label, 'Dismiss');
+  fs.writeFileSync(lock, String(process.pid));
+  await engine.tick();
+  assert.equal(await dismiss(), undefined, 'the runner is still alive with a recorded failure');
+  fs.rmSync(lock);
+  await engine.tick();
+  assert.ok(await dismiss(), 'the button appears once the lock is released without a ledger write');
+  const stalePane = await engine.render('Pane');
+  write({ owner: 'another-claude' });
+  await engine.press(stalePane, 'dismiss');
+  assert.equal(engine.toasts.at(-1), 'This task belongs to another Claude session.');
+  assert.equal(calls, 0);
+  await engine.tick();
+  assert.equal(await dismiss(), undefined);
+  write({ owner: null, phase: 'done' });
+  await engine.tick();
+  assert.equal(await dismiss(), undefined);
+  write({ owner: null });
+  await engine.tick();
+  assert.ok(await dismiss());
+  await engine.press(await engine.render('Pane'), 'dismiss');
+  assert.equal(engine.toasts.at(-1), refusal);
+  assert.equal(JSON.parse(fs.readFileSync(ledger, 'utf8')).phase, 'codex-failed');
+  await engine.press(await engine.render('Pane'), 'dismiss');
+  await waitFor(() => engine.toasts.at(-1)?.includes('discarded (from codex-failed)'));
+  assert.equal(engine.toasts.at(-1), `agent-duet ${sid}: audit discarded (from codex-failed).`);
+  assert.equal(calls, 2);
+  assert.deepEqual(JSON.parse(fs.readFileSync(ledger, 'utf8')).discard.by, { claudeSession: 'claude-me' });
+  await engine.tick();
+  assert.equal(await dismiss(), undefined);
+  const pane = await engine.render('Pane');
+  assert.ok(!lines(pane).some((line) => line.startsWith(`${sid} · `)));
+  await engine.press(pane, `task-${sid}`);
+  assert.match(lines(await engine.render('Pane')).join('\n'), /🗑 discarded/);
+  assert.doesNotMatch(lines(await engine.render('Pane')).join('\n'), /delegate interrupted/);
+});
+
 await test('old active build survives hundreds of newer ledgers in guard, Stop and context', async () => {
   const { engine, sid, write, stateHome } = await languageEngine({ language: 'en' });
   const build = buildOf('long-running');

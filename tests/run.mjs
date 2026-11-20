@@ -2329,6 +2329,97 @@ await test('audit: a cut-off audit goes on in its own thread on retry', () => {
   assert.equal(state(sid).phase, 'done');
 });
 
+await test('discard: a failed agy audit keeps its pending attempt and files, and cannot resume', () => {
+  const cwd = fs.mkdtempSync(path.join(tmp, 'failed-audit-'));
+  const stateHome = path.join(tmp, 'discarded-audit-state');
+  const run = (args, { input = '', env = {} } = {}) => duet(args, { cwd, input, env: { ...env, AGENT_DUET_HOME: stateHome } });
+  scriptCodex([{ fail: 'test audit failure' }]);
+  const started = run(['start', '--engine', 'agy', '--kind', 'audit', '--subject', '-'], {
+    env: { CLAUDE_CODE_SESSION_ID: 'claude-started' }, input: '# Stale audit\nFind stale outcomes.\n',
+  });
+  assert.equal(started.code, 1, started.err);
+  const sid = retrySid(started.err);
+  const dir = path.join(stateHome, sid);
+  const readState = () => JSON.parse(fs.readFileSync(path.join(dir, 'state.json'), 'utf8'));
+  const before = readState();
+  assert.equal(before.phase, 'codex-failed');
+  const roundFiles = fs.readdirSync(dir).filter((name) => name.startsWith('round-'));
+  assert.ok(roundFiles.includes('round-1.prompt.md'));
+  const artifacts = roundFiles.map((name) => fs.readFileSync(path.join(dir, name), 'utf8'));
+
+  const closed = run(['discard'], { env: { CLAUDE_CODE_SESSION_ID: 'claude-closed' } });
+  assert.equal(closed.code, 0, closed.err);
+  assert.match(closed.out, /audit discarded \(from codex-failed\)/);
+  const after = readState();
+  assert.equal(after.phase, 'discarded');
+  assert.deepEqual(after.discard, { at: after.discard.at, phase: 'codex-failed', round: before.round, by: { claudeSession: 'claude-closed' } });
+  assert.equal(new Date(after.discard.at).toISOString(), after.discard.at);
+  assert.deepEqual(after.pending, before.pending);
+  assert.deepEqual(roundFiles.map((name) => fs.readFileSync(path.join(dir, name), 'utf8')), artifacts);
+  assert.match(fs.readFileSync(before.subject.task, 'utf8'), /Find stale outcomes/);
+
+  const status = run(['status', '--session', sid]);
+  assert.equal(status.code, 0, status.err);
+  assert.match(status.out, /audit discarded \(from codex-failed\).*by Claude session claude-closed/);
+  assert.doesNotMatch(status.out, /did not complete|retry/);
+  const list = run(['list']);
+  assert.equal(list.code, 0, list.err);
+  assert.match(list.out, new RegExp(`${sid}.*discarded \\(from codex-failed\\)`));
+  const savedReport = fs.readFileSync(path.join(dir, 'report.md'), 'utf8');
+  assert.match(savedReport, /Outcome: discarded \(from codex-failed\)/);
+  assert.ok(before.pending.error && savedReport.includes(before.pending.error));
+  const report = run(['report', '--session', sid]);
+  assert.equal(report.code, 0, report.err);
+  assert.equal(report.out, savedReport);
+
+  for (const [args, input] of [
+    [['discard'], ''], [['retry', '--fresh'], ''],
+    [['reply', '--responses', '-'], responses('x', [])], [['review', '--issues', '-'], reviewJSON('approve', [])],
+  ]) {
+    const refused = run([...args, '--session', sid], { input });
+    assert.equal(refused.code, 2, refused.err);
+    assert.match(refused.err, /already discarded/);
+  }
+  assert.deepEqual(readState(), after);
+  assert.equal(calls().length, 1, 'no further engine turns were started');
+});
+
+for (const kind of ['plan', 'file', 'code']) {
+  await test(`discard: a done ${kind} review keeps its reply and reports the phase it closed from`, () => {
+    const cwd = approvalRepo();
+    const subject = path.join(cwd, 'reviewed.txt');
+    fs.appendFileSync(subject, 'review me\n');
+    scriptCodex([turn('approve', [])]);
+    const started = duet(['start', '--kind', kind, ...(kind === 'code' ? [] : ['--subject', subject])], { cwd, env: realPolicy });
+    assert.equal(started.code, 0, started.err);
+    const sid = sessionId(started.out);
+    assert.equal(state(sid).phase, 'done');
+    const reply = path.join(home, sid, 'round-1.codex.json');
+    const original = fs.readFileSync(reply, 'utf8');
+    const discard = duet(['discard', '--session', sid], { cwd });
+    assert.equal(discard.code, 0, discard.err);
+    assert.equal(state(sid).discard.round, 1);
+    assert.deepEqual(state(sid).discard.by, { user: os.userInfo().username });
+    assert.equal(fs.readFileSync(reply, 'utf8'), original);
+    assert.match(fs.readFileSync(subject, 'utf8'), /review me/);
+    assert.match(duet(['status', '--session', sid]).out, new RegExp(`${kind} discarded \\(from done\\)`));
+    assert.match(duet(['list'], { cwd }).out, /discarded \(from done\)/);
+    assert.match(duet(['report', '--session', sid]).out, /Outcome: discarded \(from done\).*from the command line/);
+  });
+}
+
+await test('discard: a completed audit retains its findings in the report', () => {
+  scriptCodex([auditTurn([finding('A1', 'high', 'Stale outcome')])]);
+  const started = duet(['start', '--kind', 'audit', '--subject', '-'], { input: '# Check outcomes\n' });
+  assert.equal(started.code, 0, started.err);
+  const sid = sessionId(started.out);
+  const closed = duet(['discard', '--session', sid]);
+  assert.equal(closed.code, 0, closed.err);
+  const report = fs.readFileSync(path.join(home, sid, 'report.md'), 'utf8');
+  assert.match(report, /Outcome: discarded \(from done\)/);
+  assert.match(report, /^### A1 \[high\] Stale outcome$/m);
+});
+
 // ---- the queue: at most AGENT_DUET_MAX_PARALLEL Codex turns at once
 const callCount = () => {
   try {
@@ -2352,8 +2443,20 @@ await test('queue: with one slot the next turns wait as queued, then run in the 
   const start = (n) => duetAsync(['start', '--kind', 'file', '--subject', `queue-${n}.md`], { cwd: tmp, env: oneSlot });
   const a = start('A');
   await waitFor(() => callCount() === 1);
+  const running = idsIn('awaiting-codex').find((sid) => lockHolderPid(sid) && isAlive(Number(lockHolderPid(sid))));
+  assert.ok(running);
   const b = start('B');
   await waitFor(() => idsIn('queued').length === 1);
+  const queued = idsIn('queued')[0];
+  for (const sid of [running, queued]) {
+    const r = duet(['discard', '--session', sid]);
+    assert.equal(r.code, 2, r.err);
+    assert.match(r.err, /busy: another agent-duet call is running/);
+  }
+  const report = duet(['report', '--session', queued]);
+  assert.equal(report.code, 0, report.err);
+  assert.match(report.out, /Outcome: queued/);
+  assert.ok(!fs.existsSync(path.join(home, queued, 'report.md')), 'a report from a busy session is printed without replacing its report file');
   const c = start('C');
   await waitFor(() => idsIn('queued').length === 2);
   for (const r of await Promise.all([a, b, c])) assert.equal(r.code, 0, r.err);

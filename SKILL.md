@@ -90,6 +90,7 @@ Before an agy audit that may need MCP, check the required per-tool Antigravity g
 
 ## Rules
 
+- Run `discard --session <id>` on an audit or review only when the owner asks to close it. It refuses a running or queued turn and keeps the session files. For a failed turn, wait for the runner to exit first.
 - Never commit, push or stash. Edit only what the subject covers: the plan file, the changed code, the reviewed files. During a code review or a build the plugin also blocks these git commands in that repository or worktree; when the user asks for a commit mid-review, tell them it waits for the review to end, or that they can commit themselves.
 - In a build, do not edit the worktree yourself: every change goes through the delegate, or the delegation saves nothing.
 - In plan mode edit nothing but the plan file.

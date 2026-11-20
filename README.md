@@ -225,7 +225,11 @@ Your messages in the reviewed project get a session summary attached, so Claude 
 
 ### Pane commands
 
-`/duet` opens the pane. The Stop button and `/duet stop` stop the selected running or queued round. Before sending TERM, the module checks the Claude session and the selected attempt. It uses `ps` to verify the runner command and start time for the PID in the session lock. A PID can still be reused between that check and the signal. If the host cannot verify the process identity, Stop explains why it refused. Resume a stopped round with `retry`. Use `/duet band|toasts|score|sound on|off` or the Settings buttons to toggle interface features. Use `/duet sound test` or “▶ Sounds” to play the three sounds in turn. The module never writes session files; it only leaves a one-line `.ui-trace.json` trace for debugging.
+`/duet` opens the pane. The Stop button and `/duet stop` stop the selected running or queued round. Before sending TERM, the module checks the Claude session and the selected attempt. It uses `ps` to verify the runner command and start time for the PID in the session lock. A PID can still be reused between that check and the signal. If the host cannot verify the process identity, Stop explains why it refused. Resume a stopped round with `retry`. Use `/duet band|toasts|score|sound on|off` or the Settings buttons to toggle interface features. Use `/duet sound test` or “▶ Sounds” to play the three sounds in turn. The module leaves a one-line `.ui-trace.json` trace for debugging. The runner handles session file updates.
+
+Use **Dismiss** in `/duet` to close a failed session once its runner exits. The button is available for sessions owned by your current Claude session or sessions without an owner. It runs `discard --session <id>` and shows the result in a toast.
+
+`discard` works for every session kind. For an audit or a plan, code or file review, it keeps the session directory, prompts and replies. The closed session stays in recent tasks for inspection and stops counting as active. For a build, the same command removes the worktree and branch.
 
 ## Engine differences
 

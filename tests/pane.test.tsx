@@ -140,6 +140,15 @@ async function paneOver($: Engine, on: On, surface: typeof SURFACES[number], fil
 }
 
 const LANGUAGES = ['ru', 'en', 'zh'] as const
+for (const [language, label] of [['en', 'Dismiss'], ['ru', 'Убрать'], ['zh', '移除']] as const) {
+  test(`a failed task with no live runner shows ${label}`, { options: { language } }, async ($, on) => {
+    const state = { ...JSON.parse(STATE), owner: 'claude-me', phase: 'codex-failed', pending: { round: 2, error: 'Stopped' } }
+    const ui = await paneOver($, on, 'desktop', { [`${ID}/state.json`]: JSON.stringify(state) })
+    expect((await ui.find({ key: 'dismiss' }))?.props.label).toBe(label)
+    await ui.unmount()
+  })
+}
+
 test('executed receipt shows the outstanding failure and its exit code', { options: { language: 'en' } }, async ($, on) => {
   const check = (command: string, ok: boolean) => ({
     command, outcome: ok ? 'passed' : 'failed', confirmation: 'confirmed', note: '',

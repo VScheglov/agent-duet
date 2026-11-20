@@ -11,7 +11,7 @@ import type { DuetChoice, DuetDiag, DuetIssue, DuetModel, DuetPlanStep, DuetPref
 
 // The agent-duet runner keeps everything a session knows in <state home>/<session>/:
 // state.json (the ledger) and round-N.events.jsonl (Codex's live event stream).
-// This mod reads those files on a timer and draws them; it never writes them.
+// This mod reads those files on a timer and draws them. Only the runner changes the session ledger.
 
 const PANE = 'agent-duet'
 const TITLE = 'Agent Duet'
@@ -276,8 +276,7 @@ let lastList: DuetView[] = []
 let hasStatus = false
 const openedFor = new Set<string>()
 const goneAnnounced = new Set<string>()
-// Whether a running or queued turn's runner still lives, per session; and Codex's event digest for the
-// sessions the pane details. Both are re-read only when their files change.
+// The cached runner liveness and event digests, keyed by session.
 type Liveness = { pid: number; gone: boolean }
 const liveness = new Map<string, Liveness & { checkedAt: number; mtimeMs: number }>()
 const digests = new Map<string, { key: string; digest: Digest }>()
@@ -329,16 +328,18 @@ function labelOf(st: any) {
   return (st.subject?.paths ?? []).map((p: string) => String(p).split('/').pop()).join(', ') || st.id
 }
 
-// The pid in the lock file of a session whose turn runs or waits, checked at most every 5 s.
+// Failed turns may still hold the lock while the runner exits, without another ledger update.
 async function aliveOf($: EngineInterface, root: string, s: { id: string; mtimeMs: number; st: any }, now: number) {
-  if (s.st.phase !== 'awaiting-codex' && s.st.phase !== 'queued') return null
+  const failed = s.st.phase === 'codex-failed'
+  if (failed && !isMine(s.st)) return null
+  if (!failed && s.st.phase !== 'awaiting-codex' && s.st.phase !== 'queued') return null
   const known = liveness.get(s.id)
-  if (known && known.mtimeMs === s.mtimeMs && now - known.checkedAt <= 5000) return known
+  if (!failed && known && known.mtimeMs === s.mtimeMs && now - known.checkedAt <= 5000) return known
   const raw = Number(await $.fs.read(`${root}/${s.id}/lock`).catch(() => ''))
   const pid = Number.isSafeInteger(raw) && raw > 1 ? raw : 0
   const gone = !pid || (await $.process.run(['kill', '-0', String(pid)])).exitCode !== 0
   const next = { pid, gone, checkedAt: now, mtimeMs: s.mtimeMs }
-  liveness.set(s.id, next)
+  if (!failed) liveness.set(s.id, next)
   return next
 }
 
@@ -494,7 +495,8 @@ function buildView(st: any, now: number, live: Liveness | null, digest: Digest |
     queuedAhead: isQueued ? queuedAhead : null,
     elapsedMs: since ? now - Date.parse(since) : 0, // Codex's time on the turn, or the wait in the queue
     pid: live?.pid ?? 0,
-    isProcessGone: Boolean(live?.gone),
+    isProcessGone: Boolean(live?.gone && (st.phase === 'awaiting-codex' || isQueued)),
+    canDismiss: st.phase === 'codex-failed' && isMine(st) && Boolean(live?.gone),
     failure: st.phase === 'codex-failed' ? oneLine(st.pending?.error) : '',
     decision: st.decision
       ? { action: st.decision.action, reason: oneLine(st.decision.reason), issues: st.decision.issues ?? [] }
@@ -566,12 +568,13 @@ async function scanSessions($: EngineInterface, root: string) {
 }
 
 // Which review this Claude session shows: its own while it runs; else one that runs elsewhere (the pane
-// shows it, nothing announces it); else its own last one; else whatever ran last.
+// shows it, nothing announces it); else its own last one; else whatever ran last. A discarded task can
+// still be picked from the list, but never becomes the default.
 function pickSession(seen: { id: string; mtimeMs: number; st: any }[], now: number) {
   return seen.find((s) => isMine(s.st) && isRunning(s.st, now))
     ?? seen.find((s) => !isMine(s.st) && isRunning(s.st, now))
-    ?? seen.find((s) => isMine(s.st))
-    ?? seen[0]
+    ?? seen.find((s) => s.st.phase !== 'discarded' && isMine(s.st))
+    ?? seen.find((s) => s.st.phase !== 'discarded')
     ?? null
 }
 
@@ -617,7 +620,13 @@ async function readSession($: EngineInterface) {
     const mine = seen.filter((s) => isMine(s.st) && (isRunning(s.st, now)
       || (now - Date.parse(s.st.updatedAt) < RECENT_MS && recent++ < 30)))
     const picked = pickSession(seen, now)
-    const focus: string = (await read($, focusAtom)) ?? ''
+    let focus: string = (await read($, focusAtom)) ?? ''
+    if (lastList.some((v) => v.id === focus && v.phase !== 'discarded')
+      && seen.some((s) => s.id === focus && s.st.phase === 'discarded')) {
+      const closedFocus = focus
+      await update($, focusAtom, (current) => current === closedFocus ? '' : current)
+      focus = (await read($, focusAtom)) ?? ''
+    }
     const detailed = new Set([picked?.id, focus].filter(Boolean))
     const viewOf = async (s: { id: string; mtimeMs: number; st: any }) => {
       const ahead = queue.indexOf(s.id)
@@ -878,6 +887,25 @@ async function stopRound($: EngineInterface, given?: DuetView | null) {
     return signal?.exitCode === 0 ? locale.stoppingRound(round, view.isQueued) : locale.stopFailed(view.pid)
   } catch {} // gone, stale, or the host cannot prove ownership
   return locale.stopUnverified
+}
+
+async function dismissSession($: EngineInterface, view: DuetView) {
+  try {
+    const root = await stateRoot($)
+    const state = JSON.parse(String(await $.fs.read(`${root}/${view.id}/state.json`)))
+    if (state.id !== view.id || !isMine(state)) {
+      $.ui.toast(locale.dismissForeign)
+      return
+    }
+    const result = await $.process.run(['node', `${$.plugin.root}/scripts/duet.mjs`, 'discard', '--session', view.id], {
+      env: { AGENT_DUET_HOME: root, CLAUDE_CODE_SESSION_ID: mySessionId },
+    })
+    const message = (result.exitCode === 0 ? result.stdout : result.stderr || result.stdout).trimEnd()
+    $.ui.toast(message || locale.dismissFailed)
+    if (result.exitCode === 0) await tick($)
+  } catch (err) {
+    $.ui.toast(`${locale.dismissFailed} ${(err as Error)?.message ?? String(err)}`)
+  }
 }
 
 const pick = ($: EngineInterface, key: string, side: DuetChoice) =>
@@ -1272,11 +1300,26 @@ export const register: Register = (on, options) => {
         <Button key="sound-test" label={locale.soundsButton} plain onPress={() => { void playAll($) }} />
       </Box>
     )
+    const tasks = list.length > 1 || (list.length > 0 && !view) ? (
+      <Box flexDirection="column">
+        <Text weight="semibold" wrap="wrap">
+          {locale.taskCounts(list.filter((v) => v.runningRound).length, list.filter((v) => v.isQueued).length, list.length)}
+        </Text>
+        {list.map((v) => (
+          <Button
+            key={`task-${v.id}`}
+            label={clip(`${v.id === view?.id ? '▸' : ' '} ${taskLine(v)}`, width)}
+            plain
+            onPress={() => { void update($, focusAtom, () => v.id) }}
+          />
+        ))}
+      </Box>
+    ) : null
     if (!view) {
       return (
         <Box flexDirection="column" gap={1}>
-          <Text>{locale.noSessions}</Text>
-          <Text dimColor wrap="wrap">{locale.lookingIn(diag.root || '…')}</Text>
+          {tasks ?? <Text>{locale.noSessions}</Text>}
+          {tasks ? null : <Text dimColor wrap="wrap">{locale.lookingIn(diag.root || '…')}</Text>}
           {diag.error ? <Text color="red" wrap="wrap">{locale.readError(diag.error)}</Text> : null}
           <Text dimColor wrap="wrap">{locale.startHint}</Text>
           {switches}
@@ -1312,21 +1355,6 @@ export const register: Register = (on, options) => {
       : view.isQueued
         ? locale.phaseQueued(view.queuedAhead, clock(view.elapsedMs), engineName(view))
         : `${view.runningRound && view.kind === 'build' ? locale.phaseBuild(engineName(view)) : view.runningRound && view.kind === 'audit' ? locale.phaseAudit(engineName(view)) : phaseWithVerification(view)}${view.runningRound ? ` · ${clock(view.elapsedMs)}` : ''}`
-    const tasks = list.length > 1 ? (
-      <Box flexDirection="column">
-        <Text weight="semibold" wrap="wrap">
-          {locale.taskCounts(list.filter((v) => v.runningRound).length, list.filter((v) => v.isQueued).length, list.length)}
-        </Text>
-        {list.map((v) => (
-          <Button
-            key={`task-${v.id}`}
-            label={clip(`${v.id === view.id ? '▸' : ' '} ${taskLine(v)}`, width)}
-            plain
-            onPress={() => { void update($, focusAtom, () => v.id) }}
-          />
-        ))}
-      </Box>
-    ) : null
 
     // The mark, id and severity in a column of one width, in the monospaced face so the titles line up.
     const badge = (mark: string, id: string, severity: string, dim = false) => (
@@ -1407,6 +1435,9 @@ export const register: Register = (on, options) => {
             <Text color={phaseColor} wrap="wrap">{phaseText}</Text>
             {isWaiting && view.isMine && view.pid > 0 && !view.isProcessGone ? (
               <Button key="stop" label={locale.stopButton} onPress={() => { void stopRound($, view).then((text) => $.ui.toast(text)) }} />
+            ) : null}
+            {view.canDismiss ? (
+              <Button key="dismiss" label={locale.dismissButton} onPress={() => { void dismissSession($, view) }} />
             ) : null}
           </Box>
           {verificationDetails(view).filter((line) => !view.runningRound || line.isProblem).map(({ text, isProblem }, n) => (
