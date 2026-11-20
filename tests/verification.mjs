@@ -73,6 +73,10 @@ export async function matchingTests(test, dir) {
       "sh -c 'npm test || true' arg0", "sh <<< 'npm test || true'",
       "time bash -c 'npm test || true'", "bash /dev/stdin <<'EOF'\nnpm test || true\nEOF",
       'echo "$(npm test || true)"', "env '-Ssh -c \"npm test || true\"'",
+      // '+' options and options after env assignments still hand the exit to an inline script.
+      "sh +e -c 'npm test || true'", "bash +x -c 'pytest; echo ok'", "zsh +o nomatch -c 'npm test || true'",
+      "bash -o pipefail -c 'npm test || true'", "env FOO=1 -S \"sh -c 'npm test || true'\"",
+      "env A=1 B=2 -S \"sh -c 'pytest; echo ok'\"",
     ].map((command) => ({ name: `a masked shell exit stays unconfirmed in ${command}`,
       claim: command, events: [[command, 0]], want: 'unconfirmed' })),
     { name: 'an inner eval cannot supply exit evidence for an AND segment', claim: 'npm test',

@@ -24,7 +24,10 @@ export function agyDefaults() {
 }
 
 const AUTH_ERROR = 'agy authentication failed. Use your real HOME, unlock the OS credential manager and sign in to agy from your own terminal before retrying.';
-const AUTH_DIAGNOSTIC = /OS credential manager (?:is )?unavailable|(?:auth(?:entication|orization)? (?:timed out|timeout)|timed out waiting for (?:auth|sign-in))/i;
+// Only a failed sign-in is fatal. agy 1.5.10 also logs "OS credential manager unavailable (…);
+// falling back to file-based secret storage" as a warning on hosts that keep secrets in a file
+// (Linux, SSH sessions), so that line alone never classifies a failure as an auth error.
+const AUTH_DIAGNOSTIC = /auth(?:entication|orization)? (?:timed out|timeout)|timed out waiting for (?:auth|sign-in)/i;
 const cliLog = path.join(AGY_HOME, 'cli.log');
 
 function logStat() {
@@ -54,8 +57,12 @@ export function agyStartup() {
       // Keep ownership of the private PATH directory until the child exits.
       for (const opener of openers) fs.rmSync(path.join(dir, opener), { force: true });
     },
-    authError(stderr) {
+    // early: agy never reached its first step, so a sign-in may still be what stopped it.
+    // After that the shared cli.log can hold another process's lines; only this process's
+    // own signals (the opener shim, its stderr) count.
+    authError(stderr, { early = true } = {}) {
       if (fs.existsSync(attempted) || AUTH_DIAGNOSTIC.test(stderr)) return AUTH_ERROR;
+      if (!early) return null;
       const after = logStat();
       if (!after?.isFile()) return null;
       const appended = before && before.dev === after.dev && before.ino === after.ino && before.size <= after.size;

@@ -71,16 +71,19 @@ function hidesExit(words, inlineInput) {
     const name = literal?.split('/').at(-1);
     if (!name) return true;
     if (['env', 'command', 'builtin', 'time', 'nohup'].includes(name)) {
+      // GNU env accepts options after NAME=value too (env A=1 -S '…'): look past the assignments.
+      while (i < words.length && ASSIGNMENT.test(literalWord(words[i]) ?? '')) i++;
       const option = literalWord(words[i]);
       if (option === '--') i++;
       else if (option?.startsWith('-')) return true;
       continue;
     }
     if (['sh', 'bash', 'zsh', 'dash', 'ksh', 'mksh', 'fish'].includes(name)) {
-      while (/^-[eux]+$/.test(words[i])) i++;
+      // Plain -e/-u/-x and their +e/+u/+x opposites only; any other option (+o, -o, -c …) may run inline input.
+      while (/^[-+][eux]+$/.test(words[i])) i++;
       if (words[i] === '--') i++;
       const script = literalWord(words[i]);
-      return inlineInput || !script || script.startsWith('-');
+      return inlineInput || !script || /^[-+]/.test(script);
     }
     return ['eval', '.', 'source', 'exec', 'exit', 'return', '!', 'if', 'while', 'until', 'for', 'case'].includes(name);
   }

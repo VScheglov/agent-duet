@@ -115,16 +115,61 @@ export async function compatibilityTests(test, parent) {
     const legacy = path.join(xdg, 'codex-duet');
     const current = path.join(xdg, 'agent-duet');
     listState(legacy, 'migrated');
-    fs.renameSync(legacy, current); // a previous runner died before symlink()
+    // A runner that died between rename() and symlink() leaves its marker inside the moved directory.
+    fs.writeFileSync(path.join(legacy, '.agent-duet-migrating'), 'interrupted');
+    fs.renameSync(legacy, current);
     const listed = run(['list', '--all'], { XDG_STATE_HOME: xdg });
     assert.equal(listed.code, 0, listed.err);
     assert.match(listed.out, /migrated/);
     assert.equal(fs.realpathSync(legacy), current);
+    assert.equal(fs.existsSync(path.join(current, '.agent-duet-migrating')), false, 'the marker goes once the link exists');
     fs.unlinkSync(legacy);
     const unrelated = path.join(xdg, 'absent-target');
     fs.symlinkSync(unrelated, legacy);
     assert.equal(run(['list', '--all'], { XDG_STATE_HOME: xdg }).code, 0);
     assert.equal(fs.readlinkSync(legacy), unrelated, 'an existing dangling link is also an independent entry');
+
+    // A move made before the marker existed is recognised by sessions that still name the old path.
+    const early = path.join(root, 'interrupted-unmarked');
+    const earlyLegacy = path.join(early, 'codex-duet');
+    const earlyCurrent = path.join(early, 'agent-duet');
+    fs.mkdirSync(path.join(earlyLegacy, 'old-build'), { recursive: true });
+    const worktree = path.join(earlyLegacy, 'old-build', 'worktree');
+    fs.writeFileSync(path.join(earlyLegacy, 'old-build', 'state.json'), JSON.stringify({
+      id: 'old-build', kind: 'build', round: 1, maxRounds: 10, phase: 'done', cwd: worktree, updatedAt: '2026-11-13',
+      subject: { repo: root, worktree, branch: 'codex-duet/old-build', base: 'HEAD' },
+    }));
+    fs.renameSync(earlyLegacy, earlyCurrent);
+    assert.equal(run(['list', '--all'], { XDG_STATE_HOME: early }).code, 0);
+    assert.equal(fs.realpathSync(earlyLegacy), earlyCurrent);
+  });
+
+  await test('rename: a fresh installation never creates the old name, and a read-only state home still runs', () => {
+    const xdg = path.join(root, 'fresh');
+    const legacy = path.join(xdg, 'codex-duet');
+    listState(path.join(xdg, 'agent-duet'), 'new-session');
+    for (let i = 0; i < 2; i++) {
+      const listed = run(['list', '--all'], { XDG_STATE_HOME: xdg });
+      assert.equal(listed.code, 0, listed.err);
+      assert.match(listed.out, /new-session/);
+      assert.equal(fs.existsSync(legacy), false, 'no codex-duet link without an interrupted move');
+    }
+    // An owner who removed the old link on a moved directory without old paths keeps it removed too.
+    // Read-only: the state home cannot take a link, yet read-only commands keep working.
+    const locked = path.join(root, 'locked');
+    const lockedCurrent = path.join(locked, 'agent-duet');
+    listState(lockedCurrent, 'kept');
+    fs.writeFileSync(path.join(lockedCurrent, '.agent-duet-migrating'), 'interrupted');
+    fs.chmodSync(locked, 0o555);
+    try {
+      for (const args of [['help'], ['list', '--all']]) {
+        const r = run(args, { XDG_STATE_HOME: locked });
+        assert.equal(r.code, 0, `${args.join(' ')}: ${r.err}`);
+      }
+      assert.equal(fs.existsSync(path.join(locked, 'codex-duet')), false);
+    } finally {
+      fs.chmodSync(locked, 0o755);
+    }
   });
 
   await test('rename: the default state directory moves once, retaining old build paths and branches through a symlink', () => {

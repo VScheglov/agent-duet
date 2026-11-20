@@ -205,7 +205,7 @@ export async function agyTests(test, parent) {
   });
 
   await test('agy auth: credential errors from the catalog stop before a turn and stale log entries are ignored', () => {
-    for (const [where, diagnostic] of [['LOG', 'OS credential manager unavailable (keyring locked); falling back to file-based secret storage'], ['STDERR', 'Print mode: auth timed out']]) {
+    for (const [where, diagnostic] of [['LOG', 'Print mode: auth timed out'], ['STDERR', 'Print mode: auth timed out']]) {
       const x = setup([{ reply: review() }]);
       const r = x.run(start('plan'), '', { FAKE_AGY_MODELS_FAIL: '1', [`FAKE_AGY_MODELS_${where}`]: diagnostic });
       assert.notEqual(r.code, 0);
@@ -219,10 +219,43 @@ export async function agyTests(test, parent) {
     const r = x.run(start('plan'), '', { FAKE_AGY_MODELS_FAIL: '1' });
     assert.equal(r.code, 0, r.err);
     assert.match(r.out, /agy models unavailable/);
+    // agy 1.5.10 logs this as a warning wherever it keeps secrets in a file; it is not a failed sign-in.
+    const y = setup([{ reply: review() }]);
+    const fallback = y.run(start('plan'), '', { FAKE_AGY_MODELS_FAIL: '1', FAKE_AGY_MODELS_LOG: 'OS credential manager unavailable (keyring locked); falling back to file-based secret storage' });
+    assert.equal(fallback.code, 0, fallback.err);
+    assert.match(fallback.out, /agy models unavailable/);
+    assert.doesNotMatch(fallback.out + fallback.err, /authentication failed/);
+  });
+
+  await test('agy auth: the file-storage warning never turns a later failure into a sign-in error', () => {
+    const warning = 'OS credential manager unavailable (exec: security not found); falling back to file-based secret storage';
+    // Before any step: the warning alone does not make an ordinary exit a sign-in failure.
+    const early = setup([{ cliLog: warning, exitCode: 1, noResult: true, noInit: true, noUserInput: true }]);
+    assert.equal(early.run(start('plan')).code, 1);
+    assert.doesNotMatch(early.state().pending.error, /authentication failed/);
+    assert.match(early.state().pending.error, /agy exited with code 1/);
+    // After work began: a fatal MCP denial is named, even with the warning in the shared log.
+    const late = setup([{
+      cliLog: warning,
+      updates: [
+        { step_index: 63, step_type: 'tool', state: 'ACTIVE', tool_name: 'call_mcp_tool', tool_info: { parameters: { ServerName: 'db', ToolName: 'query' } } },
+        { step_index: 63, state: 'ERROR' },
+      ],
+      denied_actions: [{ action: 'mcp', display_name: 'McpTool' }],
+      response: '', stderr: 'jetski: no output produced\n', exitCode: 1,
+    }]);
+    assert.equal(late.run(start('audit'), 'Inspect').code, 1);
+    assert.match(late.state().pending.error, /agy denied mcp\(db\/query\)/);
+    assert.doesNotMatch(late.state().pending.error, /authentication failed/);
+    // A sign-in timeout on stderr still wins once work began.
+    const timeout = setup([{ reply: review(), status: 'ERROR', stderr: 'Error: authentication timed out.\n', exitCode: 1 }]);
+    assert.equal(timeout.run(start('plan')).code, 1);
+    assert.match(timeout.state().pending.error, /agy authentication failed/);
   });
 
   await test('agy auth: turn errors distinguish credential access from an MCP wait or generic exit', () => {
-    for (const detail of [{ cliLog: 'OS credential manager is unavailable' }, { stderr: 'Error: authentication timed out.' }]) {
+    // A real sign-in failure stops agy before its first step; only then is the shared cli.log read.
+    for (const detail of [{ cliLog: 'Print mode: auth timed out', noInit: true, noUserInput: true }, { stderr: 'Error: authentication timed out.' }]) {
       const x = setup([{ ...detail, exitCode: 1, noResult: true }]);
       const r = x.run(start('plan'));
       assert.equal(r.code, 1, r.err);

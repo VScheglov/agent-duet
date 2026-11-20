@@ -1039,8 +1039,8 @@ function runCodex(st, round, prompt, threadId, schema = SCHEMA) {
         const answer = agyAnswer(normalizer.result, schema);
         if (answer) writeJSON(out, answer);
         else result.missingAnswer = true;
-        if (!answer || extra.code !== 0 || result.agyStatus !== 'SUCCESS' || result.finished_reason) {
-          result.authError = startup.authError(stderr + '\n' + (result.turnFailed ?? ''));
+        if (!extra.spawnError && (!answer || extra.code !== 0 || result.agyStatus !== 'SUCCESS' || result.finished_reason)) {
+          result.authError = startup.authError(stderr + '\n' + (result.turnFailed ?? ''), { early: waitingForAgy });
         }
         startup.close();
         const { model, attempts } = await normalizer.reconcile(result.threadId, st.pending.codexModel, st.codex.modelCatalog, eventsFile);
@@ -1438,12 +1438,12 @@ function turnProblem(st, res) {
   if (res.engine === 'agy') {
     const waiting = !res.beganWork ? ' agy waits for all of its MCP servers to connect before a turn (agy mcp list); check the network or VPN.' : '';
     if (res.cancelled) return `cancelled: agent-duet received SIGINT or SIGTERM; retry continues the interrupted agy turn.${waiting}`;
+    if (res.spawnError) return res.spawnError;
     if (res.authError) return res.authError;
     if (res.timedOut) {
       const limit = res.timeoutMs >= 60_000 ? `${Math.round(res.timeoutMs / 60_000)} min` : `${res.timeoutMs} ms`;
       return `agy did not finish within ${limit}.${waiting}`;
     }
-    if (res.spawnError) return res.spawnError;
     if (res.denied_actions?.length && (res.missingAnswer || res.agyStatus !== 'SUCCESS' || res.code !== 0 || res.finished_reason || res.agyError)) {
       return agyDenialProblem(st, res);
     }

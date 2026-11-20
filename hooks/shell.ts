@@ -84,6 +84,41 @@ class Reader {
     return { ...redirects(), kind: 'choice', arms, exhaustive, end: '' }
   }
 
+  // A loop body may run zero or more times: read it as an if without else, so a cd inside the
+  // body is joined with the state before the loop instead of reaching the commands after it.
+  // A while/until condition runs at least once, like an if condition; a for word list is data
+  // whose substitutions run.
+  private loop(word: string, pending: Heredoc[]): Choice {
+    const choice: Choice = { ...redirects(), kind: 'choice', arms: [], exhaustive: false, end: '' }
+    let condition: Node[] | undefined
+    if (word === 'for') {
+      this.trivia(pending)
+      if (this.text.startsWith('((', this.at)) throw new Error('unsupported arithmetic for loop')
+      const start = this.at
+      this.word(choice.substitutions) // the loop variable
+      if (this.at === start) throw new Error('expected for variable')
+      for (;;) {
+        while (this.at < this.text.length && space(this.text[this.at])) this.at++
+        const c = this.text[this.at]
+        if (c === undefined) throw new Error('expected do')
+        if (c === ';') {
+          this.at++
+          break
+        }
+        if (c === '\n' || this.atWord('do')) break
+        const at = this.at
+        this.word(choice.substitutions)
+        if (this.at === at) throw new Error('unexpected for word')
+      }
+      this.trivia(pending)
+    } else condition = this.read('', ['do'], pending)
+    if (!this.take('do')) throw new Error('expected do')
+    const body = this.read('', ['done'], pending)
+    if (!this.take('done')) throw new Error('expected done')
+    choice.arms.push({ condition, body })
+    return choice
+  }
+
   private cases(pending: Heredoc[]): Choice {
     const choice: Choice = { ...redirects(), kind: 'choice', arms: [], exhaustive: false, end: '' }
     this.trivia(pending)
@@ -187,6 +222,10 @@ class Reader {
       } else if (this.atWord('case') && prefix()) {
         this.at += 4
         compound(this.cases(pending))
+      } else if ((this.atWord('while') || this.atWord('until') || this.atWord('for')) && prefix()) {
+        const word = ['while', 'until', 'for'].find((w) => this.atWord(w))!
+        this.at += word.length
+        compound(this.loop(word, pending))
       } else if (c === '(' || (c === '{' && braceEnd && prefix())) {
         this.at++
         compound(group(this.read(c === '(' ? ')' : '}'), c === '('))
@@ -566,7 +605,10 @@ function inspect(nodes: Node[], ctx: Context, home: string, writes: GitWrite[], 
     let node = nodes[i]
     const entry = previous === '&&' ? exits.success : previous === '||' ? exits.failure : ctx
     const pipeline = node.end === '|'
-    const negated = node.negated || (node.kind === 'simple' && !node.words[0]?.quoted && node.words[0]?.value === '!')
+    // Each leading unquoted ! inverts the exit again (! ! cd x succeeds when cd does).
+    let bangs = 0
+    if (node.kind === 'simple') while (bangs < node.words.length && !node.words[bangs].quoted && node.words[bangs].value === '!') bangs++
+    const negated = node.negated || bangs % 2 === 1
     let local = fork(entry)
     let result = inspectNode(node, local, home, writes, input)
     while (node.end === '|' && i + 1 < nodes.length) {

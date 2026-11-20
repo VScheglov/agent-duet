@@ -514,6 +514,17 @@ const extraHookCases = [
   ['builtin git commit', true], ['exec git push', true], ['nice -n 10 git push', true],
   ['xargs -n 1 git push', true], ['time -p git commit', true], ['ls | git push', true],
   ['while git push; do :; done', true], ['until git stash; do :; done', true], ['! git commit', true],
+  // A loop body may run zero times: its cd must not move a later write out of the guarded tree.
+  [`while false; do cd "${outsideSpace}"; done; git commit -m x`, true],
+  [`until true; do cd "${outsideSpace}"; done; git commit -m x`, true],
+  [`for d in; do cd "${outsideSpace}"; done; git commit -m x`, true],
+  [`for d in a b\ndo\n  cd "${outsideSpace}"\ndone\ngit push`, true],
+  ['for d in a $(git push); do :; done', true], ['for d in a b; do git commit -m "$d"; done', true],
+  [`for d in a b; do echo "$d"; done; cd "${outsideSpace}" && git push`, false],
+  [`while read -r f; do echo "$f"; done < list; cd "${outsideSpace}" && git push`, false],
+  // Each ! inverts again: ! ! cd x || git commit runs the commit only when cd failed.
+  [`! ! cd "${outsideSpace}" || git commit -m x`, true],
+  [`! cd "${outsideSpace}" || git push`, false],
   ['git -C a* push', true], ['git -C `pwd` push', true],
   [`(cd "${outsideSpace}" && git status); git push`, true],
   [`out="$(cd "${outsideSpace}" && git status)"; git push`, true],
